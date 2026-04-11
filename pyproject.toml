@@ -1,7 +1,7 @@
 [project]
-name = "codex-lb"
+name = "codex-lb-mod"
 version = "1.12.0"
-description = "Codex load balancer and proxy for ChatGPT accounts with usage dashboard"
+description = "A modded fork of codex-lb for ChatGPT account load balancing, proxying, and dashboard usage"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Soju06", email = "qlskssk@gmail.com" }]
