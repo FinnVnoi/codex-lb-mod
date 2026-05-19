@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -60,7 +60,12 @@ def _reset_credit_snapshot(credit_id: str) -> RateLimitResetCreditsSnapshot:
     )
 
 
-async def _create_api_key(*, name: str, limits: list[LimitRuleInput] | None = None) -> tuple[str, str]:
+async def _create_api_key(
+    *,
+    name: str,
+    limits: list[LimitRuleInput] | None = None,
+    expires_at: datetime | None = None,
+) -> tuple[str, str]:
     async with SessionLocal() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         created = await service.create_key(
@@ -907,3 +912,19 @@ async def test_codex_usage_reset_consume_rejects_empty_redeem_request_id(async_c
     )
     assert response.status_code == 400
     assert response.json()["error"]["code"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_codex_usage_accepts_expiring_api_key_with_amin_prefix(async_client, db_setup):
+    _, plain_key = await _create_api_key(
+        name="codex-usage-expiring-api-key",
+        expires_at=utcnow() + timedelta(days=30),
+        limits=[LimitRuleInput(limit_type="credits", limit_window="5h", max_value=100)],
+    )
+    assert plain_key.startswith("sk-amin-")
+    response = await async_client.get(
+        "/api/codex/usage",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+    assert response.status_code == 200
+    assert response.json()["plan_type"] == "api_key"

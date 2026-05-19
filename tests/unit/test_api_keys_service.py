@@ -662,6 +662,27 @@ async def test_api_key_read_skips_null_allowed_models() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_key_uses_amin_prefix_when_expiry_is_set() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="expiring-key",
+            allowed_models=None,
+            expires_at=datetime(2026, 3, 20, 23, 59, 59, tzinfo=timezone(timedelta(hours=9))),
+        )
+    )
+
+    assert created.key.startswith("sk-amin-")
+    assert created.key_prefix == created.key[:15]
+
+    stored = await repo.get_by_id(created.id)
+    assert stored is not None
+    assert stored.key_prefix == created.key[:15]
+
+
+@pytest.mark.asyncio
 async def test_create_key_normalizes_timezone_aware_expiry_to_utc_naive() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -1664,6 +1685,32 @@ async def test_regenerate_key_rotates_hash_and_prefix() -> None:
     assert regenerated.key.startswith("sk-clb-")
     assert row_after.key_hash != old_hash
     assert row_after.key_prefix != old_prefix
+
+
+@pytest.mark.asyncio
+async def test_regenerate_key_preserves_amin_prefix_for_expiring_key() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="regen-expiring-key",
+            allowed_models=None,
+            expires_at=utcnow() + timedelta(days=30),
+        )
+    )
+
+    row_before = await repo.get_by_id(created.id)
+    assert row_before is not None
+    old_hash = row_before.key_hash
+
+    regenerated = await service.regenerate_key(created.id)
+    row_after = await repo.get_by_id(created.id)
+    assert row_after is not None
+
+    assert created.key.startswith("sk-amin-")
+    assert regenerated.key.startswith("sk-amin-")
+    assert row_after.key_hash != old_hash
+    assert row_after.key_prefix == regenerated.key[:15]
 
 
 @pytest.mark.asyncio
