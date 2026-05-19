@@ -140,6 +140,21 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert regenerated_payload["key"].startswith("sk-clb-")
     assert regenerated_payload["key"] != first_key
 
+    expiring_create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "expiring-key",
+            "expiresAt": "2026-03-20T23:59:59+09:00",
+        },
+    )
+    assert expiring_create.status_code == 200
+    expiring_payload = expiring_create.json()
+    assert expiring_payload["key"].startswith("sk-amin-")
+    assert expiring_payload["keyPrefix"] == expiring_payload["key"][:15]
+
+    deleted_expiring = await async_client.delete(f"/api/api-keys/{expiring_payload['id']}")
+    assert deleted_expiring.status_code == 204
+
     deleted = await async_client.delete(f"/api/api-keys/{key_id}")
     assert deleted.status_code == 204
 

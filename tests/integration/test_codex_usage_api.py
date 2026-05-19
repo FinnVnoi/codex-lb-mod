@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -39,13 +39,19 @@ def _make_account(
     )
 
 
-async def _create_api_key(*, name: str, limits: list[LimitRuleInput] | None = None) -> tuple[str, str]:
+async def _create_api_key(
+    *,
+    name: str,
+    limits: list[LimitRuleInput] | None = None,
+    expires_at: datetime | None = None,
+) -> tuple[str, str]:
     async with SessionLocal() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         created = await service.create_key(
             ApiKeyCreateData(
                 name=name,
                 allowed_models=None,
+                expires_at=expires_at,
                 limits=limits or [],
             )
         )
@@ -382,6 +388,43 @@ async def test_codex_usage_accepts_api_key_callers(async_client, db_setup):
         "approx_local_messages": None,
         "approx_cloud_messages": None,
     }
+
+
+@pytest.mark.asyncio
+async def test_codex_usage_accepts_expiring_api_key_with_amin_prefix(async_client, db_setup):
+    key_id, plain_key = await _create_api_key(
+        name="codex-usage-expiring-api-key",
+        expires_at=datetime(2026, 12, 31, tzinfo=timezone.utc),
+        limits=[LimitRuleInput(limit_type="credits", limit_window="5h", max_value=100)],
+    )
+    assert plain_key.startswith("sk-amin-")
+
+    now = utcnow()
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        await repo.replace_limits(
+            key_id,
+            [
+                ApiKeyLimit(
+                    api_key_id=key_id,
+                    limit_type=LimitType.CREDITS,
+                    limit_window=LimitWindow.FIVE_HOURS,
+                    max_value=100,
+                    current_value=20,
+                    model_filter=None,
+                    reset_at=now + timedelta(hours=5),
+                ),
+            ],
+        )
+        await session.commit()
+
+    response = await async_client.get(
+        "/api/codex/usage",
+        headers={"Authorization": f"Bearer {plain_key}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["plan_type"] == "api_key"
 
 
 @pytest.mark.asyncio

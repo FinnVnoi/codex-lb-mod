@@ -43,6 +43,8 @@ API_KEY_USAGE_RESERVATION_DEFAULT_INPUT_TOKENS = API_KEY_USAGE_RESERVATION_MAX_T
 API_KEY_USAGE_RESERVATION_DEFAULT_OUTPUT_TOKENS = 2_048
 _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_MICRODOLLARS = 2_000_000
 _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_BASE_TOKENS = API_KEY_USAGE_RESERVATION_MAX_TOKEN_BUDGET * 2
+_STANDARD_KEY_PREFIX = "sk-clb"
+_EXPIRING_KEY_PREFIX = "sk-amin"
 
 
 class ApiKeysRepositoryProtocol(Protocol):
@@ -326,7 +328,7 @@ class ApiKeysService:
     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
         now = utcnow()
         expires_at = _normalize_expires_at(payload.expires_at)
-        plain_key = _generate_plain_key()
+        plain_key = _generate_plain_key(expires_at=expires_at)
         normalized_allowed_models = _normalize_allowed_models(payload.allowed_models)
         assigned_account_ids = await self._resolve_assigned_account_ids(payload.assigned_account_ids)
         enforced_model = _normalize_model_slug(payload.enforced_model)
@@ -530,7 +532,7 @@ class ApiKeysService:
         if row is None:
             raise ApiKeyNotFoundError(f"API key not found: {key_id}")
         old_key_hash = row.key_hash
-        plain_key = _generate_plain_key()
+        plain_key = _generate_plain_key(expires_at=row.expires_at)
         updated = await self._repository.update(
             key_id,
             key_hash=_hash_key(plain_key),
@@ -1014,8 +1016,9 @@ def _normalize_name(name: str) -> str:
     return normalized
 
 
-def _generate_plain_key() -> str:
-    return f"sk-clb-{secrets.token_urlsafe(32)}"
+def _generate_plain_key(*, expires_at: datetime | None = None) -> str:
+    prefix = _EXPIRING_KEY_PREFIX if expires_at is not None else _STANDARD_KEY_PREFIX
+    return f"{prefix}-{secrets.token_urlsafe(32)}"
 
 
 def _hash_key(plain_key: str) -> str:
