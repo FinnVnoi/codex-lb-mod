@@ -87,6 +87,71 @@ async def test_import_missing_tokens_returns_400(async_client):
 
 
 @pytest.mark.asyncio
+async def test_import_cliproxyapi_bundle_with_bom_imports_multiple_accounts(async_client):
+    first_payload = {
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acc_cpa_bundle_one",
+            "chatgpt_plan_type": "plus",
+        },
+        "https://api.openai.com/profile": {"email": "bundle-one@example.com"},
+    }
+    second_payload = {
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": "acc_cpa_bundle_two",
+            "chatgpt_plan_type": "team",
+        },
+        "https://api.openai.com/profile": {"email": "bundle-two@example.com"},
+    }
+    bundle = {
+        "exported_at": "2024-01-02T03:04:05Z",
+        "accounts": [
+            {
+                "name": "bundle-one@example.com",
+                "credentials": {
+                    "access_token": _encode_jwt(first_payload),
+                    "chatgpt_account_id": "acc_cpa_bundle_one",
+                    "email": "bundle-one@example.com",
+                    "plan_type": "plus",
+                },
+            },
+            {
+                "name": "bundle-two@example.com",
+                "credentials": {
+                    "access_token": _encode_jwt(second_payload),
+                    "chatgpt_account_id": "acc_cpa_bundle_two",
+                    "email": "bundle-two@example.com",
+                    "plan_type": "team",
+                },
+            },
+        ],
+    }
+
+    files = {
+        "auth_json": (
+            "cpa.json",
+            "\ufeff" + json.dumps(bundle),
+            "application/json",
+        )
+    }
+    response = await async_client.post("/api/accounts/import", files=files)
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["accountId"] == generate_unique_account_id("acc_cpa_bundle_two", "bundle-two@example.com")
+    accounts_response = await async_client.get("/api/accounts")
+    assert accounts_response.status_code == 200
+    accounts = {entry["email"]: entry for entry in accounts_response.json()["accounts"]}
+    assert accounts["bundle-one@example.com"]["accountId"] == generate_unique_account_id(
+        "acc_cpa_bundle_one", "bundle-one@example.com"
+    )
+    assert accounts["bundle-one@example.com"]["auth"]["refresh"]["state"] == "missing"
+    assert accounts["bundle-two@example.com"]["accountId"] == generate_unique_account_id(
+        "acc_cpa_bundle_two", "bundle-two@example.com"
+    )
+    assert accounts["bundle-two@example.com"]["auth"]["refresh"]["state"] == "missing"
+
+
+@pytest.mark.asyncio
 async def test_import_falls_back_to_email_based_account_id(async_client):
     email = "fallback@example.com"
     auth_json = _make_auth_json(None, email)
