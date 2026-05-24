@@ -8,7 +8,19 @@ python oauth sqlalchemy dashboard load-balancer openai rate-limit api-proxy code
 Resources
 -->
 
-# codex-lb
+# codex-lb-mod
+
+> This project is a modified fork of [Soju06/codex-lb](https://github.com/Soju06/codex-lb).
+> It keeps the original codex-lb foundation while adapting it for custom deployment and multi-workspace style usage.
+
+## What is different in this mod?
+
+- Based on upstream stable release v1.18.2
+- Supports importing CLIProxyAPI/CPA Codex JSON exports
+- Extra attribution to the original upstream project
+- Agent-specific local development files removed from the public repo
+- Ready for packaging and downloadable source releases
+
 
 Load balancer for ChatGPT accounts. Pool multiple accounts, track usage, manage API keys, view everything in a dashboard.
 
