@@ -467,3 +467,32 @@ async def test_refresh_account_deactivates_when_upstream_returns_token_expired(m
     reason = repo.status_payload["deactivation_reason"]
     assert isinstance(reason, str)
     assert "re-login" in reason.lower() or "expired" in reason.lower()
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_skips_empty_refresh_token(monkeypatch):
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        raise AssertionError("empty refresh token should not call upstream refresh")
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_empty_refresh",
+        email="user@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-token"),
+        refresh_token_encrypted=encryptor.encrypt(""),
+        id_token_encrypted=encryptor.encrypt("id-token"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(cast(AccountsRepositoryPort, repo))
+
+    updated = await manager.refresh_account(account)
+
+    assert updated is account
+    assert repo.tokens_payload is None
+    assert repo.status_payload is None
