@@ -51,6 +51,8 @@ class AuthManager:
 
     async def refresh_account(self, account: Account) -> Account:
         refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
+        if not refresh_token:
+            return account
         try:
             result = await refresh_access_token(refresh_token)
         except RefreshError as exc:

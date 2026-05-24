@@ -18,6 +18,7 @@ pytestmark = pytest.mark.unit
 class _DummyRepo:
     def __init__(self) -> None:
         self.tokens_payload: dict[str, object] | None = None
+        self.status_payload: dict[str, object] | None = None
 
     async def update_status(
         self,
@@ -25,6 +26,11 @@ class _DummyRepo:
         status: AccountStatus,
         deactivation_reason: str | None = None,
     ) -> bool:
+        self.status_payload = {
+            "account_id": account_id,
+            "status": status,
+            "deactivation_reason": deactivation_reason,
+        }
         return True
 
     async def update_tokens(
@@ -85,3 +91,33 @@ async def test_refresh_account_preserves_plan_type_when_missing(monkeypatch):
     assert updated.plan_type == "pro"
     assert repo.tokens_payload is not None
     assert repo.tokens_payload["plan_type"] == "pro"
+
+
+@pytest.mark.asyncio
+async def test_refresh_account_skips_empty_refresh_token(monkeypatch):
+    async def _fake_refresh(_: str) -> TokenRefreshResult:
+        raise AssertionError("empty refresh token should not call upstream refresh")
+
+    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
+
+    encryptor = TokenEncryptor()
+    account = Account(
+        id="acc_empty_refresh",
+        email="user@example.com",
+        plan_type="plus",
+        access_token_encrypted=encryptor.encrypt("access-token"),
+        refresh_token_encrypted=encryptor.encrypt(""),
+        id_token_encrypted=encryptor.encrypt("id-token"),
+        last_refresh=utcnow(),
+        status=AccountStatus.ACTIVE,
+        deactivation_reason=None,
+    )
+    repo = _DummyRepo()
+    manager = AuthManager(cast(AccountsRepositoryPort, repo))
+
+    updated = await manager.refresh_account(account)
+
+    assert updated is account
+    assert repo.tokens_payload is None
+    assert repo.status_payload is None
+

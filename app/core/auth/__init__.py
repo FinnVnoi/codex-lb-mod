@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from typing import Any
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 DEFAULT_EMAIL = "unknown@example.com"
 DEFAULT_PLAN = "unknown"
@@ -67,7 +67,12 @@ class AuthFile(BaseModel):
 
     openai_api_key: str | None = Field(default=None, alias="OPENAI_API_KEY")
     tokens: AuthTokens
-    last_refresh_at: datetime | None = Field(default=None, alias="lastRefreshAt")
+    last_refresh_at: datetime | None = Field(
+        default=None,
+        alias="lastRefreshAt",
+        validation_alias=AliasChoices("lastRefreshAt", "last_refresh"),
+        serialization_alias="lastRefreshAt",
+    )
     workspace_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -81,6 +86,50 @@ class AuthFile(BaseModel):
             "org_id",
         ),
     )
+    email: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_flat_codex_tokens(cls, value: object) -> object:
+        """Accept CLIProxyAPI's flat Codex auth JSON shape.
+
+        CLIProxyAPI stores Codex credentials as top-level ``id_token``,
+        ``access_token``, ``refresh_token``, and ``account_id`` fields rather
+        than under Codex CLI's ``tokens`` object. Normalize that shape before
+        Pydantic validates the canonical model.
+        """
+        if not isinstance(value, dict) or "tokens" in value:
+            return value
+
+        provider = str(value.get("type") or "").strip().lower()
+        if provider != "codex":
+            return value
+
+        id_token = value.get("id_token") or value.get("idToken")
+        access_token = value.get("access_token") or value.get("accessToken")
+        refresh_token = value.get("refresh_token") or value.get("refreshToken")
+        account_id = value.get("account_id") or value.get("accountId")
+        if id_token is None and access_token:
+            # CPA bundle exports can contain only the long-lived ChatGPT access
+            # token. It is still a JWT with the ChatGPT account/profile claims
+            # codex-lb needs for identity, so use it as the claim-bearing token.
+            id_token = access_token
+        if refresh_token is None and access_token:
+            # Access-token-only imports are usable until the token expires, but
+            # cannot be refreshed. Store an empty marker instead of rejecting
+            # the account so operators can import CPA bundles directly.
+            refresh_token = ""
+        if not any((id_token, access_token, refresh_token, account_id)):
+            return value
+
+        normalized = dict(value)
+        normalized["tokens"] = {
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "account_id": account_id,
+        }
+        return normalized
 
 
 class OpenAIAuthClaims(BaseModel):
@@ -93,6 +142,12 @@ class OpenAIAuthClaims(BaseModel):
         validation_alias=AliasChoices("workspace_id", "workspaceId", "organization_id", "organizationId"),
     )
     organizations: list[WorkspaceClaim] | None = None
+
+
+class OpenAIProfileClaims(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    email: str | None = None
 
 
 class IdTokenClaims(BaseModel):
@@ -110,6 +165,10 @@ class IdTokenClaims(BaseModel):
     auth: OpenAIAuthClaims | None = Field(
         default=None,
         alias="https://api.openai.com/auth",
+    )
+    profile: OpenAIProfileClaims | None = Field(
+        default=None,
+        alias="https://api.openai.com/profile",
     )
 
 
@@ -145,10 +204,11 @@ def extract_id_token_claims(id_token: str) -> IdTokenClaims:
 def claims_from_auth(auth: AuthFile) -> AccountClaims:
     claims = extract_id_token_claims(auth.tokens.id_token)
     auth_claims = claims.auth or OpenAIAuthClaims()
+    profile_claims = claims.profile or OpenAIProfileClaims()
     plan_type = auth_claims.chatgpt_plan_type or claims.chatgpt_plan_type
     return AccountClaims(
         account_id=resolve_chatgpt_account_id(auth=auth, claims=claims),
-        email=claims.email,
+        email=claims.email or profile_claims.email or auth.email,
         plan_type=plan_type,
     )
 
