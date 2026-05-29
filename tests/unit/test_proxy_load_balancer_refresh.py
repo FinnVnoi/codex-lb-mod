@@ -66,7 +66,8 @@ class StubAccountsRepository(AccountsRepository):
     async def get_by_id(self, account_id: str) -> Account | None:
         return self._find_account(account_id)
 
-    async def list_accounts(self) -> list[Account]:
+    async def list_accounts(self, *, refresh_existing: bool = False) -> list[Account]:
+        del refresh_existing
         return list(self._accounts)
 
     def _find_account(self, account_id: str) -> Account | None:
@@ -136,7 +137,13 @@ class StubUsageRepository(UsageRepository):
         self.primary_calls = 0
         self.secondary_calls = 0
 
-    async def latest_by_account(self, window: str | None = None) -> dict[str, UsageHistory]:
+    async def latest_by_account(
+        self,
+        window: str | None = None,
+        *,
+        account_ids: Collection[str] | None = None,
+    ) -> dict[str, UsageHistory]:
+        del account_ids
         if window == "secondary":
             self.secondary_calls += 1
             return self._secondary

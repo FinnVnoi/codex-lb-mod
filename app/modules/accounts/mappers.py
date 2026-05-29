@@ -3,16 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from app.core import usage as usage_core
-from app.core.auth import DEFAULT_PLAN, extract_id_token_claims
+from app.core.auth import DEFAULT_PLAN, extract_id_token_claims, token_expiry_epoch_ms
 from app.core.crypto import TokenEncryptor
 from app.core.plan_types import coerce_account_plan_type
 from app.core.usage.quota import apply_usage_quota
 from app.core.usage.types import UsageTrendBucket, UsageWindowRow
 from app.core.utils.time import from_epoch_seconds
-from app.db.models import Account, AccountStatus, UsageHistory
+from app.db.models import Account, AccountLimitWarmup, AccountStatus, UsageHistory
 from app.modules.accounts.schemas import (
     AccountAdditionalQuota,
     AccountAuthStatus,
+    AccountLimitWarmupStatus,
     AccountRequestUsage,
     AccountSummary,
     AccountTokenStatus,
@@ -30,6 +31,7 @@ def build_account_summaries(
     secondary_usage: dict[str, UsageHistory],
     request_usage_by_account: dict[str, AccountRequestUsage] | None = None,
     additional_quotas_by_account: dict[str, list[AccountAdditionalQuota]] | None = None,
+    limit_warmups_by_account: dict[str, AccountLimitWarmup] | None = None,
     encryptor: TokenEncryptor,
     include_auth: bool = True,
 ) -> list[AccountSummary]:
@@ -40,6 +42,7 @@ def build_account_summaries(
             secondary_usage.get(account.id),
             request_usage_by_account.get(account.id) if request_usage_by_account else None,
             additional_quotas_by_account.get(account.id) if additional_quotas_by_account else None,
+            limit_warmups_by_account.get(account.id) if limit_warmups_by_account else None,
             encryptor,
             include_auth=include_auth,
         )
@@ -53,6 +56,7 @@ def _account_to_summary(
     secondary_usage: UsageHistory | None,
     request_usage: AccountRequestUsage | None,
     additional_quotas: list[AccountAdditionalQuota] | None,
+    limit_warmup: AccountLimitWarmup | None,
     encryptor: TokenEncryptor,
     include_auth: bool = True,
 ) -> AccountSummary:
@@ -118,7 +122,8 @@ def _account_to_summary(
     return AccountSummary(
         account_id=account.id,
         email=account.email,
-        display_name=account.email,
+        alias=account.alias,
+        display_name=account.alias or account.email,
         plan_type=plan_type,
         status=effective_status.value,
         usage=AccountUsage(
@@ -138,6 +143,23 @@ def _account_to_summary(
         additional_quotas=additional_quotas or [],
         deactivation_reason=account.deactivation_reason,
         auth=auth_status,
+        limit_warmup_enabled=account.limit_warmup_enabled,
+        limit_warmup=_limit_warmup_to_status(limit_warmup),
+    )
+
+
+def _limit_warmup_to_status(entry: AccountLimitWarmup | None) -> AccountLimitWarmupStatus | None:
+    if entry is None:
+        return None
+    return AccountLimitWarmupStatus(
+        window=entry.window,
+        reset_at=entry.reset_at,
+        status=entry.status,
+        model=entry.model,
+        attempted_at=entry.attempted_at,
+        completed_at=entry.completed_at,
+        error_code=entry.error_code,
+        error_message=entry.error_message,
     )
 
 
@@ -157,6 +179,14 @@ def _effective_status_from_usage(
         secondary_used=secondary_used_percent,
         secondary_reset=secondary_usage.reset_at if secondary_usage is not None else None,
     )
+    if account.status == AccountStatus.RATE_LIMITED and status == AccountStatus.ACTIVE:
+        if (
+            account.blocked_at is None
+            and account.reset_at is not None
+            and account.reset_at <= datetime.now(timezone.utc).timestamp()
+        ):
+            return status
+        return account.status
     return status
 
 
@@ -209,12 +239,9 @@ def _decrypt_token(encryptor: TokenEncryptor, encrypted: bytes | None) -> str | 
 def _token_expiry(token: str | None) -> datetime | None:
     if not token:
         return None
-    claims = extract_id_token_claims(token)
-    exp = claims.exp
-    if isinstance(exp, (int, float)):
-        return datetime.fromtimestamp(exp, tz=timezone.utc)
-    if isinstance(exp, str) and exp.isdigit():
-        return datetime.fromtimestamp(int(exp), tz=timezone.utc)
+    expires_ms = token_expiry_epoch_ms(token)
+    if expires_ms is not None:
+        return datetime.fromtimestamp(expires_ms / 1000, tz=timezone.utc)
     return None
 
 

@@ -1050,6 +1050,20 @@ def _state_from_account(
     secondary_used = effective_secondary_entry.used_percent if effective_secondary_entry else None
     secondary_reset = effective_secondary_entry.reset_at if effective_secondary_entry else None
 
+    # If the usage window has reset (reset_at is in the past) but the last
+    # recorded sample still shows 100 % usage, the data is stale.  Zero it
+    # out so the account is not incorrectly blocked or deprioritised while
+    # waiting for the next usage refresh to fetch fresh numbers.
+    now_epoch = int(time.time())
+    if primary_used is not None and primary_used >= 100.0:
+        if primary_reset is not None and primary_reset <= now_epoch:
+            primary_used = 0.0
+            primary_reset = None
+    if secondary_used is not None and secondary_used >= 100.0:
+        if secondary_reset is not None and secondary_reset <= now_epoch:
+            secondary_used = 0.0
+            secondary_reset = None
+
     # Use account.reset_at from DB as the authoritative source for runtime reset
     # and to survive process restarts.
     db_reset_at = float(account.reset_at) if account.reset_at else None
@@ -1108,9 +1122,12 @@ def _state_from_account(
         secondary_reset=secondary_reset,
     )
 
-    next_blocked_at = (
-        effective_blocked_at if status in (AccountStatus.QUOTA_EXCEEDED, AccountStatus.RATE_LIMITED) else None
-    )
+    if status == AccountStatus.QUOTA_EXCEEDED:
+        next_blocked_at = effective_blocked_at
+    elif status == AccountStatus.RATE_LIMITED and account.status != AccountStatus.QUOTA_EXCEEDED:
+        next_blocked_at = effective_blocked_at
+    else:
+        next_blocked_at = None
 
     settings = get_settings()
     if getattr(settings, "soft_drain_enabled", True):
@@ -1164,6 +1181,84 @@ def _state_from_account(
         capacity_credits=usage_core.capacity_for_plan(account.plan_type, "secondary"),
         health_tier=new_tier,
     )
+
+
+def background_recovery_state_from_account(
+    *,
+    account: Account,
+    primary_entry: UsageHistory | None,
+    secondary_entry: UsageHistory | None,
+) -> AccountState:
+    """Evaluate recovery for a persisted blocked account without live runtime state.
+
+    The usage refresh scheduler only needs to know whether a persisted blocked
+    account can safely return to `active`. Seed a throwaway runtime snapshot
+    from the persisted block marker so fresh post-block usage rows can clear a
+    stale reset guard even when the original balancer process is gone.
+    """
+
+    runtime = RuntimeState()
+    blocked_at = float(account.blocked_at) if account.blocked_at is not None else None
+    reset_at = float(account.reset_at) if account.reset_at is not None else None
+
+    if blocked_at is not None:
+        runtime.blocked_at = blocked_at
+
+    if account.status == AccountStatus.RATE_LIMITED and blocked_at is not None:
+        if reset_at is not None:
+            runtime.cooldown_until = reset_at
+    state = _state_from_account(
+        account=account,
+        primary_entry=primary_entry,
+        secondary_entry=secondary_entry,
+        runtime=runtime,
+    )
+    if account.status == AccountStatus.RATE_LIMITED:
+        if blocked_at is not None and reset_at is not None and reset_at <= time.time():
+            if not _usage_entry_recorded_after_block(primary_entry, blocked_at):
+                return replace(
+                    state,
+                    status=AccountStatus.RATE_LIMITED,
+                    reset_at=reset_at,
+                    blocked_at=blocked_at,
+                    cooldown_until=reset_at,
+                )
+        elif blocked_at is None and reset_at is not None and reset_at <= time.time():
+            if not _usage_entry_is_recent_available(primary_entry):
+                return replace(
+                    state,
+                    status=AccountStatus.RATE_LIMITED,
+                    reset_at=reset_at,
+                    blocked_at=None,
+                    cooldown_until=None,
+                )
+        if reset_at is None:
+            return replace(
+                state,
+                status=AccountStatus.RATE_LIMITED,
+                reset_at=None,
+                blocked_at=blocked_at,
+                cooldown_until=None,
+            )
+    return state
+
+
+def _usage_entry_is_recent_available(entry: UsageHistory | None) -> bool:
+    return (
+        entry is not None
+        and _usage_entry_is_recent_enough(entry.recorded_at)
+        and entry.used_percent is not None
+        and float(entry.used_percent) < 100.0
+    )
+
+
+def _usage_entry_recorded_after_block(entry: UsageHistory | None, blocked_at: float) -> bool:
+    if entry is None or entry.recorded_at is None:
+        return False
+    recorded_at = entry.recorded_at
+    if recorded_at.tzinfo is None:
+        recorded_at = recorded_at.replace(tzinfo=timezone.utc)
+    return recorded_at.timestamp() > blocked_at
 
 
 def _usage_entry_is_recent_enough(recorded_at: datetime | None) -> bool:
@@ -1251,14 +1346,7 @@ async def _latest_additional_by_key(
     )
     if resolved_quota_key is None:
         return {}
-    if hasattr(additional_usage_repo, "latest_by_quota_key"):
-        return await additional_usage_repo.latest_by_quota_key(
-            resolved_quota_key,
-            window,
-            account_ids=account_ids,
-            since=since,
-        )
-    return await additional_usage_repo.latest_by_account(
+    return await additional_usage_repo.latest_by_quota_key(
         resolved_quota_key,
         window,
         account_ids=account_ids,
