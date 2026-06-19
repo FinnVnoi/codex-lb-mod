@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -39,13 +39,19 @@ def _make_account(
     )
 
 
-async def _create_api_key(*, name: str, limits: list[LimitRuleInput] | None = None) -> tuple[str, str]:
+async def _create_api_key(
+    *,
+    name: str,
+    limits: list[LimitRuleInput] | None = None,
+    expires_at: datetime | None = None,
+) -> tuple[str, str]:
     async with SessionLocal() as session:
         service = ApiKeysService(ApiKeysRepository(session))
         created = await service.create_key(
             ApiKeyCreateData(
                 name=name,
                 allowed_models=None,
+                expires_at=expires_at,
                 limits=limits or [],
             )
         )
