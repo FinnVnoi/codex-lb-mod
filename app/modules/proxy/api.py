@@ -203,6 +203,9 @@ from app.modules.proxy.schemas import (
     ModelMetadata,
     RateLimitStatusPayload,
     ReasoningLevelSchema,
+    V1BulkUsageError,
+    V1BulkUsageItem,
+    V1BulkUsageResponse,
     V1ResetCreditEntry,
     V1ResetCreditRedeemRequest,
     V1ResetCreditRedeemResponse,
@@ -925,6 +928,28 @@ async def v1_models(
 async def v1_usage(
     api_key: ApiKeyData = Security(validate_usage_api_key),
 ) -> V1UsageResponse | JSONResponse:
+    return await _build_v1_usage_response_for_api_key(api_key)
+
+
+@usage_router.post("/v1/usage/bulk", response_model=V1BulkUsageResponse)
+async def v1_usage_bulk(
+    request: Request,
+) -> V1BulkUsageResponse:
+    keys = _parse_bulk_usage_keys(await request.body())
+    items: list[V1BulkUsageItem] = []
+    for index, key in enumerate(keys):
+        items.append(await _build_bulk_usage_item(index, key))
+
+    ok_count = sum(1 for item in items if item.ok)
+    return V1BulkUsageResponse(
+        total=len(items),
+        ok=ok_count,
+        error=len(items) - ok_count,
+        data=items,
+    )
+
+
+async def _build_v1_usage_response_for_api_key(api_key: ApiKeyData) -> V1UsageResponse:
     usage_sections = _parse_usage_sections(api_key.usage_sections)
     async with get_background_session() as session:
         service = ApiKeysService(ApiKeysRepository(session), usage_repository=UsageRepository(session))
@@ -1319,6 +1344,125 @@ async def v1_warmup_by_mode(
         api_key,
         mode=mode.strip().lower(),
     )
+
+
+async def _build_bulk_usage_item(index: int, key: str) -> V1BulkUsageItem:
+    masked_key = _mask_api_key_for_bulk_usage(key)
+    try:
+        api_key = await _validate_bulk_usage_key(key)
+        usage = await _build_v1_usage_response_for_api_key(api_key)
+        codex_usage = RateLimitStatusPayload.from_data(await _build_codex_usage_payload_for_api_key(api_key))
+    except ProxyAuthError as exc:
+        return V1BulkUsageItem(
+            index=index,
+            masked_key=masked_key,
+            ok=False,
+            status_code=401,
+            error=V1BulkUsageError(code="invalid_api_key", message=str(exc)),
+        )
+    except Exception:
+        logger.warning("Failed to build bulk usage item", exc_info=True)
+        return V1BulkUsageItem(
+            index=index,
+            masked_key=masked_key,
+            ok=False,
+            status_code=500,
+            error=V1BulkUsageError(code="usage_lookup_failed", message="Unable to fetch usage for this key"),
+        )
+
+    return V1BulkUsageItem(
+        index=index,
+        masked_key=masked_key,
+        key_prefix=api_key.key_prefix,
+        ok=True,
+        status_code=200,
+        usage=usage,
+        codex_usage=codex_usage,
+    )
+
+
+async def _validate_bulk_usage_key(key: str) -> ApiKeyData:
+    async with get_background_session() as session:
+        service = ApiKeysService(ApiKeysRepository(session))
+        try:
+            return await service.validate_key(key)
+        except ApiKeyInvalidError as exc:
+            raise ProxyAuthError(str(exc)) from exc
+
+
+def _parse_bulk_usage_keys(body: bytes) -> list[str]:
+    if len(body) > 128 * 1024:
+        raise HTTPException(status_code=413, detail="Bulk usage payload is too large")
+
+    text = body.decode("utf-8-sig").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No API keys provided")
+
+    keys: list[str]
+    try:
+        payload = json.loads(text)
+    except JSONDecodeError:
+        keys = _parse_bulk_usage_text_lines(text)
+    else:
+        keys = _parse_bulk_usage_json_payload(payload)
+
+    if not keys:
+        raise HTTPException(status_code=400, detail="No API keys provided")
+    if len(keys) > 500:
+        raise HTTPException(status_code=400, detail="Bulk usage accepts at most 500 keys")
+    return keys
+
+
+def _parse_bulk_usage_json_payload(payload: JsonValue) -> list[str]:
+    if isinstance(payload, list):
+        return [_coerce_bulk_usage_key(item) for item in payload if _coerce_bulk_usage_key(item)]
+    if isinstance(payload, dict):
+        source = payload.get("keys") or payload.get("apiKeys") or payload.get("api_keys") or payload.get("serialKeys")
+        if isinstance(source, list):
+            return [_coerce_bulk_usage_key(item) for item in source if _coerce_bulk_usage_key(item)]
+        key = _coerce_bulk_usage_key(payload)
+        return [key] if key else []
+    if isinstance(payload, str):
+        return _parse_bulk_usage_text_lines(payload)
+    return []
+
+
+def _parse_bulk_usage_text_lines(text: str) -> list[str]:
+    keys: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip().strip(",")
+        if not line or line.startswith("#"):
+            continue
+        key = _coerce_bulk_usage_key(line)
+        if key:
+            keys.append(key)
+    return keys
+
+
+def _coerce_bulk_usage_key(value: JsonValue) -> str | None:
+    if isinstance(value, dict):
+        for field in ("apiKey", "api_key", "key", "serialKey", "serial_key"):
+            candidate = value.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        return None
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().strip('"').strip("'")
+    if not normalized:
+        return None
+    for prefix in ("apiKey=", "api_key=", "key=", "serialKey=", "serial_key="):
+        if normalized.startswith(prefix):
+            normalized = normalized[len(prefix) :].strip().strip('"').strip("'")
+            break
+    return normalized or None
+
+
+def _mask_api_key_for_bulk_usage(key: str) -> str:
+    key = key.strip()
+    if len(key) <= 12:
+        return f"{key[:4]}..." if key else ""
+    return f"{key[:8]}...{key[-4:]}"
 
 
 def _ordered_aggregate_limits(aggregate_limits: dict[str, V1UsageLimitResponse]) -> list[V1UsageLimitResponse]:

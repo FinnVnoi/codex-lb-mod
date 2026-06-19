@@ -756,3 +756,103 @@ async def test_v1_usage_ignores_paused_and_deactivated_accounts_in_aggregate_cre
         },
     ]
     assert payload["limits"] == payload["upstream_limits"]
+
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_bulk_returns_usage_for_newline_separated_keys(async_client):
+    key_a_id, key_a = await _create_api_key(
+        name="bulk-usage-a",
+        limits=[LimitRuleInput(limit_type="credits", limit_window="5h", max_value=60)],
+    )
+    _, key_b = await _create_api_key(name="bulk-usage-b")
+    now = utcnow()
+    reset_at = now + timedelta(hours=5)
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        await repo.replace_limits(
+            key_a_id,
+            [
+                ApiKeyLimit(
+                    api_key_id=key_a_id,
+                    limit_type=LimitType.CREDITS,
+                    limit_window=LimitWindow.FIVE_HOURS,
+                    max_value=60,
+                    current_value=12,
+                    model_filter=None,
+                    reset_at=reset_at,
+                )
+            ],
+        )
+        logs = RequestLogsRepository(session)
+        await logs.add_log(
+            account_id=None,
+            api_key_id=key_a_id,
+            request_id="req_v1_bulk_usage_a1",
+            model="gpt-5.4",
+            input_tokens=10,
+            output_tokens=5,
+            cached_input_tokens=2,
+            latency_ms=100,
+            status="success",
+            error_code=None,
+            requested_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.post(
+        "/v1/usage/bulk",
+        content=f"# comment\napiKey={key_a}\nserialKey={key_b}\ninvalid-key\n",
+        headers={"Content-Type": "text/plain"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 3
+    assert payload["ok"] == 2
+    assert payload["error"] == 1
+
+    first = payload["data"][0]
+    assert first["ok"] is True
+    assert first["status_code"] == 200
+    assert first["usage"]["request_count"] == 1
+    assert first["usage"]["total_tokens"] == 15
+    assert first["usage"]["limits"] == [
+        {
+            "limit_type": "credits",
+            "limit_window": "5h",
+            "max_value": 60,
+            "current_value": 12,
+            "remaining_value": 48,
+            "model_filter": None,
+            "reset_at": reset_at.isoformat() + "Z",
+            "source": "api_key_limit",
+        }
+    ]
+    assert first["codex_usage"]["plan_type"] == "api_key"
+    assert first["codex_usage"]["credits"]["balance"] == "48"
+
+    second = payload["data"][1]
+    assert second["ok"] is True
+    assert second["usage"]["request_count"] == 0
+
+    third = payload["data"][2]
+    assert third["ok"] is False
+    assert third["status_code"] == 401
+    assert third["error"]["code"] == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_bulk_accepts_json_payload(async_client):
+    _, key = await _create_api_key(name="bulk-usage-json")
+
+    response = await async_client.post(
+        "/v1/usage/bulk",
+        json={"keys": [{"serialKey": key}]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["ok"] == 1
+    assert payload["data"][0]["ok"] is True

@@ -272,6 +272,36 @@ class V1UsageResponse(BaseModel):
     account_pool_usage: AccountPoolUsageResponse | None = None
 
 
+class V1BulkUsageError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    message: str
+
+
+class V1BulkUsageItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    masked_key: str
+    key_prefix: str | None = None
+    ok: bool
+    status_code: int
+    usage: V1UsageResponse | None = None
+    codex_usage: RateLimitStatusPayload | None = None
+    error: V1BulkUsageError | None = None
+
+
+class V1BulkUsageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object: str = "list"
+    total: int
+    ok: int
+    error: int
+    data: list[V1BulkUsageItem]
+
+
 class V1ResetCreditEntry(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
