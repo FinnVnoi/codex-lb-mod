@@ -109,6 +109,19 @@ class UsageRefreshScheduler:
                     if usage_written:
                         after_primary = await usage_repo.latest_by_account(window="primary")
                         after_secondary = await usage_repo.latest_by_account(window="secondary")
+                        refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
+                        # Recover post-reset RATE_LIMITED/QUOTA_EXCEEDED accounts before evaluating
+                        # limit warm-up candidates. Otherwise a 5h reset can be observed in usage
+                        # history while the account row is still RATE_LIMITED, causing the warm-up
+                        # safety filter to skip it; the next refresh then sees usage <100% and the
+                        # reset transition is lost.
+                        recovered_count = await reconcile_recoverable_account_statuses(
+                            accounts_repo=accounts_repo,
+                            usage_repo=usage_repo,
+                            accounts=refreshed_accounts,
+                        )
+                        if recovered_count:
+                            refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
                         dashboard_settings = await settings_repo.get_or_create()
                         warmup_service = LimitWarmupService(
                             warmup_repo,
@@ -118,7 +131,6 @@ class UsageRefreshScheduler:
                                 accounts_repo_factory=_background_accounts_repo,
                             ),
                         )
-                        refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
                         await warmup_service.run_after_usage_refresh(
                             accounts=refreshed_accounts,
                             settings=dashboard_settings,
@@ -126,11 +138,6 @@ class UsageRefreshScheduler:
                             before_secondary=before_secondary,
                             after_primary=after_primary,
                             after_secondary=after_secondary,
-                        )
-                        await reconcile_recoverable_account_statuses(
-                            accounts_repo=accounts_repo,
-                            usage_repo=usage_repo,
-                            accounts=refreshed_accounts,
                         )
                     await get_rate_limit_headers_cache().invalidate()
                     get_account_selection_cache().invalidate()
