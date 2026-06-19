@@ -193,8 +193,20 @@ class UsageRefreshScheduler:
                         settings_repo = SettingsRepository(session)
                         after_primary = await usage_repo.latest_by_account(window="primary")
                         after_secondary = await usage_repo.latest_by_account(window="secondary")
-                        dashboard_settings = await settings_repo.get_or_create()
                         refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
+                        # Recover post-reset RATE_LIMITED/QUOTA_EXCEEDED accounts before evaluating
+                        # limit warm-up candidates. Otherwise a 5h reset can be observed in usage
+                        # history while the account row is still RATE_LIMITED, causing the warm-up
+                        # safety filter to skip it; the next refresh then sees usage <100% and the
+                        # reset transition is lost.
+                        recovered_count = await reconcile_recoverable_account_statuses(
+                            accounts_repo=accounts_repo,
+                            usage_repo=usage_repo,
+                            accounts=refreshed_accounts,
+                        )
+                        if recovered_count:
+                            refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
+                        dashboard_settings = await settings_repo.get_or_create()
                         detach_session_objects(session)
                     warmup_service = LimitWarmupService(
                         cast(Any, _BackgroundLimitWarmupRepository()),
@@ -214,14 +226,6 @@ class UsageRefreshScheduler:
                         refresh_started_at=refresh_started_at,
                         usage_refresh_interval_seconds=self.interval_seconds,
                     )
-                    async with get_background_session() as session:
-                        usage_repo = UsageRepository(session)
-                        accounts_repo = AccountsRepository(session)
-                        await reconcile_recoverable_account_statuses(
-                            accounts_repo=accounts_repo,
-                            usage_repo=usage_repo,
-                            accounts=refreshed_accounts,
-                        )
                 if cycle_complete:
                     await _invalidate_usage_refresh_caches()
             except Exception:
