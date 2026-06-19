@@ -13,11 +13,12 @@ import {
 } from "@/utils/account-status";
 import { formatDateTimeInline, formatPercentNullable, formatQuotaResetLabel, formatSlug } from "@/utils/formatters";
 
-type AccountAction = "details" | "resume" | "reauth" | "warmup-toggle";
+export type AccountAction = "details" | "resume" | "reauth" | "warmup-toggle";
 
 export type AccountCardProps = {
   account: AccountSummary;
   showAccountId?: boolean;
+  readOnly?: boolean;
   onAction?: (account: AccountSummary, action: AccountAction) => void;
 };
 
@@ -65,15 +66,31 @@ function QuotaBar({
   );
 }
 
-export function AccountCard({ account, showAccountId = false, onAction }: AccountCardProps) {
+export function AccountCard({ account, showAccountId = false, readOnly = false, onAction }: AccountCardProps) {
   const blurred = usePrivacyStore((s) => s.blurred);
   const status = normalizeStatus(account.status);
   const primaryRemaining = account.usage?.primaryRemainingPercent ?? null;
   const secondaryRemaining = account.usage?.secondaryRemainingPercent ?? null;
+  const monthlyRemaining = account.usage?.monthlyRemainingPercent ?? null;
   const weeklyOnly = account.windowMinutesPrimary == null && account.windowMinutesSecondary != null;
+  const monthlyOnly =
+    account.windowMinutesMonthly != null &&
+    account.windowMinutesPrimary == null &&
+    account.windowMinutesSecondary == null;
+  const displayCredits = account.creditsBalance ?? (
+    monthlyOnly
+      ? account.remainingCreditsMonthly
+      : weeklyOnly
+        ? account.remainingCreditsSecondary
+        : (account.remainingCreditsSecondary ?? account.remainingCreditsPrimary)
+  );
+  const creditsLabel = account.creditsUnlimited ? "Unlimited" : (
+    displayCredits === null || displayCredits === undefined ? "-" : displayCredits.toFixed(2)
+  );
 
   const primaryReset = formatQuotaResetLabel(account.resetAtPrimary ?? null);
   const secondaryReset = formatQuotaResetLabel(account.resetAtSecondary ?? null);
+  const monthlyReset = formatQuotaResetLabel(account.resetAtMonthly ?? null);
 
   const title = account.displayName || account.email;
   const compactId = formatCompactAccountId(account.accountId);
@@ -113,9 +130,15 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
       </div>
 
       {/* Quota bars */}
-      <div className={cn("mt-3.5 grid gap-3", weeklyOnly ? "grid-cols-1" : "grid-cols-2")}>
-        {!weeklyOnly && <QuotaBar label="5h" percent={primaryRemaining} resetLabel={primaryReset} />}
-        <QuotaBar label="Weekly" percent={secondaryRemaining} resetLabel={secondaryReset} />
+      <div className={cn("mt-3.5 grid gap-3", weeklyOnly || monthlyOnly ? "grid-cols-1" : "grid-cols-2")}>
+        {monthlyOnly ? (
+          <QuotaBar label="Monthly" percent={monthlyRemaining} resetLabel={monthlyReset} />
+        ) : (
+          <>
+            {!weeklyOnly && <QuotaBar label="5h" percent={primaryRemaining} resetLabel={primaryReset} />}
+            <QuotaBar label="Weekly" percent={secondaryRemaining} resetLabel={secondaryReset} />
+          </>
+        )}
       </div>
 
       <div className="mt-3 flex items-center justify-between gap-2 rounded-lg bg-muted/40 px-2.5 py-2 text-xs">
@@ -134,11 +157,19 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
               : "text-muted-foreground hover:text-foreground",
           )}
           aria-label={warmupToggleLabel}
+          disabled={readOnly}
           onClick={() => onAction?.(account, "warmup-toggle")}
         >
           <Zap className="h-3 w-3" aria-hidden="true" />
           {account.limitWarmupEnabled ? "On" : "Off"}
         </Button>
+      </div>
+
+      <div className="mt-3 text-xs text-muted-foreground">
+        Credits:{" "}
+        <span className="font-medium tabular-nums text-foreground">
+          {creditsLabel}
+        </span>
       </div>
 
       {/* Actions */}
@@ -159,18 +190,20 @@ export function AccountCard({ account, showAccountId = false, onAction }: Accoun
             size="sm"
             variant="ghost"
             className="h-7 gap-1.5 rounded-lg text-xs text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-700 dark:text-emerald-400 dark:hover:text-emerald-300"
+            disabled={readOnly}
             onClick={() => onAction?.(account, "resume")}
           >
             <Play className="h-3 w-3" />
             Resume
           </Button>
         )}
-        {status === "deactivated" && (
+        {(status === "reauth" || status === "deactivated") && (
           <Button
             type="button"
             size="sm"
             variant="ghost"
             className="h-7 gap-1.5 rounded-lg text-xs text-amber-600 hover:bg-amber-500/10 hover:text-amber-700 dark:text-amber-400 dark:hover:text-amber-300"
+            disabled={readOnly}
             onClick={() => onAction?.(account, "reauth")}
           >
             <RotateCcw className="h-3 w-3" />

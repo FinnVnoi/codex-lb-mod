@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, Body, Depends, Query
 from fastapi.responses import JSONResponse
 
-from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
+from app.core.auth.dependencies import (
+    require_dashboard_write_access,
+    set_dashboard_error_format,
+    validate_dashboard_session,
+)
 from app.core.clients.oauth import OAuthError
 from app.core.errors import dashboard_error
 from app.dependencies import OauthContext, get_oauth_context
@@ -17,6 +23,8 @@ from app.modules.oauth.schemas import (
     OauthStatusResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(
     prefix="/api/oauth",
     tags=["dashboard"],
@@ -27,6 +35,7 @@ router = APIRouter(
 @router.post("/start", response_model=OauthStartResponse)
 async def start_oauth(
     request: OauthStartRequest,
+    _write_access=Depends(require_dashboard_write_access),
     context: OauthContext = Depends(get_oauth_context),
 ) -> OauthStartResponse | JSONResponse:
     try:
@@ -54,6 +63,7 @@ async def oauth_status(
 @router.post("/complete", response_model=OauthCompleteResponse)
 async def complete_oauth(
     request: OauthCompleteRequest | None = Body(default=None),
+    _write_access=Depends(require_dashboard_write_access),
     context: OauthContext = Depends(get_oauth_context),
 ) -> OauthCompleteResponse | JSONResponse:
     try:
@@ -68,12 +78,19 @@ async def complete_oauth(
 @router.post("/manual-callback", response_model=ManualCallbackResponse)
 async def manual_callback(
     request: ManualCallbackRequest,
+    _write_access=Depends(require_dashboard_write_access),
     context: OauthContext = Depends(get_oauth_context),
 ) -> ManualCallbackResponse | JSONResponse:
     try:
         return await context.service.manual_callback(request.callback_url, flow_id=request.flow_id)
-    except Exception as exc:
+    except OAuthError as exc:
+        return JSONResponse(
+            status_code=502,
+            content=dashboard_error(exc.code, exc.message),
+        )
+    except Exception:
+        logger.exception("manual_callback failed")
         return JSONResponse(
             status_code=500,
-            content=dashboard_error("manual_callback_failed", str(exc)),
+            content=dashboard_error("manual_callback_failed", "An internal error occurred."),
         )

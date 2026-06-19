@@ -14,10 +14,8 @@ from app.core.usage.logs import RequestLogLike, calculated_cost_from_log
 from app.core.usage.types import BucketModelAggregate, RequestActivityAggregate
 from app.core.utils.request_id import ensure_request_id
 from app.core.utils.time import utcnow
-from app.db.models import Account, ApiKey, RequestLog
+from app.db.models import Account, ApiKey, RequestKind, RequestLog
 from app.db.session import sqlite_writer_section
-
-_INTERNAL_LIMIT_WARMUP_SOURCE = "limit_warmup"
 
 
 @dataclass(frozen=True, slots=True)
@@ -30,9 +28,16 @@ class RequestLogsRepository:
     def __init__(self, session: AsyncSession) -> None:
         self._session = session
 
+    @staticmethod
+    def _exclude_warmup_clause() -> ColumnElement[bool]:
+        return RequestLog.request_kind.not_in((RequestKind.WARMUP.value, "limit_warmup"))
+
     async def list_since(self, since: datetime) -> list[RequestLog]:
         result = await self._session.execute(
-            select(RequestLog).where(RequestLog.requested_at >= since, _normal_traffic_clause())
+            select(RequestLog).where(
+                RequestLog.requested_at >= since,
+                self._exclude_warmup_clause(),
+            )
         )
         return list(result.scalars().all())
 
@@ -105,7 +110,8 @@ class RequestLogsRepository:
                 func.coalesce(func.sum(RequestLog.reasoning_tokens), 0).label("reasoning_tokens"),
                 func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
             )
-            .where(RequestLog.requested_at >= since, _normal_traffic_clause())
+            .where(RequestLog.requested_at >= since)
+            .where(self._exclude_warmup_clause())
             .group_by(bucket_col, RequestLog.model, RequestLog.service_tier)
             .order_by(bucket_col)
         )
@@ -127,17 +133,7 @@ class RequestLogsRepository:
         ]
 
     async def aggregate_activity_since(self, since: datetime) -> RequestActivityAggregate:
-        stmt = select(
-            func.count().label("request_count"),
-            func.coalesce(
-                func.sum(cast(RequestLog.status != literal_column("'success'"), Integer)),
-                0,
-            ).label("error_count"),
-            func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
-            func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
-            func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
-            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
-        ).where(RequestLog.requested_at >= since, _normal_traffic_clause())
+        stmt = self._aggregate_activity_stmt(since)
         result = await self._session.execute(stmt)
         row = result.one()
         return RequestActivityAggregate(
@@ -149,12 +145,56 @@ class RequestLogsRepository:
             cost_usd=float(row.cost_usd or 0.0),
         )
 
+    async def aggregate_activity_between(self, since: datetime, until: datetime) -> RequestActivityAggregate:
+        stmt = self._aggregate_activity_stmt(since, until)
+        result = await self._session.execute(stmt)
+        row = result.one()
+        return RequestActivityAggregate(
+            request_count=int(row.request_count),
+            error_count=int(row.error_count),
+            input_tokens=int(row.input_tokens),
+            output_tokens=int(row.output_tokens),
+            cached_input_tokens=int(row.cached_input_tokens),
+            cost_usd=float(row.cost_usd or 0.0),
+        )
+
+    def _aggregate_activity_stmt(self, since: datetime, until: datetime | None = None):
+        stmt = select(
+            func.count().label("request_count"),
+            func.coalesce(
+                func.sum(cast(RequestLog.status != literal_column("'success'"), Integer)),
+                0,
+            ).label("error_count"),
+            func.coalesce(func.sum(RequestLog.input_tokens), 0).label("input_tokens"),
+            func.coalesce(func.sum(RequestLog.output_tokens), 0).label("output_tokens"),
+            func.coalesce(func.sum(RequestLog.cached_input_tokens), 0).label("cached_input_tokens"),
+            func.coalesce(func.sum(RequestLog.cost_usd), 0.0).label("cost_usd"),
+        ).where(
+            RequestLog.requested_at >= since,
+            self._exclude_warmup_clause(),
+        )
+        if until is not None:
+            stmt = stmt.where(RequestLog.requested_at < until)
+        return stmt
+
     async def top_error_since(self, since: datetime) -> str | None:
+        stmt = self._top_error_stmt(since)
+        result = await self._session.execute(stmt)
+        row = result.first()
+        return str(row[0]) if row and row[0] else None
+
+    async def top_error_between(self, since: datetime, until: datetime) -> str | None:
+        stmt = self._top_error_stmt(since, until)
+        result = await self._session.execute(stmt)
+        row = result.first()
+        return str(row[0]) if row and row[0] else None
+
+    def _top_error_stmt(self, since: datetime, until: datetime | None = None):
         stmt = (
             select(RequestLog.error_code, func.count(RequestLog.id).label("error_count"))
             .where(
                 RequestLog.requested_at >= since,
-                _normal_traffic_clause(),
+                self._exclude_warmup_clause(),
                 RequestLog.status != "success",
                 RequestLog.error_code.is_not(None),
             )
@@ -162,9 +202,15 @@ class RequestLogsRepository:
             .order_by(func.count(RequestLog.id).desc(), RequestLog.error_code.asc())
             .limit(1)
         )
+        if until is not None:
+            stmt = stmt.where(RequestLog.requested_at < until)
+        return stmt
+
+    async def earliest_activity_at(self) -> datetime | None:
+        stmt = select(func.min(RequestLog.requested_at)).where(self._exclude_warmup_clause())
         result = await self._session.execute(stmt)
-        row = result.first()
-        return str(row[0]) if row and row[0] else None
+        value = result.scalar_one_or_none()
+        return value if isinstance(value, datetime) else None
 
     async def add_log(
         self,
@@ -190,12 +236,30 @@ class RequestLogsRepository:
         session_id: str | None = None,
         plan_type: str | None = None,
         source: str | None = None,
+        useragent: str | None = None,
+        useragent_group: str | None = None,
+        failure_phase: str | None = None,
+        failure_detail: str | None = None,
+        failure_exception_type: str | None = None,
+        upstream_status_code: int | None = None,
+        upstream_error_code: str | None = None,
+        bridge_stage: str | None = None,
+        request_kind: str = RequestKind.NORMAL.value,
+        upstream_proxy_route_mode: str | None = None,
+        upstream_proxy_pool_id: str | None = None,
+        upstream_proxy_endpoint_id: str | None = None,
+        upstream_proxy_fallback_used: bool | None = None,
+        upstream_proxy_fail_closed_reason: str | None = None,
     ) -> RequestLog:
         async with sqlite_writer_section():
             resolved_request_id = ensure_request_id(request_id)
             resolved_plan_type = plan_type
             if resolved_plan_type is None and account_id:
                 resolved_plan_type = await self._resolve_account_plan_type(account_id)
+            resolved_useragent = useragent if not isinstance(useragent, str) or useragent.strip() else None
+            resolved_useragent_group = (
+                useragent_group if not isinstance(useragent_group, str) or useragent_group.strip() else None
+            )
             log = RequestLog(
                 account_id=account_id,
                 api_key_id=api_key_id,
@@ -203,8 +267,10 @@ class RequestLogsRepository:
                 request_id=resolved_request_id,
                 model=model,
                 plan_type=resolved_plan_type,
-                source=source,
                 transport=transport,
+                request_kind=request_kind,
+                useragent=resolved_useragent,
+                useragent_group=resolved_useragent_group,
                 service_tier=service_tier,
                 requested_service_tier=requested_service_tier,
                 actual_service_tier=actual_service_tier,
@@ -219,6 +285,17 @@ class RequestLogsRepository:
                 status=status,
                 error_code=error_code,
                 error_message=error_message,
+                failure_phase=failure_phase,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+                upstream_status_code=upstream_status_code,
+                upstream_error_code=upstream_error_code,
+                bridge_stage=bridge_stage,
+                upstream_proxy_route_mode=upstream_proxy_route_mode,
+                upstream_proxy_pool_id=upstream_proxy_pool_id,
+                upstream_proxy_endpoint_id=upstream_proxy_endpoint_id,
+                upstream_proxy_fallback_used=upstream_proxy_fallback_used,
+                upstream_proxy_fail_closed_reason=upstream_proxy_fail_closed_reason,
                 requested_at=requested_at or utcnow(),
             )
             log.cost_usd = calculated_cost_from_log(typing_cast(RequestLogLike, log))
@@ -301,8 +378,7 @@ class RequestLogsRepository:
             exclude_soft_deleted=True,
         )
 
-        total_col = func.count().over().label("_total")
-        stmt = select(RequestLog, total_col).order_by(RequestLog.requested_at.desc(), RequestLog.id.desc())
+        stmt = select(RequestLog).order_by(RequestLog.requested_at.desc(), RequestLog.id.desc())
         stmt = self._apply_related_search_joins(stmt, filters.needs_related_search_joins)
         if filters.conditions:
             stmt = stmt.where(and_(*filters.conditions))
@@ -311,11 +387,8 @@ class RequestLogsRepository:
         if limit:
             stmt = stmt.limit(limit)
         result = await self._session.execute(stmt)
-        rows = result.all()
-        if not rows:
-            return [], await self._count_recent(filters)
-        logs = [row[0] for row in rows]
-        total = rows[0][1]
+        logs = list(result.scalars().all())
+        total = await self._count_recent(filters)
         return logs, total
 
     async def _count_recent(self, filters: _RequestLogFilters) -> int:
@@ -433,7 +506,7 @@ class RequestLogsRepository:
         error_codes_excluding: list[str] | None = None,
         exclude_soft_deleted: bool = False,
     ) -> _RequestLogFilters:
-        conditions = [_normal_traffic_clause()]
+        conditions = []
         if exclude_soft_deleted:
             conditions.append(RequestLog.deleted_at.is_(None))
         if since is not None:
@@ -523,7 +596,3 @@ async def _safe_rollback(session: AsyncSession) -> None:
             await session.rollback()
     except BaseException:
         return
-
-
-def _normal_traffic_clause():
-    return or_(RequestLog.source.is_(None), RequestLog.source != _INTERNAL_LIMIT_WARMUP_SOURCE)

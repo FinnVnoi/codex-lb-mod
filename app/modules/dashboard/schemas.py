@@ -33,11 +33,23 @@ class DashboardUsageMetrics(DashboardModel):
     top_error: str | None = None
 
 
+class DashboardMetricsComparisonPrevious(DashboardModel):
+    requests: int
+    tokens: int
+    cost_usd: float = Field(alias="costUsd")
+
+
+class DashboardMetricsComparison(DashboardModel):
+    can_compare: bool = Field(alias="canCompare")
+    previous: DashboardMetricsComparisonPrevious
+
+
 class DashboardOverviewSummary(DashboardModel):
     primary_window: UsageWindow
     secondary_window: UsageWindow | None = None
     cost: DashboardUsageCost
     metrics: DashboardUsageMetrics | None = None
+    comparison: DashboardMetricsComparison | None = None
 
 
 class DashboardUsageWindows(DashboardModel):
@@ -93,6 +105,12 @@ class DashboardOverviewResponse(DashboardModel):
     summary: DashboardOverviewSummary
     windows: DashboardUsageWindows
     trends: MetricsTrends
+    depletion_primary: DepletionResponse | None = None
+    depletion_secondary: DepletionResponse | None = None
+    weekly_credit_pace: WeeklyCreditPaceResponse | None = None
+
+
+class DashboardProjectionsResponse(DashboardModel):
     depletion_primary: DepletionResponse | None = None
     depletion_secondary: DepletionResponse | None = None
     weekly_credit_pace: WeeklyCreditPaceResponse | None = None

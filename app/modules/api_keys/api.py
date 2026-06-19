@@ -3,7 +3,11 @@ from __future__ import annotations
 from fastapi import APIRouter, Body, Depends, Request, Response
 
 from app.core.audit.service import AuditService
-from app.core.auth.dependencies import set_dashboard_error_format, validate_dashboard_session
+from app.core.auth.dependencies import (
+    require_dashboard_write_access,
+    set_dashboard_error_format,
+    validate_dashboard_session,
+)
 from app.core.exceptions import DashboardBadRequestError, DashboardNotFoundError
 from app.dependencies import ApiKeysContext, get_api_keys_context
 from app.modules.api_keys.schemas import (
@@ -43,6 +47,7 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         enforced_model=row.enforced_model,
         enforced_reasoning_effort=row.enforced_reasoning_effort,
         enforced_service_tier=row.enforced_service_tier,
+        traffic_class=row.traffic_class,
         expires_at=row.expires_at,
         is_active=row.is_active,
         account_assignment_scope_enabled=row.account_assignment_scope_enabled,
@@ -113,6 +118,7 @@ def _build_limit_inputs(payload: ApiKeyCreateRequest | ApiKeyUpdateRequest) -> l
 async def create_api_key(
     request: Request,
     payload: ApiKeyCreateRequest = Body(...),
+    _write_access=Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyCreateResponse:
     limit_inputs = _build_limit_inputs(payload)
@@ -126,6 +132,7 @@ async def create_api_key(
                 enforced_model=payload.enforced_model,
                 enforced_reasoning_effort=payload.enforced_reasoning_effort,
                 enforced_service_tier=payload.enforced_service_tier,
+                traffic_class=payload.traffic_class or "foreground",
                 expires_at=payload.expires_at,
                 assigned_account_ids=payload.assigned_account_ids,
                 limits=limit_inputs,
@@ -158,6 +165,7 @@ async def update_api_key(
     request: Request,
     key_id: str,
     payload: ApiKeyUpdateRequest = Body(...),
+    _write_access=Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyResponse:
     fields = payload.model_fields_set
@@ -178,6 +186,8 @@ async def update_api_key(
         enforced_reasoning_effort_set="enforced_reasoning_effort" in fields,
         enforced_service_tier=payload.enforced_service_tier,
         enforced_service_tier_set="enforced_service_tier" in fields,
+        traffic_class=payload.traffic_class,
+        traffic_class_set="traffic_class" in fields,
         expires_at=payload.expires_at,
         expires_at_set="expires_at" in fields,
         is_active=payload.is_active,
@@ -207,6 +217,7 @@ async def update_api_key(
 async def delete_api_key(
     request: Request,
     key_id: str,
+    _write_access=Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> Response:
     try:
@@ -224,6 +235,7 @@ async def delete_api_key(
 @router.post("/{key_id}/regenerate", response_model=ApiKeyCreateResponse)
 async def regenerate_api_key(
     key_id: str,
+    _write_access=Depends(require_dashboard_write_access),
     context: ApiKeysContext = Depends(get_api_keys_context),
 ) -> ApiKeyCreateResponse:
     try:

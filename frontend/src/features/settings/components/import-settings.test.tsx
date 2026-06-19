@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
 import { ImportSettings } from "@/features/settings/components/import-settings";
+import { buildSettingsUpdateRequest } from "@/features/settings/payload";
 import { createDashboardSettings } from "@/test/mocks/factories";
 
 describe("ImportSettings", () => {
@@ -19,7 +20,7 @@ describe("ImportSettings", () => {
     expect(screen.getByText("Allow import without overwrite")).toBeInTheDocument();
     expect(
       screen.getByText(
-        "Keep duplicate imports as separate accounts instead of replacing existing ones.",
+        "Keep separate workspace or unknown credential slots instead of replacing by email.",
       ),
     ).toBeInTheDocument();
   });
@@ -60,23 +61,7 @@ describe("ImportSettings", () => {
 
     expect(payload.importWithoutOverwrite).toBe(true);
 
-    expect(payload).toStrictEqual({
-      stickyThreadsEnabled: settings.stickyThreadsEnabled,
-      upstreamStreamTransport: settings.upstreamStreamTransport,
-      preferEarlierResetAccounts: settings.preferEarlierResetAccounts,
-      routingStrategy: settings.routingStrategy,
-      openaiCacheAffinityMaxAgeSeconds: settings.openaiCacheAffinityMaxAgeSeconds,
-      dashboardSessionTtlSeconds: settings.dashboardSessionTtlSeconds,
-      importWithoutOverwrite: true,
-      totpRequiredOnLogin: settings.totpRequiredOnLogin,
-      apiKeyAuthEnabled: settings.apiKeyAuthEnabled,
-      limitWarmupEnabled: settings.limitWarmupEnabled,
-      limitWarmupWindows: settings.limitWarmupWindows,
-      limitWarmupModel: settings.limitWarmupModel,
-      limitWarmupPrompt: settings.limitWarmupPrompt,
-      limitWarmupCooldownSeconds: settings.limitWarmupCooldownSeconds,
-      limitWarmupMinAvailablePercent: settings.limitWarmupMinAvailablePercent,
-    });
+    expect(payload).toStrictEqual(buildSettingsUpdateRequest(settings, { importWithoutOverwrite: true }));
   });
 
   it("disables the switch when busy is true", () => {

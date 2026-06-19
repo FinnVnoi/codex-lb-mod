@@ -6,6 +6,11 @@ import { ensureLocalStorageShim } from "@/test/local-storage-shim";
 import { resetMockState } from "@/test/mocks/handlers";
 import { server, startMockServer } from "@/test/mocks/server";
 
+vi.mock("@/components/lazy-recharts", async () => {
+  const recharts = await import("recharts");
+  return { ...recharts };
+});
+
 if (typeof window !== "undefined" && typeof window.matchMedia !== "function") {
   Object.defineProperty(window, "matchMedia", {
     writable: true,
@@ -27,6 +32,34 @@ if (typeof document !== "undefined" && typeof document.elementFromPoint !== "fun
 }
 
 ensureLocalStorageShim();
+
+if (typeof Element !== "undefined") {
+  const proto = Element.prototype as unknown as Record<string, unknown>;
+  if (typeof proto.hasPointerCapture !== "function") {
+    Object.defineProperty(Element.prototype, "hasPointerCapture", {
+      configurable: true,
+      value: () => false,
+    });
+  }
+  if (typeof proto.setPointerCapture !== "function") {
+    Object.defineProperty(Element.prototype, "setPointerCapture", {
+      configurable: true,
+      value: () => {},
+    });
+  }
+  if (typeof proto.releasePointerCapture !== "function") {
+    Object.defineProperty(Element.prototype, "releasePointerCapture", {
+      configurable: true,
+      value: () => {},
+    });
+  }
+  if (typeof proto.scrollIntoView !== "function") {
+    Object.defineProperty(Element.prototype, "scrollIntoView", {
+      configurable: true,
+      value: () => {},
+    });
+  }
+}
 
 if (typeof globalThis.ResizeObserver === "undefined") {
   class ResizeObserverMock {

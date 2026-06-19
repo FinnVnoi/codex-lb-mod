@@ -17,6 +17,21 @@ from pathlib import Path
 
 _VERSION_RE = re.compile(r"^(?P<base>\d+\.\d+\.\d+)(?:-(?P<channel>alpha|beta|rc)\.(?P<serial>[1-9]\d*))?$")
 _TAG_RE = re.compile(r"^v(?P<version>\d+\.\d+\.\d+(?:-(?:alpha|beta|rc)\.[1-9]\d*)?)$")
+_CONVENTIONAL_SUBJECT_RE = re.compile(r"^(?P<type>[a-z][a-z0-9-]*)(?:\([^)]+\))?(?P<breaking>!)?: (?P<description>.+)$")
+_RELEASABLE_CONVENTIONAL_TYPES = frozenset({"deps", "feat", "fix", "perf", "revert"})
+_PEP440_PRERELEASE_RE = re.compile(r"^(?P<base>\d+\.\d+\.\d+)(?P<channel>a|b|rc)(?P<serial>[1-9]\d*)$")
+_PEP440_CHANNELS = {
+    "a": "alpha",
+    "b": "beta",
+    "rc": "rc",
+}
+
+
+@dataclass(frozen=True)
+class CommitMessage:
+    sha: str
+    subject: str
+    body: str
 
 
 @dataclass(frozen=True)
@@ -176,8 +191,27 @@ def read_project_versions(root: Path) -> dict[str, str]:
     }
 
 
+def canonical_release_version(value: str) -> str:
+    match = _PEP440_PRERELEASE_RE.fullmatch(value)
+    if match is None:
+        return value
+    channel = _PEP440_CHANNELS[match.group("channel")]
+    return f"{match.group('base')}-{channel}.{match.group('serial')}"
+
+
+def canonical_release_version_for_file(name: str, value: str) -> str:
+    if name == "uv.lock":
+        return canonical_release_version(value)
+    return value
+
+
 def assert_project_versions(root: Path, expected_version: str) -> None:
-    mismatches = {name: actual for name, actual in read_project_versions(root).items() if actual != expected_version}
+    expected = canonical_release_version(expected_version)
+    mismatches = {
+        name: actual
+        for name, actual in read_project_versions(root).items()
+        if canonical_release_version_for_file(name, actual) != canonical_release_version_for_file(name, expected)
+    }
     if mismatches:
         detail = ", ".join(f"{name}={actual!r}" for name, actual in sorted(mismatches.items()))
         raise ValueError(f"release version drift: expected {expected_version!r}; {detail}")
@@ -192,6 +226,64 @@ def run_git(root: Path, *args: str, check: bool = True) -> subprocess.CompletedP
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
+
+
+def is_releasable_conventional_commit(subject: str, body: str = "") -> bool:
+    """Return whether a commit should open/update a release-please-style beta PR.
+
+    The beta channel should not advance for workflow-only noise such as
+    ``ci: ...`` after the previous beta tag. Match release-please's semver
+    intent rather than GitHub's broader generated release notes: feature, fix,
+    perf, dependency, revert, and breaking-change commits are releasable.
+    """
+
+    match = _CONVENTIONAL_SUBJECT_RE.fullmatch(subject.strip())
+    if not match:
+        return False
+    if match.group("breaking"):
+        return True
+    if "BREAKING CHANGE:" in body or "BREAKING-CHANGE:" in body:
+        return True
+    return match.group("type") in _RELEASABLE_CONVENTIONAL_TYPES
+
+
+def commit_messages_since(root: Path, ref: str) -> list[CommitMessage]:
+    """Return commits after *ref* in oldest-to-newest order."""
+
+    proc = run_git(root, "log", "--reverse", "--format=%H%x00%s%x00%b%x1e", f"{ref}..HEAD")
+    commits: list[CommitMessage] = []
+    for record in proc.stdout.rstrip("\x1e\n").split("\x1e"):
+        if not record.strip():
+            continue
+        parts = record.split("\x00", 2)
+        if len(parts) != 3:
+            raise ValueError(f"unexpected git log record while reading commits since {ref!r}")
+        sha, subject, body = parts
+        commits.append(CommitMessage(sha=sha, subject=subject, body=body))
+    return commits
+
+
+def releasable_commits_since(root: Path, ref: str) -> list[CommitMessage]:
+    return [
+        commit
+        for commit in commit_messages_since(root, ref)
+        if is_releasable_conventional_commit(commit.subject, commit.body)
+    ]
+
+
+def latest_stable_tag(root: Path) -> str | None:
+    proc = run_git(root, "tag", "--merged", "HEAD", "--sort=-v:refname")
+    stable_tag = re.compile(r"^v\d+\.\d+\.\d+$")
+    return next((tag for tag in proc.stdout.splitlines() if stable_tag.fullmatch(tag)), None)
+
+
+def format_beta_changelog(root: Path, ref: str) -> str:
+    commits = releasable_commits_since(root, ref)
+    if not commits:
+        return f"No releasable Conventional Commits since `{ref}`."
+
+    lines = [f"- {commit.subject} ({commit.sha[:7]})" for commit in commits]
+    return "\n".join(lines)
 
 
 def discover_release_please_base_version(root: Path) -> str:
