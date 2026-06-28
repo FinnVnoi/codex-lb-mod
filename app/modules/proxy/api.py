@@ -74,6 +74,12 @@ from app.core.exceptions import (
 )
 from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, bridge_public_contract_error_total
 from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, resolve_connection_client_ip
+from app.core.openai.anthropic import (
+    AnthropicMessageResponse,
+    AnthropicMessagesRequest,
+    anthropic_message_from_chat_completion,
+    stream_anthropic_messages,
+)
 from app.core.openai.chat_requests import ChatCompletionsRequest
 from app.core.openai.chat_responses import (
     ChatCompletion,
@@ -3277,6 +3283,95 @@ def _raw_optional_string(raw: Mapping[str, JsonValue], key: str) -> str | None:
     return value if isinstance(value, str) else None
 
 
+@v1_router.post("/messages", response_model=AnthropicMessageResponse, response_model_exclude_none=True)
+async def v1_anthropic_messages(
+    request: Request,
+    payload: AnthropicMessagesRequest = Body(...),
+    context: ProxyContext = Depends(get_proxy_context),
+    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
+) -> Response:
+    """Anthropic Messages-compatible adapter backed by the Responses proxy."""
+
+    rate_limit_headers = await context.service.rate_limit_headers()
+    effective_model = _effective_model_for_api_key(api_key, payload.model)
+    validate_model_access(api_key, effective_model)
+    try:
+        responses_payload = payload.to_responses_request()
+    except ClientPayloadError as exc:
+        error = openai_client_payload_error(exc)
+        return _anthropic_logged_error_response(request, 400, error, headers=rate_limit_headers)
+    except ValidationError as exc:
+        error = openai_validation_error(exc)
+        return _anthropic_logged_error_response(request, 400, error, headers=rate_limit_headers)
+
+    apply_api_key_enforcement(responses_payload, api_key)
+    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=responses_payload.model)
+    if admission_denial is not None:
+        return _anthropic_response_from_openai_json_response(request, admission_denial)
+
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=responses_payload.model,
+        request_service_tier=responses_payload.service_tier,
+        request_usage_budget=estimate_api_key_request_usage(responses_payload),
+    )
+    responses_payload.stream = True
+    stream = context.service.stream_responses(
+        responses_payload,
+        request.headers,
+        codex_session_affinity=False,
+        propagate_http_errors=True,
+        openai_cache_affinity=True,
+        api_key=api_key,
+        api_key_reservation=reservation,
+        suppress_text_done_events=True,
+    )
+    stream, startup_error = await _probe_chat_stream_startup_error(
+        stream,
+        timeout_seconds=_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS,
+    )
+    if startup_error is not None:
+        return _anthropic_stream_startup_error_response(request, startup_error, headers=rate_limit_headers)
+
+    if payload.stream:
+        anthropic_stream = stream_anthropic_messages(
+            _stream_proxy_errors_as_response_failed(stream),
+            model=responses_payload.model,
+        )
+        return StreamingResponse(
+            inject_sse_keepalives(
+                anthropic_stream,
+                get_settings().sse_keepalive_interval_seconds,
+            ),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", **rate_limit_headers},
+        )
+
+    try:
+        first = await stream.__anext__()
+    except StopAsyncIteration:
+        first = None
+    except ProxyResponseError as exc:
+        return _anthropic_logged_error_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+
+    stream_with_first = _prepend_first(first, stream)
+    result = await collect_chat_completion(stream_with_first, model=responses_payload.model)
+    if isinstance(result, OpenAIErrorEnvelopeModel):
+        status_code = _status_for_error(result.error)
+        return _anthropic_logged_error_response(
+            request,
+            status_code,
+            result.model_dump(mode="json", exclude_none=True),
+            headers=rate_limit_headers,
+        )
+    anthropic = anthropic_message_from_chat_completion(result, model=responses_payload.model)
+    return JSONResponse(
+        content=anthropic.model_dump(mode="json", exclude_none=True),
+        status_code=200,
+        headers=rate_limit_headers,
+    )
+
+
 @v1_router.post(
     "/chat/completions",
     response_model=ChatCompletionResult,
@@ -5667,6 +5762,125 @@ def _stream_event_error_envelope(event_block: str) -> OpenAIErrorEnvelopeModel |
 
 def _parse_sse_payload(line: str) -> dict[str, JsonValue] | None:
     return parse_sse_data_json(line)
+
+
+def _anthropic_stream_startup_error_response(
+    request: Request,
+    error: ProxyResponseError | OpenAIErrorEnvelopeModel,
+    *,
+    headers: Mapping[str, str],
+) -> JSONResponse:
+    if isinstance(error, ProxyResponseError):
+        envelope = _parse_error_envelope(error.payload)
+        status_code, envelope = _mask_previous_response_not_found_error(envelope, default_status=error.status_code)
+        return _anthropic_logged_error_response(
+            request,
+            status_code,
+            envelope.model_dump(mode="json", exclude_none=True),
+            headers=headers,
+        )
+    status_code, envelope = _mask_previous_response_not_found_error(error)
+    return _anthropic_logged_error_response(
+        request,
+        status_code,
+        envelope.model_dump(mode="json", exclude_none=True),
+        headers=headers,
+    )
+
+
+def _anthropic_response_from_openai_json_response(request: Request, response: JSONResponse) -> JSONResponse:
+    try:
+        content = json.loads(response.body.decode("utf-8"))
+    except (UnicodeDecodeError, JSONDecodeError, AttributeError):
+        content = openai_error("upstream_error", "Upstream error", error_type="server_error")
+    headers = {
+        key: value
+        for key, value in response.headers.items()
+        if key.lower() not in {"content-length", "content-type"}
+    }
+    return _anthropic_logged_error_response(
+        request,
+        response.status_code,
+        content if isinstance(content, Mapping) else openai_error("upstream_error", "Upstream error"),
+        headers=headers,
+    )
+
+
+def _anthropic_logged_error_response(
+    request: Request,
+    status_code: int,
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+    *,
+    headers: Mapping[str, str] | None = None,
+) -> JSONResponse:
+    code, message = _error_details_from_content(content)
+    effective_headers = dict(headers or {})
+    if status_code == 429 and is_local_overload_error_code(code):
+        effective_headers = merge_retry_after_headers(effective_headers)
+    log_error_response(
+        logger,
+        request,
+        status_code,
+        code,
+        message,
+        category="proxy_error_response",
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content=_anthropic_error_content(status_code, content),
+        headers=effective_headers or None,
+    )
+
+
+def _anthropic_error_content(
+    status_code: int,
+    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
+) -> dict[str, JsonValue]:
+    if isinstance(content, OpenAIErrorEnvelopeModel):
+        envelope = content
+    else:
+        envelope = _parse_error_envelope(cast(JsonValue, content))
+    error = envelope.error
+    code = error.code if error is not None else None
+    message = error.message if error is not None and error.message else None
+    if message is None:
+        _, message = _error_details_from_content(content)
+    return {
+        "type": "error",
+        "error": {
+            "type": _anthropic_error_type(status_code, error),
+            "message": message or "Upstream error",
+            **({"code": code} if code else {}),
+        },
+    }
+
+
+def _anthropic_error_type(status_code: int, error: OpenAIError | None) -> str:
+    raw_type = error.type if error is not None else None
+    code = error.code if error is not None else None
+    if raw_type in {
+        "invalid_request_error",
+        "authentication_error",
+        "permission_error",
+        "not_found_error",
+        "rate_limit_error",
+        "api_error",
+        "overloaded_error",
+    }:
+        return raw_type
+    if status_code == 400:
+        return "invalid_request_error"
+    if status_code == 401:
+        return "authentication_error"
+    if status_code == 403:
+        return "permission_error"
+    if status_code == 404:
+        return "not_found_error"
+    if status_code == 429 or code in {"rate_limit_exceeded", "usage_limit_reached", "insufficient_quota"}:
+        return "rate_limit_error"
+    if status_code in {502, 503, 504, 529}:
+        return "overloaded_error" if code and is_local_overload_error_code(code) else "api_error"
+    return "api_error"
 
 
 def _logged_error_json_response(
