@@ -56,6 +56,10 @@ async def validate_proxy_api_key(
     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
 ) -> ApiKeyData | None:
     authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    if authorization is None:
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            authorization = f"Bearer {x_api_key}"
     return await validate_proxy_api_key_authorization(authorization, request=request)
 
 
@@ -114,7 +118,12 @@ async def validate_usage_api_key(
     Bearer API key, regardless of the global ``api_key_auth_enabled`` setting.
     Raises ProxyAuthError when the key is missing or invalid.
     """
-    token = _extract_bearer_token(None if credentials is None else f"Bearer {credentials.credentials}")
+    authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    if authorization is None:
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            authorization = f"Bearer {x_api_key}"
+    token = _extract_bearer_token(authorization)
     if not token:
         raise ProxyAuthError("Missing API key in Authorization header")
 
