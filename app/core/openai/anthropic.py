@@ -532,6 +532,7 @@ async def stream_anthropic_messages(
     tool_index_by_key: dict[str, int] = {}
     next_index = 0
     completed = False
+    terminal_seen = False
 
     def event(event_type: str, payload: Mapping[str, JsonValue]) -> str:
         data = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
@@ -557,6 +558,13 @@ async def stream_anthropic_messages(
     async for line in stream:
         payload = parse_sse_data_json(line)
         if not payload:
+            continue
+        if terminal_seen:
+            # Keep draining the upstream Responses stream after the terminal
+            # event so proxy-side finally blocks can settle API-key usage
+            # reservations. Returning immediately here closes the upstream
+            # generator at the terminal yield point, which releases the
+            # reservation instead of finalizing it with the usage payload.
             continue
         event_type = payload.get("type")
 
@@ -622,12 +630,14 @@ async def stream_anthropic_messages(
                 raw_output = usage.get("output_tokens")
                 input_tokens = raw_input if isinstance(raw_input, int) else input_tokens
                 output_tokens = raw_output if isinstance(raw_output, int) else output_tokens
-            break
+            terminal_seen = True
+            continue
 
         if event_type in ("response.failed", "error"):
             yield _anthropic_error_event(payload)
             completed = True
-            break
+            terminal_seen = True
+            continue
 
     if text_index is None and not content_started and not tool_index_by_key:
         text_index = next_index
