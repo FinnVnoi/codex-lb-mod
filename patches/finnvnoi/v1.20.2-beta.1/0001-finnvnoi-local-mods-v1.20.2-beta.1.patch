@@ -1,0 +1,2343 @@
+diff --git a/app/core/auth/__init__.py b/app/core/auth/__init__.py
+index e8a7c335..acde69cb 100644
+--- a/app/core/auth/__init__.py
++++ b/app/core/auth/__init__.py
+@@ -7,7 +7,7 @@ from dataclasses import dataclass
+ from datetime import datetime
+ from uuid import uuid4
+ 
+-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
++from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+ 
+ DEFAULT_EMAIL = "unknown@example.com"
+ DEFAULT_PLAN = "unknown"
+@@ -33,6 +33,50 @@ class AuthFile(BaseModel):
+         validation_alias=AliasChoices("lastRefreshAt", "last_refresh"),
+         serialization_alias="lastRefreshAt",
+     )
++    email: str | None = None
++
++    @model_validator(mode="before")
++    @classmethod
++    def _accept_flat_codex_tokens(cls, value: object) -> object:
++        """Accept CLIProxyAPI's flat Codex auth JSON shape.
++
++        CLIProxyAPI stores Codex credentials as top-level ``id_token``,
++        ``access_token``, ``refresh_token``, and ``account_id`` fields rather
++        than under Codex CLI's ``tokens`` object.  Normalize that shape before
++        Pydantic validates the canonical model.
++        """
++        if not isinstance(value, dict) or "tokens" in value:
++            return value
++
++        provider = str(value.get("type") or "").strip().lower()
++        if provider != "codex":
++            return value
++
++        id_token = value.get("id_token") or value.get("idToken")
++        access_token = value.get("access_token") or value.get("accessToken")
++        refresh_token = value.get("refresh_token") or value.get("refreshToken")
++        account_id = value.get("account_id") or value.get("accountId")
++        if id_token is None and access_token:
++            # CPA bundle exports can contain only the long-lived ChatGPT access
++            # token. It is still a JWT with the ChatGPT account/profile claims
++            # codex-lb needs for identity, so use it as the claim-bearing token.
++            id_token = access_token
++        if refresh_token is None and access_token:
++            # Access-token-only imports are usable until the token expires, but
++            # cannot be refreshed. Store an empty marker instead of rejecting
++            # the account so operators can import CPA bundles directly.
++            refresh_token = ""
++        if not any((id_token, access_token, refresh_token, account_id)):
++            return value
++
++        normalized = dict(value)
++        normalized["tokens"] = {
++            "id_token": id_token,
++            "access_token": access_token,
++            "refresh_token": refresh_token,
++            "account_id": account_id,
++        }
++        return normalized
+ 
+ 
+ class OpenAIAuthClaims(BaseModel):
+@@ -70,6 +114,12 @@ class OpenAIAuthClaims(BaseModel):
+     )
+ 
+ 
++class OpenAIProfileClaims(BaseModel):
++    model_config = ConfigDict(extra="ignore")
++
++    email: str | None = None
++
++
+ class IdTokenClaims(BaseModel):
+     model_config = ConfigDict(extra="ignore", populate_by_name=True)
+ 
+@@ -109,6 +159,10 @@ class IdTokenClaims(BaseModel):
+         default=None,
+         alias="https://api.openai.com/auth",
+     )
++    profile: OpenAIProfileClaims | None = Field(
++        default=None,
++        alias="https://api.openai.com/profile",
++    )
+ 
+ 
+ @dataclass
+@@ -146,10 +200,11 @@ def extract_id_token_claims(id_token: str) -> IdTokenClaims:
+ def claims_from_auth(auth: AuthFile) -> AccountClaims:
+     claims = extract_id_token_claims(auth.tokens.id_token)
+     auth_claims = claims.auth or OpenAIAuthClaims()
++    profile_claims = claims.profile or OpenAIProfileClaims()
+     plan_type = auth_claims.chatgpt_plan_type or claims.chatgpt_plan_type
+     return AccountClaims(
+         account_id=auth.tokens.account_id or auth_claims.chatgpt_account_id or claims.chatgpt_account_id,
+-        email=claims.email,
++        email=claims.email or profile_claims.email or auth.email,
+         plan_type=plan_type,
+         workspace_id=clean_account_identity_part(auth_claims.workspace_id or claims.workspace_id),
+         workspace_label=clean_account_identity_part(auth_claims.workspace_label or claims.workspace_label),
+diff --git a/app/core/auth/dependencies.py b/app/core/auth/dependencies.py
+index 2b946d54..921d29ac 100644
+--- a/app/core/auth/dependencies.py
++++ b/app/core/auth/dependencies.py
+@@ -34,7 +34,7 @@ from app.modules.dashboard_auth.service import DASHBOARD_SESSION_COOKIE, get_das
+ 
+ logger = logging.getLogger(__name__)
+ 
+-_bearer = HTTPBearer(description="API key (e.g. sk-clb-…)", auto_error=False)
++_bearer = HTTPBearer(description="API key (e.g. sk-clb-… or sk-amin-…)", auto_error=False)
+ 
+ 
+ # --- Error format markers ---
+@@ -56,6 +56,10 @@ async def validate_proxy_api_key(
+     credentials: HTTPAuthorizationCredentials | None = Security(_bearer),
+ ) -> ApiKeyData | None:
+     authorization = None if credentials is None else f"Bearer {credentials.credentials}"
++    if authorization is None:
++        x_api_key = request.headers.get("x-api-key")
++        if x_api_key:
++            authorization = f"Bearer {x_api_key}"
+     return await validate_proxy_api_key_authorization(authorization, request=request)
+ 
+ 
+@@ -114,7 +118,12 @@ async def validate_usage_api_key(
+     Bearer API key, regardless of the global ``api_key_auth_enabled`` setting.
+     Raises ProxyAuthError when the key is missing or invalid.
+     """
+-    token = _extract_bearer_token(None if credentials is None else f"Bearer {credentials.credentials}")
++    authorization = None if credentials is None else f"Bearer {credentials.credentials}"
++    if authorization is None:
++        x_api_key = request.headers.get("x-api-key")
++        if x_api_key:
++            authorization = f"Bearer {x_api_key}"
++    token = _extract_bearer_token(authorization)
+     if not token:
+         raise ProxyAuthError("Missing API key in Authorization header")
+ 
+@@ -259,7 +268,7 @@ async def validate_codex_usage_identity(request: Request) -> ApiKeyData | None:
+     raw_account_id = request.headers.get("chatgpt-account-id")
+     account_id = raw_account_id.strip() if raw_account_id else ""
+     if not account_id:
+-        if token.startswith("sk-clb-"):
++        if token.startswith(("sk-clb-", "sk-amin-")):
+             return await _validate_api_key_token(token)
+         raise ProxyAuthError("Missing chatgpt-account-id header")
+ 
+diff --git a/app/core/openai/anthropic.py b/app/core/openai/anthropic.py
+new file mode 100644
+index 00000000..74f1f754
+--- /dev/null
++++ b/app/core/openai/anthropic.py
+@@ -0,0 +1,751 @@
++from __future__ import annotations
++
++import json
++import time
++from collections.abc import AsyncIterator, Iterable, Mapping
++from typing import Any, Literal, cast
++
++from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
++
++from app.core.openai.exceptions import ClientPayloadError
++from app.core.openai.requests import ResponsesReasoning, ResponsesRequest
++from app.core.types import JsonValue
++from app.core.utils.json_guards import is_json_list, is_json_mapping
++from app.core.utils.sse import format_sse_data, parse_sse_data_json
++
++_ANTHROPIC_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
++_ANTHROPIC_IMAGE_MEDIA_TO_MIME = {
++    "jpeg": "image/jpeg",
++    "jpg": "image/jpeg",
++    "png": "image/png",
++    "gif": "image/gif",
++    "webp": "image/webp",
++}
++
++
++class AnthropicThinkingConfig(BaseModel):
++    model_config = ConfigDict(extra="allow")
++
++    type: str | None = None
++    budget_tokens: StrictInt | None = Field(default=None, ge=0)
++
++
++class AnthropicMessagesRequest(BaseModel):
++    """Anthropic Messages-compatible request surface.
++
++    This is intentionally a compatibility adapter: it accepts the common
++    Anthropic Messages fields and maps the request to codex-lb's internal
++    Responses path. Unsupported Anthropic-only controls are accepted via
++    ``extra='allow'`` and ignored unless they have a close Responses
++    equivalent.
++    """
++
++    model_config = ConfigDict(extra="allow")
++
++    model: str = Field(min_length=1)
++    messages: list[JsonValue] = Field(default_factory=list)
++    system: JsonValue | None = None
++    tools: JsonValue | None = None
++    tool_choice: JsonValue | None = None
++    stream: JsonValue | None = None
++    max_tokens: JsonValue | None = None
++    stop_sequences: JsonValue | None = None
++    temperature: JsonValue | None = None
++    top_p: JsonValue | None = None
++    top_k: JsonValue | None = None
++    metadata: JsonValue | None = None
++    thinking: AnthropicThinkingConfig | JsonValue | None = None
++
++    @model_validator(mode="after")
++    def _validate_messages(self) -> "AnthropicMessagesRequest":
++        for index, message in enumerate(self.messages):
++            message_mapping = _json_mapping(message)
++            if message_mapping is None:
++                raise ValueError(f"messages[{index}] must be an object")
++            role = message_mapping.get("role")
++            if role not in ("user", "assistant", "system", "developer"):
++                raise ValueError(
++                    f"messages[{index}].role must be 'user', 'assistant', 'system', or 'developer'"
++                )
++        return self
++
++    def to_responses_request(self) -> ResponsesRequest:
++        instructions = "\n".join(
++            part
++            for part in (
++                _anthropic_system_to_instructions(self.system),
++                _anthropic_messages_to_instructions(self.messages),
++            )
++            if part
++        )
++        payload: dict[str, JsonValue] = {
++            "model": self.model,
++            "instructions": instructions,
++            "input": _anthropic_messages_to_responses_input(self.messages),
++            "store": False,
++        }
++        stream = _anthropic_bool_or_none(self.stream)
++        if stream is not None:
++            payload["stream"] = stream
++        stop_sequences = _anthropic_stop_sequences(self.stop_sequences)
++        if stop_sequences is not None:
++            payload["stop"] = stop_sequences
++        reasoning = _anthropic_thinking_to_reasoning(self.thinking)
++        if reasoning is not None:
++            payload["reasoning"] = reasoning.model_dump(mode="json", exclude_none=True)
++        tools = _anthropic_tools_to_responses(_anthropic_list_field(self.tools, field_name="tools"))
++        if tools:
++            payload["tools"] = tools
++        tool_choice = _anthropic_tool_choice_to_responses(self.tool_choice)
++        if tool_choice is not None:
++            payload["tool_choice"] = tool_choice
++        return ResponsesRequest.model_validate(payload)
++
++
++def _json_mapping(value: JsonValue) -> Mapping[str, JsonValue] | None:
++    if not is_json_mapping(value):
++        return None
++    return value
++
++
++def _json_list(value: JsonValue) -> list[JsonValue] | None:
++    if not is_json_list(value):
++        return None
++    return value
++
++
++def _anthropic_list_field(value: JsonValue | None, *, field_name: str) -> list[JsonValue]:
++    if value is None:
++        return []
++    values = _json_list(value)
++    if values is None:
++        raise ClientPayloadError(f"{field_name} must be an array.", param=field_name)
++    return values
++
++
++def _anthropic_bool_or_none(value: JsonValue | None) -> bool | None:
++    if value is None:
++        return None
++    if isinstance(value, bool):
++        return value
++    if isinstance(value, str):
++        lowered = value.strip().lower()
++        if lowered in {"true", "1", "yes"}:
++            return True
++        if lowered in {"false", "0", "no"}:
++            return False
++    return None
++
++
++def _anthropic_stop_sequences(value: JsonValue | None) -> str | list[str] | None:
++    if value is None:
++        return None
++    if isinstance(value, str):
++        return value
++    values = _json_list(value)
++    if values is None:
++        return None
++    return [item for item in values if isinstance(item, str)]
++
++
++def _anthropic_system_to_instructions(system: JsonValue | None) -> str:
++    if system is None:
++        return ""
++    if isinstance(system, str):
++        return system
++    parts: list[str] = []
++    for part in _json_list(system) or [system]:
++        if isinstance(part, str):
++            parts.append(part)
++            continue
++        mapping = _json_mapping(part)
++        if mapping is None:
++            continue
++        text = mapping.get("text")
++        if isinstance(text, str):
++            parts.append(text)
++    return "\n".join(part for part in parts if part)
++
++
++def _anthropic_messages_to_instructions(messages: list[JsonValue]) -> str:
++    parts: list[str] = []
++    for message in messages:
++        mapping = _json_mapping(message)
++        if mapping is None:
++            continue
++        role = mapping.get("role")
++        if role not in ("system", "developer"):
++            continue
++        text = _anthropic_content_to_text(mapping.get("content"))
++        if text:
++            parts.append(text)
++    return "\n".join(parts)
++
++
++def _anthropic_messages_to_responses_input(messages: list[JsonValue]) -> list[JsonValue]:
++    output: list[JsonValue] = []
++    for message in messages:
++        mapping = _json_mapping(message)
++        if mapping is None:
++            raise ClientPayloadError("Each message must be an object.", param="messages")
++        role = mapping.get("role")
++        if role in ("system", "developer"):
++            continue
++        if role not in ("user", "assistant"):
++            raise ClientPayloadError("Anthropic messages only support user and assistant roles.", param="messages")
++        content = mapping.get("content")
++        output.extend(_anthropic_message_to_responses_items(cast(str, role), content))
++    return output
++
++
++def _anthropic_message_to_responses_items(role: str, content: JsonValue) -> list[JsonValue]:
++    if isinstance(content, str) or content is None:
++        return [
++            {
++                "role": role,
++                "content": [
++                    {
++                        "type": "output_text" if role == "assistant" else "input_text",
++                        "text": content or "",
++                    }
++                ],
++            }
++        ]
++
++    parts = _json_list(content)
++    if parts is None:
++        raise ClientPayloadError("message content must be a string or array.", param="messages.content")
++
++    message_parts: list[JsonValue] = []
++    items: list[JsonValue] = []
++    for part in parts:
++        part_mapping = _json_mapping(part)
++        if part_mapping is None:
++            if isinstance(part, str):
++                message_parts.append(
++                    {"type": "output_text" if role == "assistant" else "input_text", "text": part}
++                )
++                continue
++            raise ClientPayloadError("message content parts must be objects.", param="messages.content")
++
++        part_type = part_mapping.get("type")
++        if part_type in _ANTHROPIC_TEXT_PART_TYPES or (part_type is None and isinstance(part_mapping.get("text"), str)):
++            text = part_mapping.get("text")
++            if not isinstance(text, str):
++                raise ClientPayloadError("text content blocks must include text.", param="messages.content")
++            message_parts.append(
++                {"type": "output_text" if role == "assistant" else "input_text", "text": text}
++            )
++            continue
++
++        if role == "user" and part_type == "image":
++            message_parts.append(_anthropic_image_to_responses_part(part_mapping))
++            continue
++
++        if role == "assistant" and part_type == "tool_use":
++            if message_parts:
++                items.append({"role": "assistant", "content": message_parts})
++                message_parts = []
++            items.append(_anthropic_tool_use_to_responses_item(part_mapping))
++            continue
++
++        if role == "user" and part_type == "tool_result":
++            if message_parts:
++                items.append({"role": "user", "content": message_parts})
++                message_parts = []
++            items.append(_anthropic_tool_result_to_responses_item(part_mapping))
++            continue
++
++        if part_type in {"thinking", "redacted_thinking"}:
++            continue
++
++        fallback_text = _anthropic_content_block_fallback_text(part_mapping)
++        if fallback_text is not None:
++            message_parts.append(
++                {"type": "output_text" if role == "assistant" else "input_text", "text": fallback_text}
++            )
++            continue
++
++        raise ClientPayloadError(f"Unsupported Anthropic content block type: {part_type}", param="messages.content")
++
++    if message_parts or not items:
++        items.append({"role": role, "content": message_parts})
++    return items
++
++
++def _anthropic_content_block_fallback_text(part: Mapping[str, JsonValue]) -> str | None:
++    text = part.get("text")
++    if isinstance(text, str):
++        return text
++    content = part.get("content")
++    if content is not None:
++        extracted = _anthropic_content_to_text(content)
++        if extracted:
++            return extracted
++    return None
++
++
++def _anthropic_image_to_responses_part(part: Mapping[str, JsonValue]) -> JsonValue:
++    source = _json_mapping(part.get("source"))
++    if source is None:
++        raise ClientPayloadError("image blocks require a source object.", param="messages.content.source")
++    source_type = source.get("type")
++    if source_type == "url":
++        url = source.get("url")
++        if not isinstance(url, str) or not url:
++            raise ClientPayloadError("image url source requires url.", param="messages.content.source.url")
++        return {"type": "input_image", "image_url": url}
++    if source_type == "base64":
++        data = source.get("data")
++        media_type = source.get("media_type") or source.get("mediaType")
++        if not isinstance(data, str) or not data:
++            raise ClientPayloadError("base64 image source requires data.", param="messages.content.source.data")
++        if not isinstance(media_type, str) or not media_type:
++            media_type = "image/png"
++        return {"type": "input_image", "image_url": f"data:{media_type};base64,{data}"}
++    raise ClientPayloadError(f"Unsupported image source type: {source_type}", param="messages.content.source.type")
++
++
++def _anthropic_tool_use_to_responses_item(part: Mapping[str, JsonValue]) -> JsonValue:
++    call_id = part.get("id")
++    name = part.get("name")
++    arguments = part.get("input")
++    if not isinstance(call_id, str) or not call_id:
++        raise ClientPayloadError("tool_use blocks require id.", param="messages.content.id")
++    if not isinstance(name, str) or not name:
++        raise ClientPayloadError("tool_use blocks require name.", param="messages.content.name")
++    return {
++        "type": "function_call",
++        "call_id": call_id,
++        "name": name,
++        "arguments": json.dumps(arguments if arguments is not None else {}, separators=(",", ":")),
++    }
++
++
++def _anthropic_tool_result_to_responses_item(part: Mapping[str, JsonValue]) -> JsonValue:
++    call_id = part.get("tool_use_id")
++    if not isinstance(call_id, str) or not call_id:
++        raise ClientPayloadError("tool_result blocks require tool_use_id.", param="messages.content.tool_use_id")
++    content = part.get("content")
++    if isinstance(content, str):
++        output = content
++    elif content is None:
++        output = ""
++    else:
++        output = _anthropic_content_to_text(content)
++    return {"type": "function_call_output", "call_id": call_id, "output": output}
++
++
++def _anthropic_content_to_text(content: JsonValue) -> str:
++    if isinstance(content, str):
++        return content
++    parts: list[str] = []
++    for part in _json_list(content) or [content]:
++        if isinstance(part, str):
++            parts.append(part)
++            continue
++        mapping = _json_mapping(part)
++        if mapping is None:
++            continue
++        text = mapping.get("text")
++        if isinstance(text, str):
++            parts.append(text)
++    return "".join(parts)
++
++
++def _anthropic_tools_to_responses(tools: list[JsonValue]) -> list[JsonValue]:
++    normalized: list[JsonValue] = []
++    for index, tool in enumerate(tools):
++        mapping = _json_mapping(tool)
++        if mapping is None:
++            raise ClientPayloadError(f"tools[{index}] must be an object", param=f"tools[{index}]")
++        name = mapping.get("name")
++        if not isinstance(name, str) or not name:
++            raise ClientPayloadError(f"tools[{index}].name is required", param=f"tools[{index}].name")
++        description = mapping.get("description")
++        input_schema = mapping.get("input_schema") or mapping.get("inputSchema") or {"type": "object"}
++        tool_payload: dict[str, JsonValue] = {
++            "type": "function",
++            "name": name,
++            "parameters": input_schema,
++        }
++        if isinstance(description, str):
++            tool_payload["description"] = description
++        normalized.append(tool_payload)
++    return normalized
++
++
++def _anthropic_tool_choice_to_responses(tool_choice: JsonValue | None) -> JsonValue | None:
++    if tool_choice is None:
++        return None
++    if isinstance(tool_choice, str):
++        if tool_choice in ("auto", "none", "required"):
++            return "auto" if tool_choice == "auto" else tool_choice
++        return {"type": "function", "name": tool_choice}
++    mapping = _json_mapping(tool_choice)
++    if mapping is None:
++        return tool_choice
++    choice_type = mapping.get("type")
++    if choice_type == "auto":
++        return "auto"
++    if choice_type == "none":
++        return "none"
++    if choice_type == "any":
++        return "required"
++    if choice_type == "tool":
++        name = mapping.get("name")
++        if isinstance(name, str) and name:
++            return {"type": "function", "name": name}
++    return tool_choice
++
++
++def _anthropic_thinking_to_reasoning(thinking: AnthropicThinkingConfig | JsonValue | None) -> ResponsesReasoning | None:
++    if thinking is None:
++        return None
++    if isinstance(thinking, AnthropicThinkingConfig):
++        thinking_type = thinking.type
++    else:
++        mapping = _json_mapping(thinking)
++        if mapping is None:
++            return None
++        raw_type = mapping.get("type")
++        thinking_type = raw_type if isinstance(raw_type, str) else None
++    if thinking_type == "disabled":
++        return None
++    if thinking_type == "enabled":
++        return ResponsesReasoning(effort="medium")
++    return None
++
++
++class AnthropicUsage(BaseModel):
++    model_config = ConfigDict(extra="ignore")
++
++    input_tokens: int = 0
++    output_tokens: int = 0
++
++
++class AnthropicContentBlock(BaseModel):
++    model_config = ConfigDict(extra="allow")
++
++    type: str
++    text: str | None = None
++    id: str | None = None
++    name: str | None = None
++    input: JsonValue | None = None
++
++
++class AnthropicMessageResponse(BaseModel):
++    model_config = ConfigDict(extra="ignore")
++
++    id: str
++    type: Literal["message"] = "message"
++    role: Literal["assistant"] = "assistant"
++    model: str
++    content: list[AnthropicContentBlock]
++    stop_reason: str | None = None
++    stop_sequence: str | None = None
++    usage: AnthropicUsage
++
++
++def anthropic_message_from_chat_completion(chat: Any, *, model: str) -> AnthropicMessageResponse:
++    response_id = getattr(chat, "id", None) or f"msg_{time.time_ns()}"
++    content_blocks: list[AnthropicContentBlock] = []
++    stop_reason: str | None = "end_turn"
++    usage = _anthropic_usage_from_chat(chat)
++    choices = getattr(chat, "choices", None) or []
++    if choices:
++        choice = choices[0]
++        finish_reason = getattr(choice, "finish_reason", None)
++        stop_reason = _anthropic_stop_reason(finish_reason)
++        message = getattr(choice, "message", None)
++        text = getattr(message, "content", None) if message is not None else None
++        if isinstance(text, str) and text:
++            content_blocks.append(AnthropicContentBlock(type="text", text=text))
++        tool_calls = getattr(message, "tool_calls", None) if message is not None else None
++        if tool_calls:
++            for tool_call in tool_calls:
++                tool_id = getattr(tool_call, "id", None)
++                function = getattr(tool_call, "function", None)
++                name = getattr(function, "name", None) if function is not None else None
++                arguments = getattr(function, "arguments", None) if function is not None else None
++                content_blocks.append(
++                    AnthropicContentBlock(
++                        type="tool_use",
++                        id=tool_id,
++                        name=name,
++                        input=_parse_json_object(arguments),
++                    )
++                )
++    if not content_blocks:
++        content_blocks.append(AnthropicContentBlock(type="text", text=""))
++    return AnthropicMessageResponse(
++        id=response_id,
++        model=model,
++        content=content_blocks,
++        stop_reason=stop_reason,
++        usage=usage,
++    )
++
++
++def _anthropic_usage_from_chat(chat: Any) -> AnthropicUsage:
++    usage = getattr(chat, "usage", None)
++    input_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
++    output_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
++    return AnthropicUsage(
++        input_tokens=input_tokens if isinstance(input_tokens, int) else 0,
++        output_tokens=output_tokens if isinstance(output_tokens, int) else 0,
++    )
++
++
++def _anthropic_stop_reason(finish_reason: str | None) -> str | None:
++    if finish_reason == "tool_calls":
++        return "tool_use"
++    if finish_reason == "length":
++        return "max_tokens"
++    if finish_reason == "content_filter":
++        return "stop_sequence"
++    return "end_turn"
++
++
++def _parse_json_object(value: str | None) -> JsonValue:
++    if not isinstance(value, str) or not value:
++        return {}
++    try:
++        parsed = json.loads(value)
++    except ValueError:
++        return {}
++    return parsed if is_json_mapping(parsed) else {}
++
++
++async def stream_anthropic_messages(
++    stream: AsyncIterator[str],
++    *,
++    model: str,
++) -> AsyncIterator[str]:
++    """Convert Responses SSE events to Anthropic Messages SSE events."""
++
++    message_id = f"msg_{time.time_ns()}"
++    input_tokens = 0
++    output_tokens = 0
++    content_started = False
++    text_index: int | None = None
++    tool_index_by_key: dict[str, int] = {}
++    next_index = 0
++    completed = False
++    terminal_seen = False
++
++    def event(event_type: str, payload: Mapping[str, JsonValue]) -> str:
++        data = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
++        return f"event: {event_type}\ndata: {data}\n\n"
++
++    yield event(
++        "message_start",
++        {
++            "type": "message_start",
++            "message": {
++                "id": message_id,
++                "type": "message",
++                "role": "assistant",
++                "model": model,
++                "content": [],
++                "stop_reason": None,
++                "stop_sequence": None,
++                "usage": {"input_tokens": 0, "output_tokens": 0},
++            },
++        },
++    )
++
++    async for line in stream:
++        payload = parse_sse_data_json(line)
++        if not payload:
++            continue
++        if terminal_seen:
++            # Keep draining the upstream Responses stream after the terminal
++            # event so proxy-side finally blocks can settle API-key usage
++            # reservations. Returning immediately here closes the upstream
++            # generator at the terminal yield point, which releases the
++            # reservation instead of finalizing it with the usage payload.
++            continue
++        event_type = payload.get("type")
++
++        if event_type == "response.output_text.delta":
++            delta = payload.get("delta")
++            if not isinstance(delta, str):
++                continue
++            if text_index is None:
++                text_index = next_index
++                next_index += 1
++                content_started = True
++                yield event(
++                    "content_block_start",
++                    {
++                        "type": "content_block_start",
++                        "index": text_index,
++                        "content_block": {"type": "text", "text": ""},
++                    },
++                )
++            yield event(
++                "content_block_delta",
++                {"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": delta}},
++            )
++            continue
++
++        tool_delta = _responses_tool_delta(payload)
++        if tool_delta is not None:
++            key, tool_id, name, arguments = tool_delta
++            index = tool_index_by_key.get(key)
++            if index is None:
++                index = next_index
++                next_index += 1
++                tool_index_by_key[key] = index
++                yield event(
++                    "content_block_start",
++                    {
++                        "type": "content_block_start",
++                        "index": index,
++                        "content_block": {
++                            "type": "tool_use",
++                            "id": tool_id or key,
++                            "name": name or "tool",
++                            "input": {},
++                        },
++                    },
++                )
++            if arguments:
++                yield event(
++                    "content_block_delta",
++                    {
++                        "type": "content_block_delta",
++                        "index": index,
++                        "delta": {"type": "input_json_delta", "partial_json": arguments},
++                    },
++                )
++            continue
++
++        if event_type in ("response.completed", "response.incomplete"):
++            response = _json_mapping(payload.get("response"))
++            usage = _json_mapping(response.get("usage")) if response is not None else None
++            if usage is not None:
++                raw_input = usage.get("input_tokens")
++                raw_output = usage.get("output_tokens")
++                input_tokens = raw_input if isinstance(raw_input, int) else input_tokens
++                output_tokens = raw_output if isinstance(raw_output, int) else output_tokens
++            terminal_seen = True
++            continue
++
++        if event_type in ("response.failed", "error"):
++            yield _anthropic_error_event(payload)
++            completed = True
++            terminal_seen = True
++            continue
++
++    if text_index is None and not content_started and not tool_index_by_key:
++        text_index = next_index
++        next_index += 1
++        yield event(
++            "content_block_start",
++            {"type": "content_block_start", "index": text_index, "content_block": {"type": "text", "text": ""}},
++        )
++    for index in range(next_index):
++        yield event("content_block_stop", {"type": "content_block_stop", "index": index})
++    if not completed:
++        stop_reason = "tool_use" if tool_index_by_key else "end_turn"
++        yield event(
++            "message_delta",
++            {
++                "type": "message_delta",
++                "delta": {"stop_reason": stop_reason, "stop_sequence": None},
++                "usage": {"output_tokens": output_tokens},
++            },
++        )
++        yield event("message_stop", {"type": "message_stop"})
++
++
++def iter_anthropic_messages_from_chat_chunks(lines: Iterable[str]) -> Iterable[str]:
++    """Best-effort OpenAI chat-SSE to Anthropic SSE adapter for tests/tools."""
++
++    for line in lines:
++        payload = parse_sse_data_json(line)
++        if payload is None:
++            continue
++        yield format_sse_data(payload)
++
++
++def _anthropic_error_event(payload: Mapping[str, JsonValue]) -> str:
++    error = payload.get("error")
++    if not isinstance(error, Mapping):
++        response = payload.get("response")
++        if isinstance(response, Mapping):
++            error = response.get("error")
++    if not isinstance(error, Mapping):
++        error = {"message": "Upstream error", "type": "api_error"}
++    message = error.get("message") if isinstance(error.get("message"), str) else "Upstream error"
++    error_type = error.get("type") if isinstance(error.get("type"), str) else "api_error"
++    data = {"type": "error", "error": {"type": error_type, "message": message}}
++    return f"event: error\ndata: {json.dumps(data, ensure_ascii=True, separators=(',', ':'))}\n\n"
++
++
++def _responses_tool_delta(payload: Mapping[str, JsonValue]) -> tuple[str, str | None, str | None, str | None] | None:
++    if not _is_tool_event(payload):
++        return None
++    candidate = _tool_candidate(payload)
++    call_id = _first_str(candidate.get("call_id"), candidate.get("tool_call_id"), candidate.get("id"))
++    item_id = _first_str(candidate.get("item_id"), candidate.get("id"))
++    item = _json_mapping(candidate.get("item"))
++    if item is not None:
++        call_id = call_id or _first_str(item.get("call_id"), item.get("id"))
++        item_id = item_id or _first_str(item.get("id"), item.get("call_id"))
++    name = _first_str(candidate.get("name"), candidate.get("tool_name"))
++    arguments = candidate.get("arguments") if isinstance(candidate.get("arguments"), str) else None
++    delta = candidate.get("delta")
++    if isinstance(delta, str) and arguments is None:
++        arguments = delta
++    delta_mapping = _json_mapping(delta)
++    if delta_mapping is not None:
++        name = name or _first_str(delta_mapping.get("name"))
++        if arguments is None and isinstance(delta_mapping.get("arguments"), str):
++            arguments = cast(str, delta_mapping.get("arguments"))
++        function = _json_mapping(delta_mapping.get("function"))
++        if function is not None:
++            name = name or _first_str(function.get("name"))
++            if arguments is None and isinstance(function.get("arguments"), str):
++                arguments = cast(str, function.get("arguments"))
++    function = _json_mapping(candidate.get("function"))
++    if function is not None:
++        name = name or _first_str(function.get("name"))
++        if arguments is None and isinstance(function.get("arguments"), str):
++            arguments = cast(str, function.get("arguments"))
++    if item is not None:
++        name = name or _first_str(item.get("name"))
++        if arguments is None and isinstance(item.get("arguments"), str):
++            arguments = cast(str, item.get("arguments"))
++    key = call_id or item_id or name
++    if key is None:
++        return None
++    return key, call_id or item_id, name, arguments
++
++
++def _is_tool_event(payload: Mapping[str, JsonValue]) -> bool:
++    event_type = payload.get("type")
++    if isinstance(event_type, str) and ("function_call" in event_type or "tool_call" in event_type):
++        return True
++    item = _json_mapping(payload.get("item"))
++    if item is not None:
++        item_type = item.get("type")
++        if isinstance(item_type, str) and ("function" in item_type or "tool" in item_type):
++            return True
++    return any(key in payload for key in ("call_id", "tool_call_id", "arguments"))
++
++
++def _tool_candidate(payload: Mapping[str, JsonValue]) -> Mapping[str, JsonValue]:
++    item = _json_mapping(payload.get("item"))
++    if item is not None and payload.get("type") in {"response.output_item.added", "response.output_item.done"}:
++        return item
++    return payload
++
++
++def _first_str(*values: JsonValue) -> str | None:
++    for value in values:
++        if isinstance(value, str) and value:
++            return value
++    return None
+diff --git a/app/core/usage/refresh_scheduler.py b/app/core/usage/refresh_scheduler.py
+index d2af2b74..15d0396e 100644
+--- a/app/core/usage/refresh_scheduler.py
++++ b/app/core/usage/refresh_scheduler.py
+@@ -110,6 +110,19 @@ class UsageRefreshScheduler:
+                     if usage_written:
+                         after_primary = await usage_repo.latest_by_account(window="primary")
+                         after_secondary = await usage_repo.latest_by_account(window="secondary")
++                        refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
++                        # Recover post-reset RATE_LIMITED/QUOTA_EXCEEDED accounts before evaluating
++                        # limit warm-up candidates. Otherwise a 5h reset can be observed in usage
++                        # history while the account row is still RATE_LIMITED, causing the warm-up
++                        # safety filter to skip it; the next refresh then sees usage <100% and the
++                        # reset transition is lost.
++                        recovered_count = await reconcile_recoverable_account_statuses(
++                            accounts_repo=accounts_repo,
++                            usage_repo=usage_repo,
++                            accounts=refreshed_accounts,
++                        )
++                        if recovered_count:
++                            refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
+                         dashboard_settings = await settings_repo.get_or_create()
+                         warmup_service = LimitWarmupService(
+                             warmup_repo,
+@@ -119,7 +132,6 @@ class UsageRefreshScheduler:
+                                 accounts_repo_factory=_background_accounts_repo,
+                             ),
+                         )
+-                        refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
+                         await warmup_service.run_after_usage_refresh(
+                             accounts=refreshed_accounts,
+                             settings=dashboard_settings,
+@@ -128,11 +140,6 @@ class UsageRefreshScheduler:
+                             after_primary=after_primary,
+                             after_secondary=after_secondary,
+                         )
+-                        await reconcile_recoverable_account_statuses(
+-                            accounts_repo=accounts_repo,
+-                            usage_repo=usage_repo,
+-                            accounts=refreshed_accounts,
+-                        )
+                     await get_rate_limit_headers_cache().invalidate()
+                     get_account_selection_cache().invalidate()
+             except Exception:
+diff --git a/app/modules/accounts/auth_manager.py b/app/modules/accounts/auth_manager.py
+index 4eb28b58..d4d263ee 100644
+--- a/app/modules/accounts/auth_manager.py
++++ b/app/modules/accounts/auth_manager.py
+@@ -200,6 +200,8 @@ class AuthManager:
+ 
+     async def refresh_account(self, account: Account) -> Account:
+         refresh_token = self._encryptor.decrypt(account.refresh_token_encrypted)
++        if not refresh_token:
++            return account
+         try:
+             result = await self._refresh_tokens(refresh_token, account=account)
+         except RefreshError as exc:
+diff --git a/app/modules/accounts/service.py b/app/modules/accounts/service.py
+index 77815c2c..b292f926 100644
+--- a/app/modules/accounts/service.py
++++ b/app/modules/accounts/service.py
+@@ -12,6 +12,7 @@ from pydantic import ValidationError
+ from app.core.auth import (
+     DEFAULT_EMAIL,
+     DEFAULT_PLAN,
++    AuthFile,
+     claims_from_auth,
+     generate_unique_account_id,
+     parse_auth_json,
+@@ -73,6 +74,35 @@ class InvalidAuthJsonError(Exception):
+     pass
+ 
+ 
++def _parse_import_payload(raw: bytes) -> list[AuthFile]:
++    try:
++        decoded = raw.decode("utf-8-sig")
++        data = json.loads(decoded)
++        if isinstance(data, dict) and isinstance(data.get("accounts"), list):
++            auths: list[AuthFile] = []
++            for entry in data["accounts"]:
++                if not isinstance(entry, dict):
++                    continue
++                credentials = entry.get("credentials")
++                if not isinstance(credentials, dict):
++                    continue
++                payload = {
++                    "type": "codex",
++                    "access_token": credentials.get("access_token"),
++                    "id_token": credentials.get("id_token") or credentials.get("access_token"),
++                    "refresh_token": credentials.get("refresh_token") or "",
++                    "account_id": credentials.get("account_id") or credentials.get("chatgpt_account_id"),
++                    "email": credentials.get("email") or entry.get("name"),
++                    "last_refresh": (entry.get("extra") or {}).get("last_refresh") or data.get("exported_at"),
++                }
++                auths.append(parse_auth_json(json.dumps(payload).encode("utf-8")))
++            if auths:
++                return auths
++        return [parse_auth_json(decoded.encode("utf-8"))]
++    except (json.JSONDecodeError, ValidationError, UnicodeDecodeError, TypeError) as exc:
++        raise InvalidAuthJsonError("Invalid auth.json payload") from exc
++
++
+ class AccountNotProbableError(Exception):
+     """Raised when an account is in a status that disallows probing."""
+ 
+@@ -273,10 +303,22 @@ class AccountsService:
+         )
+ 
+     async def import_account(self, raw: bytes) -> AccountImportResponse:
+-        try:
+-            auth = parse_auth_json(raw)
+-        except (json.JSONDecodeError, ValidationError, UnicodeDecodeError, TypeError) as exc:
+-            raise InvalidAuthJsonError("Invalid auth.json payload") from exc
++        auths = _parse_import_payload(raw)
++        imported: list[AccountImportResponse] = []
++        for auth in auths:
++            imported.append(await self._import_auth(auth, refresh_usage=len(auths) == 1))
++        if len(auths) > 1 and self._usage_repo and self._usage_updater:
++            account_ids = [entry.account_id for entry in imported]
++            accounts = [account for account_id in account_ids if (account := await self._repo.get_by_id(account_id))]
++            if accounts:
++                latest_usage = await self._usage_repo.latest_by_account(window="primary")
++                await self._usage_updater.refresh_accounts(accounts, latest_usage)
++        get_account_selection_cache().invalidate()
++        if imported:
++            return imported[-1]
++        raise InvalidAuthJsonError("Invalid auth.json payload")
++
++    async def _import_auth(self, auth: AuthFile, *, refresh_usage: bool) -> AccountImportResponse:
+         claims = claims_from_auth(auth)
+ 
+         email = claims.email or DEFAULT_EMAIL
+@@ -302,10 +344,9 @@ class AccountsService:
+         )
+ 
+         saved = await self._repo.upsert_account_slot(account)
+-        if self._usage_repo and self._usage_updater:
++        if refresh_usage and self._usage_repo and self._usage_updater:
+             latest_usage = await self._usage_repo.latest_by_account(window="primary")
+             await self._usage_updater.refresh_accounts([saved], latest_usage)
+-        get_account_selection_cache().invalidate()
+         return AccountImportResponse(
+             account_id=saved.id,
+             email=saved.email,
+diff --git a/app/modules/api_keys/service.py b/app/modules/api_keys/service.py
+index 14d6bf21..45598601 100644
+--- a/app/modules/api_keys/service.py
++++ b/app/modules/api_keys/service.py
+@@ -45,6 +45,8 @@ API_KEY_USAGE_RESERVATION_DEFAULT_INPUT_TOKENS = API_KEY_USAGE_RESERVATION_MAX_T
+ API_KEY_USAGE_RESERVATION_DEFAULT_OUTPUT_TOKENS = 2_048
+ _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_MICRODOLLARS = 2_000_000
+ _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_BASE_TOKENS = API_KEY_USAGE_RESERVATION_MAX_TOKEN_BUDGET * 2
++_STANDARD_KEY_PREFIX = "sk-clb"
++_EXPIRING_KEY_PREFIX = "sk-amin"
+ TRAFFIC_CLASS_FOREGROUND = "foreground"
+ TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
+ _SUPPORTED_TRAFFIC_CLASSES = frozenset({TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC})
+@@ -412,7 +414,7 @@ class ApiKeysService:
+     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
+         now = utcnow()
+         expires_at = _normalize_expires_at(payload.expires_at)
+-        plain_key = _generate_plain_key()
++        plain_key = _generate_plain_key(expires_at=expires_at)
+         normalized_allowed_models = _normalize_allowed_models(payload.allowed_models)
+         assigned_account_ids = await self._resolve_assigned_account_ids(payload.assigned_account_ids)
+         enforced_model = _normalize_model_slug(payload.enforced_model)
+@@ -655,7 +657,7 @@ class ApiKeysService:
+         if row is None:
+             raise ApiKeyNotFoundError(f"API key not found: {key_id}")
+         old_key_hash = row.key_hash
+-        plain_key = _generate_plain_key()
++        plain_key = _generate_plain_key(expires_at=row.expires_at)
+         updated = await self._repository.update(
+             key_id,
+             key_hash=_hash_key(plain_key),
+@@ -1139,8 +1141,9 @@ def _normalize_name(name: str) -> str:
+     return normalized
+ 
+ 
+-def _generate_plain_key() -> str:
+-    return f"sk-clb-{secrets.token_urlsafe(32)}"
++def _generate_plain_key(*, expires_at: datetime | None = None) -> str:
++    prefix = _EXPIRING_KEY_PREFIX if expires_at is not None else _STANDARD_KEY_PREFIX
++    return f"{prefix}-{secrets.token_urlsafe(32)}"
+ 
+ 
+ def _hash_key(plain_key: str) -> str:
+diff --git a/app/modules/proxy/api.py b/app/modules/proxy/api.py
+index 537dfdf9..c1300977 100644
+--- a/app/modules/proxy/api.py
++++ b/app/modules/proxy/api.py
+@@ -51,6 +51,12 @@ from app.core.errors import (
+ from app.core.exceptions import ProxyAuthError, ProxyRateLimitError
+ from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, bridge_public_contract_error_total
+ from app.core.middleware.api_firewall import _parse_trusted_proxy_networks, resolve_connection_client_ip
++from app.core.openai.anthropic import (
++    AnthropicMessageResponse,
++    AnthropicMessagesRequest,
++    anthropic_message_from_chat_completion,
++    stream_anthropic_messages,
++)
+ from app.core.openai.chat_requests import ChatCompletionsRequest
+ from app.core.openai.chat_responses import (
+     ChatCompletion,
+@@ -129,6 +135,9 @@ from app.modules.proxy.schemas import (
+     ModelMetadata,
+     RateLimitStatusPayload,
+     ReasoningLevelSchema,
++    V1BulkUsageError,
++    V1BulkUsageItem,
++    V1BulkUsageResponse,
+     V1UsageLimitResponse,
+     V1UsageResponse,
+     WarmupFailedAccount,
+@@ -693,6 +702,28 @@ async def v1_models(
+ async def v1_usage(
+     api_key: ApiKeyData = Security(validate_usage_api_key),
+ ) -> V1UsageResponse:
++    return await _build_v1_usage_response_for_api_key(api_key)
++
++
++@usage_router.post("/v1/usage/bulk", response_model=V1BulkUsageResponse)
++async def v1_usage_bulk(
++    request: Request,
++) -> V1BulkUsageResponse:
++    keys = _parse_bulk_usage_keys(await request.body())
++    items: list[V1BulkUsageItem] = []
++    for index, key in enumerate(keys):
++        items.append(await _build_bulk_usage_item(index, key))
++
++    ok_count = sum(1 for item in items if item.ok)
++    return V1BulkUsageResponse(
++        total=len(items),
++        ok=ok_count,
++        error=len(items) - ok_count,
++        data=items,
++    )
++
++
++async def _build_v1_usage_response_for_api_key(api_key: ApiKeyData) -> V1UsageResponse:
+     async with get_background_session() as session:
+         service = ApiKeysService(ApiKeysRepository(session))
+         usage = await service.get_key_usage_summary_for_self(api_key.id)
+@@ -711,6 +742,125 @@ async def v1_usage(
+     )
+ 
+ 
++async def _build_bulk_usage_item(index: int, key: str) -> V1BulkUsageItem:
++    masked_key = _mask_api_key_for_bulk_usage(key)
++    try:
++        api_key = await _validate_bulk_usage_key(key)
++        usage = await _build_v1_usage_response_for_api_key(api_key)
++        codex_usage = RateLimitStatusPayload.from_data(await _build_codex_usage_payload_for_api_key(api_key))
++    except ProxyAuthError as exc:
++        return V1BulkUsageItem(
++            index=index,
++            masked_key=masked_key,
++            ok=False,
++            status_code=401,
++            error=V1BulkUsageError(code="invalid_api_key", message=str(exc)),
++        )
++    except Exception:
++        logger.warning("Failed to build bulk usage item", exc_info=True)
++        return V1BulkUsageItem(
++            index=index,
++            masked_key=masked_key,
++            ok=False,
++            status_code=500,
++            error=V1BulkUsageError(code="usage_lookup_failed", message="Unable to fetch usage for this key"),
++        )
++
++    return V1BulkUsageItem(
++        index=index,
++        masked_key=masked_key,
++        key_prefix=api_key.key_prefix,
++        ok=True,
++        status_code=200,
++        usage=usage,
++        codex_usage=codex_usage,
++    )
++
++
++async def _validate_bulk_usage_key(key: str) -> ApiKeyData:
++    async with get_background_session() as session:
++        service = ApiKeysService(ApiKeysRepository(session))
++        try:
++            return await service.validate_key(key)
++        except ApiKeyInvalidError as exc:
++            raise ProxyAuthError(str(exc)) from exc
++
++
++def _parse_bulk_usage_keys(body: bytes) -> list[str]:
++    if len(body) > 128 * 1024:
++        raise HTTPException(status_code=413, detail="Bulk usage payload is too large")
++
++    text = body.decode("utf-8-sig").strip()
++    if not text:
++        raise HTTPException(status_code=400, detail="No API keys provided")
++
++    keys: list[str]
++    try:
++        payload = json.loads(text)
++    except JSONDecodeError:
++        keys = _parse_bulk_usage_text_lines(text)
++    else:
++        keys = _parse_bulk_usage_json_payload(payload)
++
++    if not keys:
++        raise HTTPException(status_code=400, detail="No API keys provided")
++    if len(keys) > 500:
++        raise HTTPException(status_code=400, detail="Bulk usage accepts at most 500 keys")
++    return keys
++
++
++def _parse_bulk_usage_json_payload(payload: JsonValue) -> list[str]:
++    if isinstance(payload, list):
++        return [_coerce_bulk_usage_key(item) for item in payload if _coerce_bulk_usage_key(item)]
++    if isinstance(payload, dict):
++        source = payload.get("keys") or payload.get("apiKeys") or payload.get("api_keys") or payload.get("serialKeys")
++        if isinstance(source, list):
++            return [_coerce_bulk_usage_key(item) for item in source if _coerce_bulk_usage_key(item)]
++        key = _coerce_bulk_usage_key(payload)
++        return [key] if key else []
++    if isinstance(payload, str):
++        return _parse_bulk_usage_text_lines(payload)
++    return []
++
++
++def _parse_bulk_usage_text_lines(text: str) -> list[str]:
++    keys: list[str] = []
++    for raw_line in text.splitlines():
++        line = raw_line.strip().strip(",")
++        if not line or line.startswith("#"):
++            continue
++        key = _coerce_bulk_usage_key(line)
++        if key:
++            keys.append(key)
++    return keys
++
++
++def _coerce_bulk_usage_key(value: JsonValue) -> str | None:
++    if isinstance(value, dict):
++        for field in ("apiKey", "api_key", "key", "serialKey", "serial_key"):
++            candidate = value.get(field)
++            if isinstance(candidate, str) and candidate.strip():
++                return candidate.strip()
++        return None
++    if not isinstance(value, str):
++        return None
++    normalized = value.strip().strip('"').strip("'")
++    if not normalized:
++        return None
++    for prefix in ("apiKey=", "api_key=", "key=", "serialKey=", "serial_key="):
++        if normalized.startswith(prefix):
++            normalized = normalized[len(prefix) :].strip().strip('"').strip("'")
++            break
++    return normalized or None
++
++
++def _mask_api_key_for_bulk_usage(key: str) -> str:
++    key = key.strip()
++    if len(key) <= 12:
++        return f"{key[:4]}..." if key else ""
++    return f"{key[:8]}...{key[-4:]}"
++
++
+ async def _run_v1_warmup(
+     request: Request,
+     context: ProxyContext = Depends(get_proxy_context),
+@@ -1982,6 +2132,95 @@ def _raw_optional_string(raw: Mapping[str, JsonValue], key: str) -> str | None:
+     return value if isinstance(value, str) else None
+ 
+ 
++@v1_router.post("/messages", response_model=AnthropicMessageResponse, response_model_exclude_none=True)
++async def v1_anthropic_messages(
++    request: Request,
++    payload: AnthropicMessagesRequest = Body(...),
++    context: ProxyContext = Depends(get_proxy_context),
++    api_key: ApiKeyData | None = Security(validate_proxy_api_key),
++) -> Response:
++    """Anthropic Messages-compatible adapter backed by the Responses proxy."""
++
++    rate_limit_headers = await context.service.rate_limit_headers()
++    effective_model = _effective_model_for_api_key(api_key, payload.model)
++    validate_model_access(api_key, effective_model)
++    try:
++        responses_payload = payload.to_responses_request()
++    except ClientPayloadError as exc:
++        error = openai_client_payload_error(exc)
++        return _anthropic_logged_error_response(request, 400, error, headers=rate_limit_headers)
++    except ValidationError as exc:
++        error = openai_validation_error(exc)
++        return _anthropic_logged_error_response(request, 400, error, headers=rate_limit_headers)
++
++    apply_api_key_enforcement(responses_payload, api_key)
++    admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=responses_payload.model)
++    if admission_denial is not None:
++        return _anthropic_response_from_openai_json_response(request, admission_denial)
++
++    reservation = await _enforce_request_limits(
++        api_key,
++        request_model=responses_payload.model,
++        request_service_tier=responses_payload.service_tier,
++        request_usage_budget=estimate_api_key_request_usage(responses_payload),
++    )
++    responses_payload.stream = True
++    stream = context.service.stream_responses(
++        responses_payload,
++        request.headers,
++        codex_session_affinity=False,
++        propagate_http_errors=True,
++        openai_cache_affinity=True,
++        api_key=api_key,
++        api_key_reservation=reservation,
++        suppress_text_done_events=True,
++    )
++    stream, startup_error = await _probe_chat_stream_startup_error(
++        stream,
++        timeout_seconds=_CHAT_COMPLETIONS_STARTUP_ERROR_PROBE_SECONDS,
++    )
++    if startup_error is not None:
++        return _anthropic_stream_startup_error_response(request, startup_error, headers=rate_limit_headers)
++
++    if payload.stream:
++        anthropic_stream = stream_anthropic_messages(
++            _stream_proxy_errors_as_response_failed(stream),
++            model=responses_payload.model,
++        )
++        return StreamingResponse(
++            inject_sse_keepalives(
++                anthropic_stream,
++                get_settings().sse_keepalive_interval_seconds,
++            ),
++            media_type="text/event-stream",
++            headers={"Cache-Control": "no-cache", **rate_limit_headers},
++        )
++
++    try:
++        first = await stream.__anext__()
++    except StopAsyncIteration:
++        first = None
++    except ProxyResponseError as exc:
++        return _anthropic_logged_error_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
++
++    stream_with_first = _prepend_first(first, stream)
++    result = await collect_chat_completion(stream_with_first, model=responses_payload.model)
++    if isinstance(result, OpenAIErrorEnvelopeModel):
++        status_code = _status_for_error(result.error)
++        return _anthropic_logged_error_response(
++            request,
++            status_code,
++            result.model_dump(mode="json", exclude_none=True),
++            headers=rate_limit_headers,
++        )
++    anthropic = anthropic_message_from_chat_completion(result, model=responses_payload.model)
++    return JSONResponse(
++        content=anthropic.model_dump(mode="json", exclude_none=True),
++        status_code=200,
++        headers=rate_limit_headers,
++    )
++
++
+ @v1_router.post(
+     "/chat/completions",
+     response_model=ChatCompletionResult,
+@@ -3177,6 +3416,125 @@ def _parse_sse_payload(line: str) -> dict[str, JsonValue] | None:
+     return parse_sse_data_json(line)
+ 
+ 
++def _anthropic_stream_startup_error_response(
++    request: Request,
++    error: ProxyResponseError | OpenAIErrorEnvelopeModel,
++    *,
++    headers: Mapping[str, str],
++) -> JSONResponse:
++    if isinstance(error, ProxyResponseError):
++        envelope = _parse_error_envelope(error.payload)
++        status_code, envelope = _mask_previous_response_not_found_error(envelope, default_status=error.status_code)
++        return _anthropic_logged_error_response(
++            request,
++            status_code,
++            envelope.model_dump(mode="json", exclude_none=True),
++            headers=headers,
++        )
++    status_code, envelope = _mask_previous_response_not_found_error(error)
++    return _anthropic_logged_error_response(
++        request,
++        status_code,
++        envelope.model_dump(mode="json", exclude_none=True),
++        headers=headers,
++    )
++
++
++def _anthropic_response_from_openai_json_response(request: Request, response: JSONResponse) -> JSONResponse:
++    try:
++        content = json.loads(response.body.decode("utf-8"))
++    except (UnicodeDecodeError, JSONDecodeError, AttributeError):
++        content = openai_error("upstream_error", "Upstream error", error_type="server_error")
++    headers = {
++        key: value
++        for key, value in response.headers.items()
++        if key.lower() not in {"content-length", "content-type"}
++    }
++    return _anthropic_logged_error_response(
++        request,
++        response.status_code,
++        content if isinstance(content, Mapping) else openai_error("upstream_error", "Upstream error"),
++        headers=headers,
++    )
++
++
++def _anthropic_logged_error_response(
++    request: Request,
++    status_code: int,
++    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
++    *,
++    headers: Mapping[str, str] | None = None,
++) -> JSONResponse:
++    code, message = _error_details_from_content(content)
++    effective_headers = dict(headers or {})
++    if status_code == 429 and is_local_overload_error_code(code):
++        effective_headers = merge_retry_after_headers(effective_headers)
++    log_error_response(
++        logger,
++        request,
++        status_code,
++        code,
++        message,
++        category="proxy_error_response",
++    )
++    return JSONResponse(
++        status_code=status_code,
++        content=_anthropic_error_content(status_code, content),
++        headers=effective_headers or None,
++    )
++
++
++def _anthropic_error_content(
++    status_code: int,
++    content: Mapping[str, JsonValue] | OpenAIErrorEnvelopeModel | OpenAIErrorEnvelope,
++) -> dict[str, JsonValue]:
++    if isinstance(content, OpenAIErrorEnvelopeModel):
++        envelope = content
++    else:
++        envelope = _parse_error_envelope(cast(JsonValue, content))
++    error = envelope.error
++    code = error.code if error is not None else None
++    message = error.message if error is not None and error.message else None
++    if message is None:
++        _, message = _error_details_from_content(content)
++    return {
++        "type": "error",
++        "error": {
++            "type": _anthropic_error_type(status_code, error),
++            "message": message or "Upstream error",
++            **({"code": code} if code else {}),
++        },
++    }
++
++
++def _anthropic_error_type(status_code: int, error: OpenAIError | None) -> str:
++    raw_type = error.type if error is not None else None
++    code = error.code if error is not None else None
++    if raw_type in {
++        "invalid_request_error",
++        "authentication_error",
++        "permission_error",
++        "not_found_error",
++        "rate_limit_error",
++        "api_error",
++        "overloaded_error",
++    }:
++        return raw_type
++    if status_code == 400:
++        return "invalid_request_error"
++    if status_code == 401:
++        return "authentication_error"
++    if status_code == 403:
++        return "permission_error"
++    if status_code == 404:
++        return "not_found_error"
++    if status_code == 429 or code in {"rate_limit_exceeded", "usage_limit_reached", "insufficient_quota"}:
++        return "rate_limit_error"
++    if status_code in {502, 503, 504, 529}:
++        return "overloaded_error" if code and is_local_overload_error_code(code) else "api_error"
++    return "api_error"
++
++
+ def _logged_error_json_response(
+     request: Request,
+     status_code: int,
+diff --git a/app/modules/proxy/schemas.py b/app/modules/proxy/schemas.py
+index 86c69459..e091a8e1 100644
+--- a/app/modules/proxy/schemas.py
++++ b/app/modules/proxy/schemas.py
+@@ -232,6 +232,36 @@ class V1UsageResponse(BaseModel):
+     upstream_limits: list[V1UsageLimitResponse] = []
+ 
+ 
++class V1BulkUsageError(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    code: str
++    message: str
++
++
++class V1BulkUsageItem(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    index: int
++    masked_key: str
++    key_prefix: str | None = None
++    ok: bool
++    status_code: int
++    usage: V1UsageResponse | None = None
++    codex_usage: RateLimitStatusPayload | None = None
++    error: V1BulkUsageError | None = None
++
++
++class V1BulkUsageResponse(BaseModel):
++    model_config = ConfigDict(extra="forbid")
++
++    object: str = "list"
++    total: int
++    ok: int
++    error: int
++    data: list[V1BulkUsageItem]
++
++
+ class WarmupRequest(BaseModel):
+     model_config = ConfigDict(extra="forbid")
+ 
+diff --git a/openspec/changes/accept-cpa-codex-auth-json/proposal.md b/openspec/changes/accept-cpa-codex-auth-json/proposal.md
+new file mode 100644
+index 00000000..3ced2dcc
+--- /dev/null
++++ b/openspec/changes/accept-cpa-codex-auth-json/proposal.md
+@@ -0,0 +1,22 @@
++## Why
++
++CLIProxyAPI persists Codex OAuth credentials as flat auth JSON files with top-level `type`, `id_token`, `access_token`, `refresh_token`, `account_id`, `email`, `expired`, and `last_refresh` fields. `codex-lb` account import currently accepts Codex CLI-style JSON where token fields live under `tokens`, so operators cannot directly reuse CLIProxyAPI Codex auth exports.
++
++## What Changes
++
++- Normalize CLIProxyAPI's flat Codex token fields into `codex-lb`'s existing `AuthFile.tokens` model during import parsing.
++- Preserve the existing Codex CLI export formats unchanged.
++- Use CLIProxyAPI's top-level `email` as a fallback when the ID token does not contain an email claim.
++
++## Capabilities
++
++### Added Capabilities
++
++- `account-import`: the account import API accepts CLIProxyAPI flat Codex auth JSON in addition to existing Codex CLI JSON shapes.
++
++## Impact
++
++- **Code**: `app/core/auth/__init__.py`
++- **Tests**: `tests/unit/test_auth.py`
++- **API surface**: `POST /api/accounts/import` accepts an additional compatible JSON shape; no endpoint or response contract changes.
++- **Operational**: no migration or configuration required.
+diff --git a/openspec/changes/accept-cpa-codex-auth-json/specs/account-import/spec.md b/openspec/changes/accept-cpa-codex-auth-json/specs/account-import/spec.md
+new file mode 100644
+index 00000000..7ed0de25
+--- /dev/null
++++ b/openspec/changes/accept-cpa-codex-auth-json/specs/account-import/spec.md
+@@ -0,0 +1,24 @@
++## ADDED Requirements
++
++### Requirement: Import CLIProxyAPI flat Codex auth JSON
++
++The account import parser MUST accept CLIProxyAPI Codex auth JSON files that identify themselves as Codex credentials and store OAuth token fields at the top level rather than under a `tokens` object. At minimum, the parser MUST map top-level `id_token`, `access_token`, `refresh_token`, and `account_id` fields into the same internal token model used for Codex CLI auth JSON imports.
++
++The parser MUST continue to accept existing Codex CLI auth JSON formats. If the ID token does not include an email claim and the CLIProxyAPI JSON provides a top-level `email`, the import flow MUST use that email as the account email fallback. The parser MUST NOT apply the flat CLIProxyAPI Codex-token normalization unless the flat payload identifies itself with `type: "codex"`.
++
++#### Scenario: CLIProxyAPI flat JSON import
++
++- **WHEN** a user uploads a Codex auth JSON file containing top-level `type: "codex"`, `id_token`, `access_token`, `refresh_token`, `account_id`, `email`, and `last_refresh`
++- **THEN** the import parser accepts the file
++- **AND** the imported account uses the mapped token values
++- **AND** the account email falls back to the top-level `email` if the ID token has no email claim
++
++#### Scenario: Existing Codex CLI import still works
++
++- **WHEN** a user uploads a Codex CLI auth JSON file with token fields under `tokens`
++- **THEN** the import parser accepts the file using the existing token mapping
++
++#### Scenario: Non-Codex flat token payload is not normalized
++
++- **WHEN** a user uploads a flat token JSON file with top-level token fields and no `type: "codex"` marker
++- **THEN** the Codex account import parser rejects it instead of treating it as a Codex account
+diff --git a/openspec/changes/accept-cpa-codex-auth-json/tasks.md b/openspec/changes/accept-cpa-codex-auth-json/tasks.md
+new file mode 100644
+index 00000000..acc965ce
+--- /dev/null
++++ b/openspec/changes/accept-cpa-codex-auth-json/tasks.md
+@@ -0,0 +1,12 @@
++## 1. Parser Compatibility
++
++- [x] 1.1 Detect flat CLIProxyAPI Codex auth JSON with top-level token fields.
++- [x] 1.2 Normalize flat Codex token fields into the existing `tokens` object before validation.
++- [x] 1.3 Preserve existing Codex CLI auth JSON parsing behavior and avoid normalizing flat payloads without `type: "codex"`.
++- [x] 1.4 Fall back to top-level `email` when the ID token does not expose an email claim.
++
++## 2. Tests
++
++- [x] 2.1 Add unit coverage for CLIProxyAPI flat Codex auth JSON and non-Codex flat token rejection.
++- [x] 2.2 Run the focused auth parser tests.
++- [x] 2.3 `openspec validate --specs` unavailable: no `openspec` executable is installed in this environment.
+diff --git a/tests/integration/test_accounts_api_extended.py b/tests/integration/test_accounts_api_extended.py
+index 0a025e14..4fcad732 100644
+--- a/tests/integration/test_accounts_api_extended.py
++++ b/tests/integration/test_accounts_api_extended.py
+@@ -102,6 +102,71 @@ async def test_import_missing_tokens_returns_400(async_client):
+     assert payload["error"]["code"] == "invalid_auth_json"
+ 
+ 
++@pytest.mark.asyncio
++async def test_import_cliproxyapi_bundle_with_bom_imports_multiple_accounts(async_client):
++    first_payload = {
++        "https://api.openai.com/auth": {
++            "chatgpt_account_id": "acc_cpa_bundle_one",
++            "chatgpt_plan_type": "plus",
++        },
++        "https://api.openai.com/profile": {"email": "bundle-one@example.com"},
++    }
++    second_payload = {
++        "https://api.openai.com/auth": {
++            "chatgpt_account_id": "acc_cpa_bundle_two",
++            "chatgpt_plan_type": "team",
++        },
++        "https://api.openai.com/profile": {"email": "bundle-two@example.com"},
++    }
++    bundle = {
++        "exported_at": "2024-01-02T03:04:05Z",
++        "accounts": [
++            {
++                "name": "bundle-one@example.com",
++                "credentials": {
++                    "access_token": _encode_jwt(first_payload),
++                    "chatgpt_account_id": "acc_cpa_bundle_one",
++                    "email": "bundle-one@example.com",
++                    "plan_type": "plus",
++                },
++            },
++            {
++                "name": "bundle-two@example.com",
++                "credentials": {
++                    "access_token": _encode_jwt(second_payload),
++                    "chatgpt_account_id": "acc_cpa_bundle_two",
++                    "email": "bundle-two@example.com",
++                    "plan_type": "team",
++                },
++            },
++        ],
++    }
++
++    files = {
++        "auth_json": (
++            "cpa.json",
++            "\ufeff" + json.dumps(bundle),
++            "application/json",
++        )
++    }
++    response = await async_client.post("/api/accounts/import", files=files)
++
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["accountId"] == generate_unique_account_id("acc_cpa_bundle_two", "bundle-two@example.com")
++    accounts_response = await async_client.get("/api/accounts")
++    assert accounts_response.status_code == 200
++    accounts = {entry["email"]: entry for entry in accounts_response.json()["accounts"]}
++    assert accounts["bundle-one@example.com"]["accountId"] == generate_unique_account_id(
++        "acc_cpa_bundle_one", "bundle-one@example.com"
++    )
++    assert accounts["bundle-one@example.com"]["auth"]["refresh"]["state"] == "missing"
++    assert accounts["bundle-two@example.com"]["accountId"] == generate_unique_account_id(
++        "acc_cpa_bundle_two", "bundle-two@example.com"
++    )
++    assert accounts["bundle-two@example.com"]["auth"]["refresh"]["state"] == "missing"
++
++
+ @pytest.mark.asyncio
+ async def test_import_falls_back_to_email_based_account_id(async_client):
+     email = "fallback@example.com"
+diff --git a/tests/integration/test_api_keys_api.py b/tests/integration/test_api_keys_api.py
+index 4a1bcaf5..8827ee09 100644
+--- a/tests/integration/test_api_keys_api.py
++++ b/tests/integration/test_api_keys_api.py
+@@ -140,6 +140,21 @@ async def test_api_keys_crud_and_regenerate(async_client):
+     assert regenerated_payload["key"].startswith("sk-clb-")
+     assert regenerated_payload["key"] != first_key
+ 
++    expiring_create = await async_client.post(
++        "/api/api-keys/",
++        json={
++            "name": "expiring-key",
++            "expiresAt": "2026-03-20T23:59:59+09:00",
++        },
++    )
++    assert expiring_create.status_code == 200
++    expiring_payload = expiring_create.json()
++    assert expiring_payload["key"].startswith("sk-amin-")
++    assert expiring_payload["keyPrefix"] == expiring_payload["key"][:15]
++
++    deleted_expiring = await async_client.delete(f"/api/api-keys/{expiring_payload['id']}")
++    assert deleted_expiring.status_code == 204
++
+     deleted = await async_client.delete(f"/api/api-keys/{key_id}")
+     assert deleted.status_code == 204
+ 
+diff --git a/tests/integration/test_codex_usage_api.py b/tests/integration/test_codex_usage_api.py
+index 70901808..588f3a33 100644
+--- a/tests/integration/test_codex_usage_api.py
++++ b/tests/integration/test_codex_usage_api.py
+@@ -1,6 +1,6 @@
+ from __future__ import annotations
+ 
+-from datetime import timedelta
++from datetime import datetime, timedelta, timezone
+ 
+ import pytest
+ 
+@@ -39,13 +39,19 @@ def _make_account(
+     )
+ 
+ 
+-async def _create_api_key(*, name: str, limits: list[LimitRuleInput] | None = None) -> tuple[str, str]:
++async def _create_api_key(
++    *,
++    name: str,
++    limits: list[LimitRuleInput] | None = None,
++    expires_at: datetime | None = None,
++) -> tuple[str, str]:
+     async with SessionLocal() as session:
+         service = ApiKeysService(ApiKeysRepository(session))
+         created = await service.create_key(
+             ApiKeyCreateData(
+                 name=name,
+                 allowed_models=None,
++                expires_at=expires_at,
+                 limits=limits or [],
+             )
+         )
+@@ -530,6 +536,43 @@ async def test_codex_usage_api_key_exposes_monthly_credit_window(async_client, d
+     assert payload["credits"]["balance"] == "750"
+ 
+ 
++@pytest.mark.asyncio
++async def test_codex_usage_accepts_expiring_api_key_with_amin_prefix(async_client, db_setup):
++    key_id, plain_key = await _create_api_key(
++        name="codex-usage-expiring-api-key",
++        expires_at=datetime(2026, 12, 31, tzinfo=timezone.utc),
++        limits=[LimitRuleInput(limit_type="credits", limit_window="5h", max_value=100)],
++    )
++    assert plain_key.startswith("sk-amin-")
++
++    now = utcnow()
++    async with SessionLocal() as session:
++        repo = ApiKeysRepository(session)
++        await repo.replace_limits(
++            key_id,
++            [
++                ApiKeyLimit(
++                    api_key_id=key_id,
++                    limit_type=LimitType.CREDITS,
++                    limit_window=LimitWindow.FIVE_HOURS,
++                    max_value=100,
++                    current_value=20,
++                    model_filter=None,
++                    reset_at=now + timedelta(hours=5),
++                ),
++            ],
++        )
++        await session.commit()
++
++    response = await async_client.get(
++        "/api/codex/usage",
++        headers={"Authorization": f"Bearer {plain_key}"},
++    )
++
++    assert response.status_code == 200
++    assert response.json()["plan_type"] == "api_key"
++
++
+ @pytest.mark.asyncio
+ async def test_codex_usage_api_key_ignores_aggregate_workspace_limits(async_client, db_setup):
+     now = utcnow()
+diff --git a/tests/integration/test_proxy_anthropic_messages.py b/tests/integration/test_proxy_anthropic_messages.py
+new file mode 100644
+index 00000000..fd9d3dd1
+--- /dev/null
++++ b/tests/integration/test_proxy_anthropic_messages.py
+@@ -0,0 +1,162 @@
++from __future__ import annotations
++
++import base64
++import json
++
++import pytest
++
++import app.modules.proxy.service as proxy_module
++
++pytestmark = pytest.mark.integration
++
++
++def _encode_jwt(payload: dict) -> str:
++    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
++    body = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
++    return f"header.{body}.sig"
++
++
++def _make_auth_json(account_id: str, email: str) -> dict:
++    payload = {
++        "email": email,
++        "chatgpt_account_id": account_id,
++        "https://api.openai.com/auth": {"chatgpt_plan_type": "plus"},
++    }
++    return {
++        "tokens": {
++            "idToken": _encode_jwt(payload),
++            "accessToken": "access-token",
++            "refreshToken": "refresh-token",
++            "accountId": account_id,
++        },
++    }
++
++
++async def _import_account(async_client, account_id: str = "acc_anthropic_messages") -> None:
++    auth_json = _make_auth_json(account_id, f"{account_id}@example.com")
++    files = {"auth_json": ("auth.json", json.dumps(auth_json), "application/json")}
++    response = await async_client.post("/api/accounts/import", files=files)
++    assert response.status_code == 200
++
++
++@pytest.mark.asyncio
++async def test_v1_anthropic_messages_non_stream(async_client, monkeypatch):
++    await _import_account(async_client)
++    observed = {}
++
++    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
++        del headers, access_token, account_id, base_url, raise_for_status
++        observed["instructions"] = payload.instructions
++        observed["input"] = payload.input
++        observed["tools"] = payload.tools
++        yield 'data: {"type":"response.output_text.delta","delta":"Hello"}\n\n'
++        yield 'data: {"type":"response.output_text.delta","delta":"!"}\n\n'
++        yield (
++            'data: {"type":"response.completed","response":{"id":"resp_anthropic_1",'
++            '"usage":{"input_tokens":3,"output_tokens":2,"total_tokens":5}}}\n\n'
++        )
++
++    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
++
++    response = await async_client.post(
++        "/v1/messages",
++        json={
++            "model": "gpt-5.2",
++            "system": "be brief",
++            "max_tokens": 64,
++            "messages": [{"role": "user", "content": "hi"}],
++            "tools": [
++                {
++                    "name": "lookup",
++                    "description": "Lookup something",
++                    "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}},
++                }
++            ],
++        },
++    )
++
++    assert response.status_code == 200
++    body = response.json()
++    assert body == {
++        "id": "resp_anthropic_1",
++        "type": "message",
++        "role": "assistant",
++        "model": "gpt-5.2",
++        "content": [{"type": "text", "text": "Hello!"}],
++        "stop_reason": "end_turn",
++        "usage": {"input_tokens": 3, "output_tokens": 2},
++    }
++    assert observed["instructions"] == "be brief"
++    assert observed["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
++    assert observed["tools"] == [
++        {
++            "type": "function",
++            "name": "lookup",
++            "description": "Lookup something",
++            "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
++        }
++    ]
++
++
++@pytest.mark.asyncio
++async def test_v1_anthropic_messages_stream(async_client, monkeypatch):
++    await _import_account(async_client, "acc_anthropic_stream")
++
++    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
++        del payload, headers, access_token, account_id, base_url, raise_for_status
++        yield 'data: {"type":"response.output_text.delta","delta":"Hi"}\n\n'
++        yield (
++            'data: {"type":"response.completed","response":{"id":"resp_anthropic_stream",'
++            '"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}\n\n'
++        )
++
++    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
++
++    async with async_client.stream(
++        "POST",
++        "/v1/messages",
++        json={"model": "gpt-5.2", "max_tokens": 64, "stream": True, "messages": [{"role": "user", "content": "hi"}]},
++    ) as response:
++        assert response.status_code == 200
++        text = "\n".join([line async for line in response.aiter_lines() if line])
++
++    assert "event: message_start" in text
++    assert "event: content_block_start" in text
++    assert "event: content_block_delta" in text
++    assert '"text":"Hi"' in text
++    assert "event: message_delta" in text
++    assert '"output_tokens":1' in text
++    assert "event: message_stop" in text
++
++
++@pytest.mark.asyncio
++async def test_v1_anthropic_messages_tool_use_non_stream(async_client, monkeypatch):
++    await _import_account(async_client, "acc_anthropic_tool")
++
++    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
++        del payload, headers, access_token, account_id, base_url, raise_for_status
++        yield (
++            'data: {"type":"response.output_item.done","output_index":0,"item":{"id":"fc_1",'
++            '"type":"function_call","call_id":"toolu_1","name":"lookup","arguments":"{\\"q\\":\\"x\\"}"}}\n\n'
++        )
++        yield (
++            'data: {"type":"response.completed","response":{"id":"resp_tool",'
++            '"usage":{"input_tokens":5,"output_tokens":3,"total_tokens":8}}}\n\n'
++        )
++
++    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
++
++    response = await async_client.post(
++        "/v1/messages",
++        json={
++            "model": "gpt-5.2",
++            "max_tokens": 64,
++            "messages": [{"role": "user", "content": "use tool"}],
++            "tools": [{"name": "lookup", "input_schema": {"type": "object"}}],
++        },
++    )
++
++    assert response.status_code == 200
++    body = response.json()
++    assert body["stop_reason"] == "tool_use"
++    assert body["content"] == [{"type": "tool_use", "id": "toolu_1", "name": "lookup", "input": {"q": "x"}}]
+diff --git a/tests/integration/test_v1_usage.py b/tests/integration/test_v1_usage.py
+index 70b0ab92..98b88d8a 100644
+--- a/tests/integration/test_v1_usage.py
++++ b/tests/integration/test_v1_usage.py
+@@ -708,3 +708,102 @@ async def test_v1_usage_ignores_paused_and_deactivated_accounts_in_aggregate_cre
+             "source": "aggregate",
+         },
+     ]
++
++
++@pytest.mark.asyncio
++async def test_v1_usage_bulk_returns_usage_for_newline_separated_keys(async_client):
++    key_a_id, key_a = await _create_api_key(
++        name="bulk-usage-a",
++        limits=[LimitRuleInput(limit_type="credits", limit_window="5h", max_value=60)],
++    )
++    _, key_b = await _create_api_key(name="bulk-usage-b")
++    now = utcnow()
++    reset_at = now + timedelta(hours=5)
++
++    async with SessionLocal() as session:
++        repo = ApiKeysRepository(session)
++        await repo.replace_limits(
++            key_a_id,
++            [
++                ApiKeyLimit(
++                    api_key_id=key_a_id,
++                    limit_type=LimitType.CREDITS,
++                    limit_window=LimitWindow.FIVE_HOURS,
++                    max_value=60,
++                    current_value=12,
++                    model_filter=None,
++                    reset_at=reset_at,
++                )
++            ],
++        )
++        logs = RequestLogsRepository(session)
++        await logs.add_log(
++            account_id=None,
++            api_key_id=key_a_id,
++            request_id="req_v1_bulk_usage_a1",
++            model="gpt-5.4",
++            input_tokens=10,
++            output_tokens=5,
++            cached_input_tokens=2,
++            latency_ms=100,
++            status="success",
++            error_code=None,
++            requested_at=now - timedelta(minutes=1),
++        )
++
++    response = await async_client.post(
++        "/v1/usage/bulk",
++        content=f"# comment\napiKey={key_a}\nserialKey={key_b}\ninvalid-key\n",
++        headers={"Content-Type": "text/plain"},
++    )
++
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["total"] == 3
++    assert payload["ok"] == 2
++    assert payload["error"] == 1
++
++    first = payload["data"][0]
++    assert first["ok"] is True
++    assert first["status_code"] == 200
++    assert first["usage"]["request_count"] == 1
++    assert first["usage"]["total_tokens"] == 15
++    assert first["usage"]["limits"] == [
++        {
++            "limit_type": "credits",
++            "limit_window": "5h",
++            "max_value": 60,
++            "current_value": 12,
++            "remaining_value": 48,
++            "model_filter": None,
++            "reset_at": reset_at.isoformat() + "Z",
++            "source": "api_key_limit",
++        }
++    ]
++    assert first["codex_usage"]["plan_type"] == "api_key"
++    assert first["codex_usage"]["credits"]["balance"] == "48"
++
++    second = payload["data"][1]
++    assert second["ok"] is True
++    assert second["usage"]["request_count"] == 0
++
++    third = payload["data"][2]
++    assert third["ok"] is False
++    assert third["status_code"] == 401
++    assert third["error"]["code"] == "invalid_api_key"
++
++
++@pytest.mark.asyncio
++async def test_v1_usage_bulk_accepts_json_payload(async_client):
++    _, key = await _create_api_key(name="bulk-usage-json")
++
++    response = await async_client.post(
++        "/v1/usage/bulk",
++        json={"keys": [{"serialKey": key}]},
++    )
++
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["total"] == 1
++    assert payload["ok"] == 1
++    assert payload["data"][0]["ok"] is True
+diff --git a/tests/unit/test_anthropic_messages_streaming.py b/tests/unit/test_anthropic_messages_streaming.py
+new file mode 100644
+index 00000000..ff53f3e5
+--- /dev/null
++++ b/tests/unit/test_anthropic_messages_streaming.py
+@@ -0,0 +1,25 @@
++from __future__ import annotations
++
++import pytest
++
++from app.core.openai.anthropic import stream_anthropic_messages
++
++
++@pytest.mark.asyncio
++async def test_stream_anthropic_messages_drains_upstream_after_terminal_event() -> None:
++    drained_after_terminal = False
++
++    async def upstream():
++        nonlocal drained_after_terminal
++        yield 'data: {"type":"response.output_text.delta","delta":"Hi"}\n\n'
++        yield (
++            'data: {"type":"response.completed","response":{"id":"resp_1",'
++            '"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}\n\n'
++        )
++        drained_after_terminal = True
++
++    chunks = [chunk async for chunk in stream_anthropic_messages(upstream(), model="gpt-5.2")]
++
++    assert drained_after_terminal is True
++    assert any('event: message_stop' in chunk for chunk in chunks)
++    assert any('"output_tokens":1' in chunk for chunk in chunks)
+diff --git a/tests/unit/test_api_keys_service.py b/tests/unit/test_api_keys_service.py
+index 246b4e2b..9b25f71a 100644
+--- a/tests/unit/test_api_keys_service.py
++++ b/tests/unit/test_api_keys_service.py
+@@ -606,6 +606,27 @@ async def test_api_key_read_skips_null_allowed_models() -> None:
+     assert reloaded.allowed_models == ["gpt-5.2", "gpt-5.5"]
+ 
+ 
++@pytest.mark.asyncio
++async def test_create_key_uses_amin_prefix_when_expiry_is_set() -> None:
++    repo = _FakeApiKeysRepository()
++    service = ApiKeysService(repo)
++
++    created = await service.create_key(
++        ApiKeyCreateData(
++            name="expiring-key",
++            allowed_models=None,
++            expires_at=datetime(2026, 3, 20, 23, 59, 59, tzinfo=timezone(timedelta(hours=9))),
++        )
++    )
++
++    assert created.key.startswith("sk-amin-")
++    assert created.key_prefix == created.key[:15]
++
++    stored = await repo.get_by_id(created.id)
++    assert stored is not None
++    assert stored.key_prefix == created.key[:15]
++
++
+ @pytest.mark.asyncio
+ async def test_create_key_normalizes_timezone_aware_expiry_to_utc_naive() -> None:
+     repo = _FakeApiKeysRepository()
+@@ -1489,6 +1510,32 @@ async def test_regenerate_key_rotates_hash_and_prefix() -> None:
+     assert row_after.key_prefix != old_prefix
+ 
+ 
++@pytest.mark.asyncio
++async def test_regenerate_key_preserves_amin_prefix_for_expiring_key() -> None:
++    repo = _FakeApiKeysRepository()
++    service = ApiKeysService(repo)
++    created = await service.create_key(
++        ApiKeyCreateData(
++            name="regen-expiring-key",
++            allowed_models=None,
++            expires_at=utcnow() + timedelta(days=30),
++        )
++    )
++
++    row_before = await repo.get_by_id(created.id)
++    assert row_before is not None
++    old_hash = row_before.key_hash
++
++    regenerated = await service.regenerate_key(created.id)
++    row_after = await repo.get_by_id(created.id)
++    assert row_after is not None
++
++    assert created.key.startswith("sk-amin-")
++    assert regenerated.key.startswith("sk-amin-")
++    assert row_after.key_hash != old_hash
++    assert row_after.key_prefix == regenerated.key[:15]
++
++
+ @pytest.mark.asyncio
+ async def test_record_usage_increments_matching_limits() -> None:
+     repo = _FakeApiKeysRepository()
+diff --git a/tests/unit/test_auth.py b/tests/unit/test_auth.py
+index 34ae7079..ddcc77cd 100644
+--- a/tests/unit/test_auth.py
++++ b/tests/unit/test_auth.py
+@@ -7,6 +7,7 @@ import stat
+ 
+ import pytest
+ from cryptography.fernet import InvalidToken
++from pydantic import ValidationError
+ 
+ from app.core.auth import claims_from_auth, extract_id_token_claims, parse_auth_json
+ from app.core.crypto import TokenEncryptor, get_or_create_key
+@@ -74,6 +75,79 @@ def test_parse_auth_json_accepts_latest_codex_export_format():
+     assert auth.last_refresh_at.isoformat() == "2024-01-02T03:04:05+00:00"
+ 
+ 
++def test_parse_auth_json_accepts_cliproxyapi_codex_flat_format():
++    payload = {
++        "https://api.openai.com/auth": {"chatgpt_plan_type": "team"},
++    }
++    token = _encode_jwt(payload)
++    auth_json = {
++        "type": "codex",
++        "id_token": token,
++        "access_token": "access-cpa",
++        "refresh_token": "refresh-cpa",
++        "account_id": "acc_cpa",
++        "email": "cpa@example.com",
++        "expired": "2024-01-02T04:04:05Z",
++        "last_refresh": "2024-01-02T03:04:05Z",
++    }
++
++    auth = parse_auth_json(json.dumps(auth_json).encode("utf-8"))
++
++    assert auth.tokens.id_token == token
++    assert auth.tokens.access_token == "access-cpa"
++    assert auth.tokens.refresh_token == "refresh-cpa"
++    assert auth.tokens.account_id == "acc_cpa"
++    assert auth.email == "cpa@example.com"
++    assert auth.last_refresh_at is not None
++    assert auth.last_refresh_at.isoformat() == "2024-01-02T03:04:05+00:00"
++
++    claims = claims_from_auth(auth)
++    assert claims.account_id == "acc_cpa"
++    assert claims.email == "cpa@example.com"
++    assert claims.plan_type == "team"
++
++
++def test_parse_auth_json_accepts_cliproxyapi_access_token_only_export():
++    payload = {
++        "https://api.openai.com/auth": {
++            "chatgpt_account_id": "acc_cpa_access",
++            "chatgpt_plan_type": "plus",
++        },
++        "https://api.openai.com/profile": {"email": "profile@example.com"},
++    }
++    token = _encode_jwt(payload)
++    auth_json = {
++        "type": "codex",
++        "access_token": token,
++        "account_id": "acc_cpa_access",
++        "email": "fallback@example.com",
++    }
++
++    auth = parse_auth_json(json.dumps(auth_json).encode("utf-8"))
++
++    assert auth.tokens.id_token == token
++    assert auth.tokens.access_token == token
++    assert auth.tokens.refresh_token == ""
++
++    claims = claims_from_auth(auth)
++    assert claims.account_id == "acc_cpa_access"
++    assert claims.email == "profile@example.com"
++    assert claims.plan_type == "plus"
++
++
++def test_parse_auth_json_rejects_non_codex_flat_token_payload():
++    auth_json = {
++        "type": "xai",
++        "id_token": "id",
++        "access_token": "access",
++        "refresh_token": "refresh",
++        "account_id": "acc_xai",
++    }
++
++    with pytest.raises(ValidationError):
++        parse_auth_json(json.dumps(auth_json).encode("utf-8"))
++
++
+ def test_claims_from_auth_preserves_prolite_plan_type():
+     payload = {
+         "email": "user@example.com",
+diff --git a/tests/unit/test_auth_manager.py b/tests/unit/test_auth_manager.py
+index e4b9b84e..8c7591ce 100644
+--- a/tests/unit/test_auth_manager.py
++++ b/tests/unit/test_auth_manager.py
+@@ -793,3 +793,32 @@ async def test_refresh_account_requires_reauth_when_upstream_returns_token_expir
+     reason = repo.status_payload["deactivation_reason"]
+     assert isinstance(reason, str)
+     assert "re-login" in reason.lower() or "expired" in reason.lower()
++
++
++@pytest.mark.asyncio
++async def test_refresh_account_skips_empty_refresh_token(monkeypatch):
++    async def _fake_refresh(_: str) -> TokenRefreshResult:
++        raise AssertionError("empty refresh token should not call upstream refresh")
++
++    monkeypatch.setattr(auth_manager_module, "refresh_access_token", _fake_refresh)
++
++    encryptor = TokenEncryptor()
++    account = Account(
++        id="acc_empty_refresh",
++        email="user@example.com",
++        plan_type="plus",
++        access_token_encrypted=encryptor.encrypt("access-token"),
++        refresh_token_encrypted=encryptor.encrypt(""),
++        id_token_encrypted=encryptor.encrypt("id-token"),
++        last_refresh=utcnow(),
++        status=AccountStatus.ACTIVE,
++        deactivation_reason=None,
++    )
++    repo = _DummyRepo()
++    manager = AuthManager(cast(AccountsRepositoryPort, repo))
++
++    updated = await manager.refresh_account(account)
++
++    assert updated is account
++    assert repo.tokens_payload is None
++    assert repo.status_payload is None
+diff --git a/tests/unit/test_usage_refresh_scheduler_recovery.py b/tests/unit/test_usage_refresh_scheduler_recovery.py
+index ba8d965e..d276ead9 100644
+--- a/tests/unit/test_usage_refresh_scheduler_recovery.py
++++ b/tests/unit/test_usage_refresh_scheduler_recovery.py
+@@ -718,3 +718,46 @@ async def test_reconcile_recoverable_account_statuses_keeps_rate_limited_when_re
+     assert account.status == AccountStatus.RATE_LIMITED
+     assert account.reset_at == past_reset
+     assert account.blocked_at == blocked_at
++
++
++@pytest.mark.asyncio
++async def test_reconcile_recoverable_account_statuses_updates_input_snapshot_for_warmup(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    now = 1_700_000_000.0
++    past_reset = int(now - 300)
++    blocked_at = int(now - 7200)
++    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
++    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
++    monkeypatch.setattr("app.modules.proxy.load_balancer.utcnow", lambda: _epoch_to_naive_utc(now))
++
++    account = _make_account(
++        "acc_rate_limited_snapshot",
++        status=AccountStatus.RATE_LIMITED,
++        reset_at=past_reset,
++        blocked_at=blocked_at,
++    )
++    accounts_repo = StubAccountsRepository([account])
++    usage_repo = StubUsageRepository(
++        primary={
++            account.id: _make_usage(
++                account.id,
++                window="primary",
++                used_percent=1.0,
++                reset_at=int(now + 3600),
++                recorded_at=_epoch_to_naive_utc(now - 10),
++                window_minutes=300,
++            )
++        }
++    )
++
++    recovered = await refresh_scheduler_module.reconcile_recoverable_account_statuses(
++        accounts_repo=accounts_repo,
++        usage_repo=usage_repo,
++        accounts=[account],
++    )
++
++    assert recovered == 1
++    assert account.status == AccountStatus.ACTIVE
++    assert account.reset_at is None
++    assert account.blocked_at is None
