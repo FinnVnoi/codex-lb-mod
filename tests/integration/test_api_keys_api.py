@@ -3137,6 +3137,90 @@ async def test_update_key_same_policy_and_max_change_preserve_usage_state(async_
 
 
 @pytest.mark.asyncio
+async def test_update_key_window_change_preserves_usage_and_starts_new_window(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "preserve-usage-window-change",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "monthly", "maxValue": 1000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    original_reset_at = utcnow() + timedelta(days=20)
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        limits[0].current_value = 456
+        limits[0].reset_at = original_reset_at
+        await session.commit()
+
+    before_update = utcnow()
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "1h", "maxValue": 2000},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].limit_window == LimitWindow.ONE_HOUR
+        assert limits[0].current_value == 456
+        assert limits[0].max_value == 2000
+        assert before_update + timedelta(minutes=59) < limits[0].reset_at <= utcnow() + timedelta(hours=1)
+        assert limits[0].reset_at != original_reset_at
+
+
+@pytest.mark.asyncio
+async def test_adding_second_window_for_same_policy_starts_new_counter(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "new-parallel-window",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "monthly", "maxValue": 1000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        limits[0].current_value = 456
+        await session.commit()
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "monthly", "maxValue": 1000},
+                {"limitType": "total_tokens", "limitWindow": "1h", "maxValue": 2000},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        by_window = {limit.limit_window: limit for limit in limits}
+        assert by_window[LimitWindow.MONTHLY].current_value == 456
+        assert by_window[LimitWindow.ONE_HOUR].current_value == 0
+
+
+@pytest.mark.asyncio
 async def test_update_key_reset_usage_requires_explicit_action(async_client):
     created = await async_client.post(
         "/api/api-keys/",

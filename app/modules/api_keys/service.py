@@ -1733,10 +1733,37 @@ async def _build_limit_rows_for_update(
     if len(submitted_by_key) != len(submitted_limits):
         raise ApiKeyValidationError("Duplicate limit rules are not allowed")
 
+    matched_by_index: dict[int, ApiKeyLimit] = {}
+    matched_existing_ids: set[int] = set()
+    for index, submitted in enumerate(submitted_limits):
+        matched = existing_by_key.get(_limit_identity_from_input(submitted))
+        if matched is not None:
+            matched_by_index[index] = matched
+            matched_existing_ids.add(matched.id)
+
+    unmatched_existing_by_policy: dict[tuple[str, str | None], list[ApiKeyLimit]] = {}
+    for existing in existing_limits:
+        if existing.id in matched_existing_ids:
+            continue
+        unmatched_existing_by_policy.setdefault(_limit_policy_identity_from_row(existing), []).append(existing)
+
+    unmatched_submitted_by_policy: dict[tuple[str, str | None], list[int]] = {}
+    for index, submitted in enumerate(submitted_limits):
+        if index in matched_by_index:
+            continue
+        unmatched_submitted_by_policy.setdefault(_limit_policy_identity_from_input(submitted), []).append(index)
+
+    # Changing only the window should keep the accumulated usage. Match it only
+    # when the old/new policy pair is unambiguous; adding a second window for the
+    # same type/model still starts a fresh counter.
+    for policy_identity, submitted_indexes in unmatched_submitted_by_policy.items():
+        existing_candidates = unmatched_existing_by_policy.get(policy_identity, [])
+        if len(submitted_indexes) == 1 and len(existing_candidates) == 1:
+            matched_by_index[submitted_indexes[0]] = existing_candidates[0]
+
     rows: list[ApiKeyLimit] = []
-    for submitted in submitted_limits:
-        identity = _limit_identity_from_input(submitted)
-        matched = existing_by_key.get(identity)
+    for index, submitted in enumerate(submitted_limits):
+        matched = matched_by_index.get(index)
         if reset_usage:
             rows.append(_limit_input_to_row(submitted, key_id, now))
             continue
@@ -1745,13 +1772,14 @@ async def _build_limit_rows_for_update(
                 raise TypeError("repository is required to backfill new API key limit usage")
             rows.append(await _new_limit_input_to_backfilled_row(submitted, key_id, now, repository))
             continue
+        window_changed = matched.limit_window.value != submitted.limit_window
         rows.append(
             _limit_input_to_row(
                 submitted,
                 key_id,
                 now,
                 current_value=matched.current_value,
-                reset_at=matched.reset_at,
+                reset_at=None if window_changed else matched.reset_at,
             )
         )
     return rows
@@ -1811,6 +1839,14 @@ def _limit_identity_from_input(limit: LimitRuleInput) -> tuple[str, str, str | N
 
 def _limit_identity_from_row(limit: ApiKeyLimit) -> tuple[str, str, str | None]:
     return (limit.limit_type.value, limit.limit_window.value, limit.model_filter)
+
+
+def _limit_policy_identity_from_input(limit: LimitRuleInput) -> tuple[str, str | None]:
+    return (limit.limit_type, limit.model_filter)
+
+
+def _limit_policy_identity_from_row(limit: ApiKeyLimit) -> tuple[str, str | None]:
+    return (limit.limit_type.value, limit.model_filter)
 
 
 def _calculate_cost_microdollars(
