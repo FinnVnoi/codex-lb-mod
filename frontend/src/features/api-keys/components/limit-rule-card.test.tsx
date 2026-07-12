@@ -28,6 +28,17 @@ function costRule(overrides: Partial<LimitRuleCreate> = {}): LimitRuleCreate {
 }
 
 describe("LimitRuleCard", () => {
+  it.each([
+    ["1h", "1 hour"],
+    ["lifetime", "Lifetime"],
+  ] as const)("renders the %s window as %s", (limitWindow, label) => {
+    renderWithProviders(
+      <LimitRuleCard rule={tokenRule({ limitWindow })} onChange={vi.fn()} onRemove={vi.fn()} />,
+    );
+
+    expect(screen.getByRole("combobox", { name: "Window" })).toHaveTextContent(label);
+  });
+
   it("renders token-type rule with correct label and value", () => {
     renderWithProviders(
       <LimitRuleCard rule={tokenRule()} onChange={vi.fn()} onRemove={vi.fn()} />,

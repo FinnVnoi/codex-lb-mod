@@ -6,6 +6,7 @@ import pytest
 
 from app.db.models import LimitWindow
 from app.modules.api_keys.limit_windows import (
+    LIFETIME_RESET_AT,
     advance_limit_reset,
     limit_window_delta,
     next_limit_reset,
@@ -20,6 +21,7 @@ NOW = datetime(2026, 5, 28, 10, 30, 0)
 @pytest.mark.parametrize(
     "window, expected_delta",
     [
+        (LimitWindow.ONE_HOUR, timedelta(hours=1)),
         (LimitWindow.FIVE_HOURS, timedelta(hours=5)),
         (LimitWindow.DAILY, timedelta(days=1)),
         (LimitWindow.WEEKLY, timedelta(days=7)),
@@ -37,11 +39,13 @@ def test_limit_window_delta_returns_expected_duration(
 @pytest.mark.parametrize(
     "window, expected",
     [
+        (LimitWindow.ONE_HOUR, NOW + timedelta(hours=1)),
         (LimitWindow.FIVE_HOURS, NOW + timedelta(hours=5)),
         (LimitWindow.DAILY, NOW + timedelta(days=1)),
         (LimitWindow.WEEKLY, NOW + timedelta(days=7)),
         (LimitWindow.SEVEN_DAYS, NOW + timedelta(days=7)),
         (LimitWindow.MONTHLY, NOW + timedelta(days=30)),
+        (LimitWindow.LIFETIME, LIFETIME_RESET_AT),
     ],
 )
 def test_next_limit_reset_adds_window_delta_to_now(
@@ -89,6 +93,12 @@ def test_advance_limit_reset_advances_multiple_deltas_when_many_windows_passed()
     assert result > NOW
 
 
+def test_lifetime_window_never_advances_or_exposes_a_reset_delta() -> None:
+    assert advance_limit_reset(NOW - timedelta(days=1), NOW, LimitWindow.LIFETIME) == LIFETIME_RESET_AT
+    with pytest.raises(ValueError, match="do not have a reset interval"):
+        limit_window_delta(LimitWindow.LIFETIME)
+
+
 def test_advance_limit_reset_handles_long_idle_gap_for_monthly_window() -> None:
     # 18 months of missed monthly resets should not loop forever; pins the
     # behaviour so a future per-call cap (or vectorised math) doesn't drop
@@ -104,6 +114,7 @@ def test_advance_limit_reset_handles_long_idle_gap_for_monthly_window() -> None:
 @pytest.mark.parametrize(
     "window",
     [
+        LimitWindow.ONE_HOUR,
         LimitWindow.FIVE_HOURS,
         LimitWindow.DAILY,
         LimitWindow.WEEKLY,

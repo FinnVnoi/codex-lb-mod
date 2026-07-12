@@ -1024,11 +1024,13 @@ class LimitType(str, Enum):
 
 
 class LimitWindow(str, Enum):
+    ONE_HOUR = "1h"
     DAILY = "daily"
     WEEKLY = "weekly"
     MONTHLY = "monthly"
     FIVE_HOURS = "5h"
     SEVEN_DAYS = "7d"
+    LIFETIME = "lifetime"
 
 
 class ApiKeyLimit(Base):

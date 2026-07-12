@@ -496,6 +496,7 @@ class ApiKeysRepository:
                     ApiKeyLimit.limit_window,
                 )
                 .where(ApiKeyLimit.reset_at < now)
+                .where(ApiKeyLimit.limit_window != LimitWindow.LIFETIME)
                 .order_by(ApiKeyLimit.reset_at.asc(), ApiKeyLimit.id.asc())
                 .limit(_EXPIRED_LIMIT_RESET_BATCH_SIZE)
             )

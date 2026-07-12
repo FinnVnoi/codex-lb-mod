@@ -1464,6 +1464,8 @@ async def _lazy_reset_expired_limits(
 ) -> bool:
     reset_performed = False
     for limit in limits:
+        if limit.limit_window == LimitWindow.LIFETIME:
+            continue
         if limit.reset_at >= now:
             continue
         new_reset_at = advance_limit_reset(limit.reset_at, now, limit.limit_window)

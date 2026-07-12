@@ -262,6 +262,16 @@ describe("ApiKeyUpdateRequestSchema", () => {
 });
 
 describe("LimitRuleCreateSchema", () => {
+  it.each(["1h", "lifetime"] as const)("accepts the %s limit window", (limitWindow) => {
+    const parsed = LimitRuleCreateSchema.parse({
+      limitType: "total_tokens",
+      limitWindow,
+      maxValue: 100,
+    });
+
+    expect(parsed.limitWindow).toBe(limitWindow);
+  });
+
   it("parses valid limit rule", () => {
     const parsed = LimitRuleCreateSchema.parse({
       limitType: "total_tokens",
