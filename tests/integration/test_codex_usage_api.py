@@ -72,6 +72,7 @@ async def _create_api_key(
             ApiKeyCreateData(
                 name=name,
                 allowed_models=None,
+                expires_at=expires_at,
                 limits=limits or [],
             )
         )
