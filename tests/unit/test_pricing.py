@@ -43,6 +43,77 @@ def test_get_pricing_for_model_gpt_5_3_alias():
     assert model == "gpt-5.3-codex"
 
 
+@pytest.mark.parametrize(
+    ("requested_model", "canonical_model", "input_rate", "cached_rate", "output_rate"),
+    [
+        ("gpt-5.6-sol-2026-07-01", "gpt-5.6-sol", 5.0, 0.5, 30.0),
+        ("gpt-5.6-terra-2026-07-01", "gpt-5.6-terra", 2.5, 0.25, 15.0),
+        ("gpt-5.6-luna-2026-07-01", "gpt-5.6-luna", 1.0, 0.1, 6.0),
+    ],
+)
+def test_get_pricing_for_model_gpt_5_6_aliases(
+    requested_model: str,
+    canonical_model: str,
+    input_rate: float,
+    cached_rate: float,
+    output_rate: float,
+):
+    result = get_pricing_for_model(requested_model, DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
+    assert result is not None
+    model, price = result
+    assert model == canonical_model
+    assert price.input_per_1m == input_rate
+    assert price.cached_input_per_1m == cached_rate
+    assert price.output_per_1m == output_rate
+
+
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected_cost"),
+    [
+        ("gpt-5.6-sol", None, 3.5),
+        ("gpt-5.6-sol", "flex", 1.75),
+        ("gpt-5.6-sol", "priority", 7.0),
+        ("gpt-5.6-terra", None, 1.75),
+        ("gpt-5.6-terra", "flex", 0.875),
+        ("gpt-5.6-terra", "priority", 3.5),
+        ("gpt-5.6-luna", None, 0.7),
+        ("gpt-5.6-luna", "flex", 0.35),
+        ("gpt-5.6-luna", "priority", 1.4),
+    ],
+)
+def test_calculate_cost_from_usage_gpt_5_6_tiers(
+    model: str,
+    service_tier: str | None,
+    expected_cost: float,
+):
+    usage = UsageTokens(input_tokens=100_000.0, output_tokens=100_000.0)
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS[model], service_tier=service_tier)
+    assert cost == pytest.approx(expected_cost)
+
+
+@pytest.mark.parametrize(
+    ("model", "service_tier", "expected_cost"),
+    [
+        ("gpt-5.6-sol", None, 27.5),
+        ("gpt-5.6-sol", "flex", 13.75),
+        ("gpt-5.6-terra", None, 13.75),
+        ("gpt-5.6-terra", "flex", 6.875),
+        ("gpt-5.6-luna", None, 5.5),
+        ("gpt-5.6-luna", "flex", 2.75),
+    ],
+)
+def test_calculate_cost_from_usage_gpt_5_6_long_context(
+    model: str,
+    service_tier: str | None,
+    expected_cost: float,
+):
+    # 500K input + 500K output exceeds the 272K prompt threshold. The
+    # whole request uses 2x input and 1.5x output pricing.
+    usage = UsageTokens(input_tokens=500_000.0, output_tokens=500_000.0)
+    cost = calculate_cost_from_usage(usage, DEFAULT_PRICING_MODELS[model], service_tier=service_tier)
+    assert cost == pytest.approx(expected_cost)
+
+
 def test_get_pricing_for_model_gpt_5_3_chat_alias():
     result = get_pricing_for_model("gpt-5.3-chat-latest", DEFAULT_PRICING_MODELS, DEFAULT_MODEL_ALIASES)
     assert result is not None

@@ -155,6 +155,7 @@ def _websocket_settings(**overrides):
         "sse_keepalive_interval_seconds": 10.0,
         "log_proxy_request_shape": False,
         "log_proxy_request_shape_raw_cache_key": False,
+        "log_proxy_request_payload": False,
         "proxy_token_refresh_limit": 32,
         "proxy_upstream_websocket_connect_limit": 64,
         "proxy_account_stream_recovery_reserve": 1,
