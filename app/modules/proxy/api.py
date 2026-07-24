@@ -1664,11 +1664,11 @@ def _parse_bulk_usage_keys(body: bytes) -> list[str]:
 
 def _parse_bulk_usage_json_payload(payload: JsonValue) -> list[str]:
     if isinstance(payload, list):
-        return [_coerce_bulk_usage_key(item) for item in payload if _coerce_bulk_usage_key(item)]
+        return [key for item in payload if (key := _coerce_bulk_usage_key(item)) is not None]
     if isinstance(payload, dict):
         source = payload.get("keys") or payload.get("apiKeys") or payload.get("api_keys") or payload.get("serialKeys")
         if isinstance(source, list):
-            return [_coerce_bulk_usage_key(item) for item in source if _coerce_bulk_usage_key(item)]
+            return [key for item in source if (key := _coerce_bulk_usage_key(item)) is not None]
         key = _coerce_bulk_usage_key(payload)
         return [key] if key else []
     if isinstance(payload, str):
@@ -6161,7 +6161,7 @@ def _anthropic_stream_startup_error_response(
 
 def _anthropic_response_from_openai_json_response(request: Request, response: JSONResponse) -> JSONResponse:
     try:
-        content = json.loads(response.body.decode("utf-8"))
+        content = json.loads(bytes(response.body).decode("utf-8"))
     except (UnicodeDecodeError, JSONDecodeError, AttributeError):
         content = openai_error("upstream_error", "Upstream error", error_type="server_error")
     headers = {

@@ -758,7 +758,6 @@ async def test_v1_usage_ignores_paused_and_deactivated_accounts_in_aggregate_cre
     assert payload["limits"] == payload["upstream_limits"]
 
 
-
 @pytest.mark.asyncio
 async def test_v1_usage_bulk_returns_usage_for_newline_separated_keys(async_client):
     key_a_id, key_a = await _create_api_key(

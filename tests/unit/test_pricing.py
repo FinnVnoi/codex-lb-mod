@@ -51,7 +51,7 @@ def test_get_pricing_for_model_gpt_5_3_alias():
         ("gpt-5.6-luna-2026-07-01", "gpt-5.6-luna", 1.0, 0.1, 6.0),
     ],
 )
-def test_get_pricing_for_model_gpt_5_6_aliases(
+def test_get_pricing_for_model_gpt_5_6_alias_rates(
     requested_model: str,
     canonical_model: str,
     input_rate: float,
@@ -102,7 +102,7 @@ def test_calculate_cost_from_usage_gpt_5_6_tiers(
         ("gpt-5.6-luna", "flex", 2.75),
     ],
 )
-def test_calculate_cost_from_usage_gpt_5_6_long_context(
+def test_calculate_cost_from_usage_gpt_5_6_long_context_balanced_tokens(
     model: str,
     service_tier: str | None,
     expected_cost: float,

@@ -21,5 +21,5 @@ async def test_stream_anthropic_messages_drains_upstream_after_terminal_event() 
     chunks = [chunk async for chunk in stream_anthropic_messages(upstream(), model="gpt-5.2")]
 
     assert drained_after_terminal is True
-    assert any('event: message_stop' in chunk for chunk in chunks)
+    assert any("event: message_stop" in chunk for chunk in chunks)
     assert any('"output_tokens":1' in chunk for chunk in chunks)

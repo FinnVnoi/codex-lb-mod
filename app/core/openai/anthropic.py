@@ -64,9 +64,7 @@ class AnthropicMessagesRequest(BaseModel):
                 raise ValueError(f"messages[{index}] must be an object")
             role = message_mapping.get("role")
             if role not in ("user", "assistant", "system", "developer"):
-                raise ValueError(
-                    f"messages[{index}].role must be 'user', 'assistant', 'system', or 'developer'"
-                )
+                raise ValueError(f"messages[{index}].role must be 'user', 'assistant', 'system', or 'developer'")
         return self
 
     def to_responses_request(self) -> ResponsesRequest:
@@ -89,7 +87,7 @@ class AnthropicMessagesRequest(BaseModel):
             payload["stream"] = stream
         stop_sequences = _anthropic_stop_sequences(self.stop_sequences)
         if stop_sequences is not None:
-            payload["stop"] = stop_sequences
+            payload["stop"] = cast(JsonValue, stop_sequences)
         reasoning = _anthropic_thinking_to_reasoning(self.thinking)
         if reasoning is not None:
             payload["reasoning"] = reasoning.model_dump(mode="json", exclude_none=True)
@@ -222,9 +220,7 @@ def _anthropic_message_to_responses_items(role: str, content: JsonValue) -> list
         part_mapping = _json_mapping(part)
         if part_mapping is None:
             if isinstance(part, str):
-                message_parts.append(
-                    {"type": "output_text" if role == "assistant" else "input_text", "text": part}
-                )
+                message_parts.append({"type": "output_text" if role == "assistant" else "input_text", "text": part})
                 continue
             raise ClientPayloadError("message content parts must be objects.", param="messages.content")
 
@@ -233,9 +229,7 @@ def _anthropic_message_to_responses_items(role: str, content: JsonValue) -> list
             text = part_mapping.get("text")
             if not isinstance(text, str):
                 raise ClientPayloadError("text content blocks must include text.", param="messages.content")
-            message_parts.append(
-                {"type": "output_text" if role == "assistant" else "input_text", "text": text}
-            )
+            message_parts.append({"type": "output_text" if role == "assistant" else "input_text", "text": text})
             continue
 
         if role == "user" and part_type == "image":
@@ -696,7 +690,8 @@ def _responses_tool_delta(payload: Mapping[str, JsonValue]) -> tuple[str, str | 
         call_id = call_id or _first_str(item.get("call_id"), item.get("id"))
         item_id = item_id or _first_str(item.get("id"), item.get("call_id"))
     name = _first_str(candidate.get("name"), candidate.get("tool_name"))
-    arguments = candidate.get("arguments") if isinstance(candidate.get("arguments"), str) else None
+    raw_arguments = candidate.get("arguments")
+    arguments: str | None = raw_arguments if isinstance(raw_arguments, str) else None
     delta = candidate.get("delta")
     if isinstance(delta, str) and arguments is None:
         arguments = delta
