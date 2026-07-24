@@ -455,6 +455,7 @@ class ApiKeysService:
         self._usage_repository = usage_repository
 
     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
+        _validate_unique_limit_rule_identities(payload.limits)
         now = utcnow()
         expires_at = _normalize_expires_at(payload.expires_at)
         plain_key = _generate_plain_key(expires_at=expires_at)
@@ -1731,9 +1732,7 @@ async def _build_limit_rows_for_update(
     repository: ApiKeysRepositoryProtocol | None = None,
 ) -> list[ApiKeyLimit]:
     existing_by_key = {_limit_identity_from_row(limit): limit for limit in existing_limits}
-    submitted_by_key = {_limit_identity_from_input(limit): limit for limit in submitted_limits}
-    if len(submitted_by_key) != len(submitted_limits):
-        raise ApiKeyValidationError("Duplicate limit rules are not allowed")
+    _validate_unique_limit_rule_identities(submitted_limits)
 
     matched_by_index: dict[int, ApiKeyLimit] = {}
     matched_existing_ids: set[int] = set()
@@ -1837,6 +1836,15 @@ def _build_reset_limit_rows(
 
 def _limit_identity_from_input(limit: LimitRuleInput) -> tuple[str, str, str | None]:
     return (limit.limit_type, limit.limit_window, limit.model_filter)
+
+
+def _validate_unique_limit_rule_identities(limits: list[LimitRuleInput]) -> None:
+    identities: set[tuple[str, str, str | None]] = set()
+    for limit in limits:
+        identity = _limit_identity_from_input(limit)
+        if identity in identities:
+            raise ApiKeyValidationError(f"Duplicate limit rules are not allowed: {identity!r}")
+        identities.add(identity)
 
 
 def _limit_identity_from_row(limit: ApiKeyLimit) -> tuple[str, str, str | None]:

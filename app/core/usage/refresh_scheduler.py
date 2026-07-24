@@ -5,7 +5,7 @@ import contextlib
 import importlib
 import logging
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, AsyncIterator, Protocol, TypeVar, cast
@@ -56,7 +56,12 @@ class _RecoverableAccountsRepository(Protocol):
 
 
 class _LatestUsageRepository(Protocol):
-    async def latest_by_account(self, window: str | None = None) -> dict[str, UsageHistory]: ...
+    async def latest_by_account(
+        self,
+        window: str | None = None,
+        *,
+        account_ids: Collection[str] | None = None,
+    ) -> dict[str, UsageHistory]: ...
 
 
 class _BackgroundLimitWarmupRepository:
@@ -173,10 +178,18 @@ class UsageRefreshScheduler:
                 async with get_background_session() as session:
                     usage_repo = UsageRepository(session)
                     accounts_repo = AccountsRepository(session)
-                    before_primary = await usage_repo.latest_by_account(window="primary")
-                    before_secondary = await usage_repo.latest_by_account(window="secondary")
                     accounts = _ordered_usage_refresh_accounts(await accounts_repo.list_accounts())
                     selected_account, cycle_complete = self._select_next_account(accounts)
+                    if selected_account is not None:
+                        selected_account_ids = [selected_account.id]
+                        before_primary = await usage_repo.latest_by_account(
+                            window="primary",
+                            account_ids=selected_account_ids,
+                        )
+                        before_secondary = await usage_repo.latest_by_account(
+                            window="secondary",
+                            account_ids=selected_account_ids,
+                        )
                     detach_session_objects(session)
                 account_count = len(accounts)
                 if selected_account is None:
@@ -191,22 +204,27 @@ class UsageRefreshScheduler:
                         usage_repo = UsageRepository(session)
                         accounts_repo = AccountsRepository(session)
                         settings_repo = SettingsRepository(session)
-                        after_primary = await usage_repo.latest_by_account(window="primary")
-                        after_secondary = await usage_repo.latest_by_account(window="secondary")
+                        after_primary = await usage_repo.latest_by_account(
+                            window="primary",
+                            account_ids=selected_account_ids,
+                        )
+                        after_secondary = await usage_repo.latest_by_account(
+                            window="secondary",
+                            account_ids=selected_account_ids,
+                        )
+                        dashboard_settings = await settings_repo.get_or_create()
                         refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
-                        # Recover post-reset RATE_LIMITED/QUOTA_EXCEEDED accounts before evaluating
-                        # limit warm-up candidates. Otherwise a 5h reset can be observed in usage
-                        # history while the account row is still RATE_LIMITED, causing the warm-up
-                        # safety filter to skip it; the next refresh then sees usage <100% and the
-                        # reset transition is lost.
-                        recovered_count = await reconcile_recoverable_account_statuses(
+                        refreshed_selected_accounts = [
+                            account for account in refreshed_accounts if account.id == selected_account.id
+                        ]
+                        # Recover a post-reset selected account before warm-up filtering.
+                        # Running this afterwards can lose the reset transition and leave
+                        # the account excluded from the only warm-up pass that can observe it.
+                        await reconcile_recoverable_account_statuses(
                             accounts_repo=accounts_repo,
                             usage_repo=usage_repo,
-                            accounts=refreshed_accounts,
+                            accounts=refreshed_selected_accounts,
                         )
-                        if recovered_count:
-                            refreshed_accounts = await accounts_repo.list_accounts(refresh_existing=True)
-                        dashboard_settings = await settings_repo.get_or_create()
                         detach_session_objects(session)
                     warmup_service = LimitWarmupService(
                         cast(Any, _BackgroundLimitWarmupRepository()),
@@ -217,7 +235,8 @@ class UsageRefreshScheduler:
                         ),
                     )
                     await warmup_service.run_after_usage_refresh(
-                        accounts=refreshed_accounts,
+                        accounts=refreshed_selected_accounts,
+                        stagger_accounts=refreshed_accounts,
                         settings=dashboard_settings,
                         before_primary=before_primary,
                         before_secondary=before_secondary,
@@ -289,9 +308,10 @@ async def reconcile_recoverable_account_statuses(
     if not candidates:
         return 0
 
-    latest_primary = await usage_repo.latest_by_account(window="primary")
-    latest_secondary = await usage_repo.latest_by_account(window="secondary")
-    latest_monthly = await usage_repo.latest_by_account(window="monthly")
+    candidate_ids = [account.id for account in candidates]
+    latest_primary = await usage_repo.latest_by_account(window="primary", account_ids=candidate_ids)
+    latest_secondary = await usage_repo.latest_by_account(window="secondary", account_ids=candidate_ids)
+    latest_monthly = await usage_repo.latest_by_account(window="monthly", account_ids=candidate_ids)
 
     recovered = 0
     for account in candidates:

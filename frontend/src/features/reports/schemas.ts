@@ -3,6 +3,7 @@ import { z } from "zod";
 const DailyReportRowSchema = z.object({
   date: z.string(),
   requests: z.number(),
+  conversations: z.number(),
   inputTokens: z.number(),
   outputTokens: z.number(),
   cachedInputTokens: z.number(),
@@ -11,6 +12,7 @@ const DailyReportRowSchema = z.object({
   errorCount: z.number(),
   medianTtftMs: z.number().optional().default(0),
   medianTps: z.number().optional().default(0),
+  medianQueueMs: z.number().optional().default(0),
 });
 
 const ModelCostEntrySchema = z.object({
@@ -41,6 +43,7 @@ const ReportSummarySchema = z.object({
   totalCachedTokens: z.number(),
   totalRequests: z.number(),
   totalErrors: z.number(),
+  totalConversations: z.number(),
   activeAccounts: z.number(),
   avgCostPerDay: z.number(),
   avgRequestsPerDay: z.number(),

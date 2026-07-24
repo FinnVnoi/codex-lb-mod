@@ -15,6 +15,34 @@ sticky-session administration. API key create/edit controls that expose
 reasoning effort choices MUST include upstream-supported extended efforts such
 as `max` and `ultra`.
 
+Advanced sections — routing settings, upstream proxy administration, model
+sources, firewall, quota phase planner, and sticky-session administration —
+SHALL render inside an Advanced settings group that is collapsed by default.
+Expanding the group SHALL take exactly one interaction, after which every
+previously mandated section SHALL be reachable and fully functional. While the
+group is collapsed, its sections SHALL NOT mount, and the sections that
+self-fetch on mount — model sources, firewall, quota phase planner, and
+sticky-session administration — SHALL NOT issue their data requests; those
+requests fire when the group is expanded. The upstream-proxy administration
+and accounts queries remain page-level requests issued when the Settings page
+loads; their data feeds the advanced Routing and Upstream Proxy sections once
+the group is expanded. Core sections (appearance, import, guest access,
+password management, session, TOTP, and API key management) SHALL remain
+visible without expanding the group.
+
+#### Scenario: Advanced settings collapsed by default
+
+- **WHEN** a user opens the Settings page
+- **THEN** appearance, import, and API key management sections are visible
+- **AND** the advanced sections (routing, upstream proxy, model sources, firewall, quota planner, sticky sessions) are not mounted
+- **AND** the self-fetching sections (model sources, firewall, quota planner, sticky sessions) have not issued their data requests
+- **AND** the page-level upstream-proxy admin and accounts queries are still issued on Settings load, feeding the Routing and Upstream Proxy sections once expanded
+
+#### Scenario: One interaction expands every advanced section
+
+- **WHEN** a user activates the Advanced settings group trigger
+- **THEN** the routing, upstream proxy, model sources, firewall, quota planner, and sticky-session sections mount and become fully functional
+
 #### Scenario: API key dialog offers extended reasoning efforts
 
 - **WHEN** an operator opens the API key create or edit dialog
@@ -22,33 +50,39 @@ as `max` and `ultra`.
 
 #### Scenario: Save weekly pace gap smoothing window
 
+- **GIVEN** the Advanced settings group is expanded
 - **WHEN** a user selects a weekly pace gap smoothing window from the routing settings section
 - **THEN** the app calls `PUT /api/settings` with `weeklyPaceSmoothingMinutes`
 - **AND** the saved settings response reflects the selected value
 
 #### Scenario: Save prompt-cache affinity TTL
 
+- **GIVEN** the Advanced settings group is expanded
 - **WHEN** a user updates the prompt-cache affinity TTL from the routing settings section
 - **THEN** the app calls `PUT /api/settings` with the updated TTL and reflects the saved value
 
 #### Scenario: Save staggered idle warm-up setting
 
+- **GIVEN** the Advanced settings group is expanded
 - **WHEN** a user toggles staggered idle limit warm-up from the routing settings section
 - **THEN** the app calls `PUT /api/settings` with the updated value and reflects the saved value
 
 #### Scenario: Save Fast Mode prohibition
 
+- **GIVEN** the Advanced settings group is expanded
 - **WHEN** a user enables or disables the Fast Mode prohibition control in the routing settings section
 - **THEN** the app calls `PUT /api/settings` with `prohibitFastMode`
 - **AND** reflects the saved value
 
 #### Scenario: View sticky-session mappings
 
+- **GIVEN** the Advanced settings group is expanded
 - **WHEN** a user opens the sticky-session section on the Settings page
 - **THEN** the app fetches sticky-session entries and displays each mapping's kind, account, timestamps, and stale/expiry state
 
 #### Scenario: Purge stale prompt-cache mappings
 
+- **GIVEN** the Advanced settings group is expanded
 - **WHEN** a user requests a stale purge from the sticky-session section
 - **THEN** the app calls the sticky-session purge API and refreshes the list afterward
 
@@ -1447,6 +1481,139 @@ The dashboard request-log API response MUST expose the persisted `clientIp` valu
 - **WHEN** a request log entry has `clientIp: null`
 - **THEN** the Request Details dialog renders `Client IP` with value `—`
 
+### Requirement: Request details expose conversation filtering
+
+The request-details dialog MUST render Client IP and Conversation ID in one
+shared row. When present, the conversation ID MUST be a clickable semantic text
+control without an underline. Activating it MUST close the dialog, preserve all
+existing request-log filters, set the clicked conversation ID as the active
+URL-backed conversation filter, and reset pagination.
+
+#### Scenario: Clicking a conversation filters the request log
+
+- **GIVEN** request details display conversation ID `conv-a` while other filters
+  are active
+- **WHEN** the conversation ID is activated
+- **THEN** the dialog closes
+- **AND** the other filters remain active
+- **AND** the active URL-backed conversation filter becomes `conv-a`
+- **AND** pagination resets
+
+### Requirement: Conversation filter state is removable and summarized
+
+When a conversation filter is active, the dashboard MUST render a removable
+conversation badge between the Statuses control and Reset. Dismissing the badge
+MUST clear only the conversation filter and reset pagination. When the filtered
+API response includes conversation metadata, the dashboard MUST render a
+summary box between the filter row and request-log table with the form:
+
+`The conversation ${id} runs ${count} request(s), cost = ${formattedCost}`. The ID, count, and cost MUST be separate styled inline-code values without literal backticks.
+
+If at least one other non-conversation filter is active, the summary MUST append
+an inline suffix describing those active filters and MUST omit the conversation
+filter from that suffix. If no other non-conversation filter is active, the
+summary MUST omit the suffix. The response-level `conversation` metadata MUST
+contain only `requestCount` and `aggregatedCostUsd`; it MUST NOT duplicate the
+conversation ID because the active URL-backed filter already identifies it.
+
+#### Scenario: Dismissing the badge clears only conversation state
+
+- **GIVEN** the conversation badge and other request-log filters are active
+- **WHEN** the badge is dismissed
+- **THEN** only the conversation filter is cleared
+- **AND** pagination resets
+- **AND** the other filters remain active
+
+#### Scenario: Summary describes the active filtered conversation
+
+- **GIVEN** the active URL-backed conversation filter is `conv-a` and the
+  filtered response contains
+  `conversation: { requestCount: 12, aggregatedCostUsd: 1.23 }`, with timeframe
+  and status filters also active
+- **WHEN** the request-log page renders
+- **THEN** the summary appears between the filter row and table
+- **AND** it states the active conversation ID, count, and formatted cost
+- **AND** its inline suffix describes the timeframe and status without repeating
+  the conversation filter
+- **AND** the response-level conversation metadata contains exactly
+  `requestCount` and `aggregatedCostUsd`, with no ID field
+
+#### Scenario: Summary omits suffix without other filters
+
+- **GIVEN** the active URL-backed conversation filter is `conv-a` and no other
+  non-conversation filter is active
+- **WHEN** the request-log page renders
+- **THEN** the summary contains the conversation sentence without an inline
+  filter suffix
+
+### Requirement: Dashboard and report metrics count distinct conversations
+
+Dashboard overview metrics MUST include a Conversations card between Est. API
+Cost and Error Rate, counting distinct non-empty conversation IDs in the
+selected timeframe. Report summary metrics MUST include a Conversations card
+immediately after Requests, counting distinct non-empty IDs across the complete
+filtered report range. A conversation spanning multiple days MUST count once in
+each applicable daily row and once in the report-wide total. Neither card MUST
+render a `{count} distinct` secondary label.
+
+#### Scenario: Dashboard count deduplicates IDs
+
+- **GIVEN** the selected dashboard timeframe contains repeated, null, and empty
+  conversation IDs
+- **WHEN** overview metrics are rendered
+- **THEN** the Conversations card counts each distinct non-empty ID once
+- **AND** the card is between Est. API Cost and Error Rate
+
+#### Scenario: Report summary and daily counts use distinct IDs
+
+- **GIVEN** one conversation has requests on two report days and another has
+  requests on one day
+- **WHEN** report metrics are rendered
+- **THEN** the summary counts two distinct conversations overall
+- **AND** each applicable daily row counts the spanning conversation once
+- **AND** the Conversations summary card is immediately after Requests
+
+### Requirement: Dashboard conversation trends are bucketed distinctly
+
+The dashboard overview response MUST expose `trends.conversations` with one
+point for each configured timeframe bucket. Each point MUST count distinct,
+non-empty conversation IDs within that bucket, and a conversation repeated
+across models or service tiers in one bucket MUST count once. Missing buckets
+MUST be zero. The Conversations card MUST use this series, while its summary
+total MUST remain the exact timeframe aggregate rather than a sum of trend
+points.
+
+#### Scenario: Conversation trend de-duplicates model groups
+
+- **GIVEN** one bucket contains the same conversation ID under two models and a
+  second distinct conversation ID under one model
+- **WHEN** the dashboard overview trends are rendered
+- **THEN** the populated bucket's conversation point is `2`
+- **AND** the series contains one point per configured bucket
+
+#### Scenario: Empty conversation buckets are zero-filled
+
+- **GIVEN** the selected dashboard timeframe has no valid conversation IDs in
+  one or more buckets
+- **WHEN** the dashboard overview response is built
+- **THEN** each empty bucket's conversation point is `0`
+
+### Requirement: Report conversation columns sort and export
+
+The daily report table MUST place a Conversations column between Reqs and Input
+Tokens. The column MUST support numeric sorting and CSV export, and its values
+MUST preserve the distinct non-empty daily conversation counts, including
+zero-filled days.
+
+#### Scenario: Daily conversation values are sortable and exported
+
+- **GIVEN** daily report rows have different conversation counts, including a
+  zero-count row
+- **WHEN** the Conversations column is sorted or CSV export is generated
+- **THEN** sorting is numeric by conversation count
+- **AND** the column appears between Reqs and Input Tokens
+- **AND** CSV output contains the Conversations header and each row's value
+
 ### Requirement: Account usage panel supports confirmed usage reset
 
 The Accounts page selected-account Usage panel SHALL expose a Reset action
@@ -2043,3 +2210,42 @@ Account summary payloads SHALL present the primary (short) quota window as absen
 - **WHEN** an account's primary sample has an unexpired `reset_at`
 - **THEN** the summary displays its used/remaining percentages, reset, and duration unchanged
 
+### Requirement: Header navigation progressive disclosure
+
+The application header SHALL render core destinations — Dashboard, Reports,
+Accounts, APIs, and Settings — as top-level navigation items. Non-core
+destinations (currently Automations) SHALL NOT render as top-level items: on
+desktop they SHALL be reachable through an Advanced menu that opens in one
+interaction, and in the mobile navigation menu they SHALL be grouped under an
+Advanced label. Direct routes to non-core destinations (e.g. `/automations`)
+SHALL continue to resolve, and the legacy `/firewall` route SHALL continue to
+redirect to `/settings`. A new page-level navigation destination SHALL default
+to the Advanced menu unless a spec explicitly designates it as core.
+
+#### Scenario: Advanced menu reveals Automations
+
+- **WHEN** a user opens the Advanced menu in the header
+- **THEN** an Automations item is revealed
+- **AND** activating it navigates to `/automations`
+
+#### Scenario: Automations is not a top-level item
+
+- **WHEN** a user views the header navigation
+- **THEN** Dashboard, Reports, Accounts, APIs, and Settings render as top-level links
+- **AND** Automations does not render as a top-level link
+
+#### Scenario: Advanced trigger reflects the active route
+
+- **WHEN** the current route is an advanced destination such as `/automations`
+- **THEN** the Advanced menu trigger renders in the active state
+- **AND** on core routes it renders in the inactive state
+
+#### Scenario: Deep links to advanced destinations keep working
+
+- **WHEN** a user opens `/automations` directly
+- **THEN** the Automations page renders
+
+#### Scenario: Legacy firewall route redirects
+
+- **WHEN** a user opens `/firewall`
+- **THEN** the app redirects to `/settings`

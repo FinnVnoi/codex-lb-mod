@@ -38,6 +38,7 @@ function createZeroRow(date: string): DailyReportRow {
   return {
     date,
     requests: 0,
+    conversations: 0,
     inputTokens: 0,
     outputTokens: 0,
     cachedInputTokens: 0,
@@ -46,5 +47,6 @@ function createZeroRow(date: string): DailyReportRow {
     errorCount: 0,
     medianTtftMs: 0,
     medianTps: 0,
+    medianQueueMs: 0,
   };
 }

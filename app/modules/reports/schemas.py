@@ -13,9 +13,11 @@ class DailyReportRow(DashboardModel):
     cached_input_tokens: int
     cost_usd: float
     active_accounts: int
+    conversations: int = 0
     error_count: int = 0
     median_ttft_ms: float = 0.0
     median_tps: float = 0.0
+    median_queue_ms: float = 0.0
 
 
 class ModelCostEntry(DashboardModel):
@@ -47,6 +49,7 @@ class ReportSummary(DashboardModel):
     total_requests: int
     total_errors: int
     active_accounts: int
+    total_conversations: int = 0
     avg_cost_per_day: float = 0.0
     avg_requests_per_day: float = 0.0
 

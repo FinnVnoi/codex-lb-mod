@@ -88,21 +88,16 @@ def _normalize_usage(usage: UsageTokens | ResponseUsage | None) -> UsageTokens |
 
 
 DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
-    # OpenAI API pricing, 2026-07-13:
-    # https://developers.openai.com/api/docs/pricing
-    # All GPT-5.6 models use the >272K long-context uplift for the full
-    # request: 2x input/cached input and 1.5x output. Flex is 50% of
-    # standard pricing; Priority has explicit rates published by OpenAI.
     "gpt-5.6-sol": ModelPrice(
         input_per_1m=5.0,
         cached_input_per_1m=0.5,
         output_per_1m=30.0,
-        flex_input_per_1m=2.5,
-        flex_cached_input_per_1m=0.25,
-        flex_output_per_1m=15.0,
         priority_input_per_1m=10.0,
         priority_cached_input_per_1m=1.0,
         priority_output_per_1m=60.0,
+        flex_input_per_1m=2.5,
+        flex_cached_input_per_1m=0.25,
+        flex_output_per_1m=15.0,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=10.0,
         long_context_cached_input_per_1m=1.0,
@@ -112,12 +107,12 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         input_per_1m=2.5,
         cached_input_per_1m=0.25,
         output_per_1m=15.0,
-        flex_input_per_1m=1.25,
-        flex_cached_input_per_1m=0.125,
-        flex_output_per_1m=7.5,
         priority_input_per_1m=5.0,
         priority_cached_input_per_1m=0.5,
         priority_output_per_1m=30.0,
+        flex_input_per_1m=1.25,
+        flex_cached_input_per_1m=0.125,
+        flex_output_per_1m=7.5,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=5.0,
         long_context_cached_input_per_1m=0.5,
@@ -127,12 +122,12 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
         input_per_1m=1.0,
         cached_input_per_1m=0.1,
         output_per_1m=6.0,
-        flex_input_per_1m=0.5,
-        flex_cached_input_per_1m=0.05,
-        flex_output_per_1m=3.0,
         priority_input_per_1m=2.0,
         priority_cached_input_per_1m=0.2,
         priority_output_per_1m=12.0,
+        flex_input_per_1m=0.5,
+        flex_cached_input_per_1m=0.05,
+        flex_output_per_1m=3.0,
         long_context_threshold_tokens=272_000,
         long_context_input_per_1m=2.0,
         long_context_cached_input_per_1m=0.2,
@@ -328,6 +323,7 @@ DEFAULT_PRICING_MODELS: dict[str, ModelPrice] = {
 }
 
 DEFAULT_MODEL_ALIASES: dict[str, str] = {
+    "gpt-5.6": "gpt-5.6-sol",
     "gpt-5.6-sol*": "gpt-5.6-sol",
     "gpt-5.6-terra*": "gpt-5.6-terra",
     "gpt-5.6-luna*": "gpt-5.6-luna",
