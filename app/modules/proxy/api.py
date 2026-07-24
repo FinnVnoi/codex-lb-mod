@@ -6165,9 +6165,7 @@ def _anthropic_response_from_openai_json_response(request: Request, response: JS
     except (UnicodeDecodeError, JSONDecodeError, AttributeError):
         content = openai_error("upstream_error", "Upstream error", error_type="server_error")
     headers = {
-        key: value
-        for key, value in response.headers.items()
-        if key.lower() not in {"content-length", "content-type"}
+        key: value for key, value in response.headers.items() if key.lower() not in {"content-length", "content-type"}
     }
     return _anthropic_logged_error_response(
         request,
