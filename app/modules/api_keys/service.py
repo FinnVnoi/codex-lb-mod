@@ -1141,6 +1141,7 @@ class ApiKeysService:
         usage = await self._repository.get_usage_summary_by_key_id(key_id)
         limits = [
             ApiKeySelfLimitData(
+                id=limit.id,
                 limit_type=limit.limit_type.value,
                 limit_window=limit.limit_window.value,
                 max_value=limit.max_value,
@@ -1218,6 +1219,7 @@ class ApiKeyUsage7DayData:
 
 @dataclass(frozen=True, slots=True)
 class ApiKeySelfLimitData:
+    id: int
     limit_type: str
     limit_window: str
     max_value: int

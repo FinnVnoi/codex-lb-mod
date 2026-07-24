@@ -17,6 +17,7 @@ from app.db.models import (
     ApiKeyAccountAssignment,
     ApiKeyLimit,
     ApiKeyModelSourceAssignment,
+    ApiKeyQuotaPurchase,
     ApiKeyUsageReservation,
     ApiKeyUsageReservationItem,
     ApiKeyUsageRollup,
@@ -476,11 +477,21 @@ class ApiKeysRepository:
         await self._session.commit()
 
     async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
+        purchased_delta = (
+            select(func.coalesce(func.sum(ApiKeyQuotaPurchase.purchased_value), 0))
+            .where(ApiKeyQuotaPurchase.limit_id == limit_id)
+            .where(ApiKeyQuotaPurchase.target_reset_at == expected_reset_at)
+            .scalar_subquery()
+        )
         result = await self._session.execute(
             update(ApiKeyLimit)
             .where(ApiKeyLimit.id == limit_id)
             .where(ApiKeyLimit.reset_at == expected_reset_at)
-            .values(current_value=0, reset_at=new_reset_at)
+            .values(
+                current_value=0,
+                max_value=ApiKeyLimit.max_value - purchased_delta,
+                reset_at=new_reset_at,
+            )
             .returning(ApiKeyLimit.id)
         )
         await self._session.commit()
@@ -505,12 +516,19 @@ class ApiKeysRepository:
                 return reset_count
 
             for limit in expired_limits:
+                purchased_delta = (
+                    select(func.coalesce(func.sum(ApiKeyQuotaPurchase.purchased_value), 0))
+                    .where(ApiKeyQuotaPurchase.limit_id == limit.id)
+                    .where(ApiKeyQuotaPurchase.target_reset_at == limit.reset_at)
+                    .scalar_subquery()
+                )
                 update_result = await self._session.execute(
                     update(ApiKeyLimit)
                     .where(ApiKeyLimit.id == limit.id)
                     .where(ApiKeyLimit.reset_at == limit.reset_at)
                     .values(
                         current_value=0,
+                        max_value=ApiKeyLimit.max_value - purchased_delta,
                         reset_at=advance_limit_reset(limit.reset_at, now, limit.limit_window),
                     )
                     .returning(ApiKeyLimit.id)
