@@ -58,7 +58,7 @@ class QuotaShopFulfillRequest(BaseModel):
     api_key: str = Field(min_length=12, max_length=512)
     limit_id: int = Field(gt=0)
     purchased_value: int = Field(gt=0)
-    amount_vnd: int = Field(ge=500, le=2_000_000_000)
+    amount_vnd: int = Field(ge=1, le=2_000_000_000)
     limit_type: str
     limit_window: str
     model_filter: str | None = Field(default=None, max_length=100)
@@ -68,8 +68,6 @@ class QuotaShopFulfillRequest(BaseModel):
     def validate_type(self) -> "QuotaShopFulfillRequest":
         if self.limit_type not in {LimitType.TOTAL_TOKENS.value, LimitType.COST_USD.value}:
             raise ValueError("Unsupported quota type")
-        if self.amount_vnd % 500 != 0:
-            raise ValueError("Payment amount must use 500 VND increments")
         return self
 
 

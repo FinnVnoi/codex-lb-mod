@@ -273,7 +273,7 @@ async def test_expired_periodic_rule_cannot_be_fulfilled(async_client, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_purchase_enforces_500_vnd_increment_and_secret(async_client, monkeypatch):
+async def test_purchase_accepts_exact_vnd_amount_and_enforces_secret(async_client, monkeypatch):
     key_id, raw_key = await _create_key()
     monkeypatch.setenv("CODEX_LB_QUOTA_SHOP_SECRET", "test-secret")
     async with SessionLocal() as session:
@@ -302,9 +302,12 @@ async def test_purchase_enforces_500_vnd_increment_and_secret(async_client, monk
         headers={"X-Quota-Shop-Secret": "test-secret"},
         json=payload,
     )
-    assert response.status_code == 400
+    assert response.status_code == 200, response.text
+    assert response.json()["amount_vnd"] == 750
+    assert response.json()["purchased_value"] == 333_333
 
-    payload["amount_vnd"] = 500
+    payload["order_ref"] = "SHOP:1003"
+    payload["amount_vnd"] = 123
     response = await async_client.post(
         "/v1/quota-shop/fulfill",
         headers={"X-Quota-Shop-Secret": "wrong"},
