@@ -33,6 +33,8 @@ const ApiKeyUsageSummarySchema = z.object({
 const SERVICE_TIERS = ["auto", "default", "priority", "flex"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
+export const ROUTING_MODES = ["balanced", "account_first", "provider_first"] as const;
+export type RoutingMode = (typeof ROUTING_MODES)[number];
 export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
 export type TrafficClass = (typeof TRAFFIC_CLASSES)[number];
 export const TRANSPORT_POLICY_OVERRIDES = ["smart", "always_http", "always_websocket"] as const;
@@ -47,6 +49,7 @@ export const ApiKeySchema = z.object({
   keyPrefix: z.string(),
   allowedModels: z.array(z.string()).nullable(),
   applyToCodexModel: z.boolean().default(false),
+  routingMode: z.enum(ROUTING_MODES).default("balanced"),
   enforcedModel: z.string().nullable().default(null),
   trafficClass: z
     .enum(TRAFFIC_CLASSES)
@@ -85,6 +88,7 @@ export const ApiKeyCreateRequestSchema = z.object({
   name: z.string().min(1).max(128),
   allowedModels: z.array(z.string()).optional(),
   applyToCodexModel: z.boolean().optional(),
+  routingMode: z.enum(ROUTING_MODES).optional(),
   trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
@@ -109,6 +113,7 @@ export const ApiKeyUpdateRequestSchema = z.object({
   name: z.string().min(1).max(128).optional(),
   allowedModels: z.array(z.string()).nullable().optional(),
   applyToCodexModel: z.boolean().optional(),
+  routingMode: z.enum(ROUTING_MODES).optional(),
   trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),

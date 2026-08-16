@@ -322,6 +322,15 @@ def _affinity_with_payload_continuity(
         conversation = (payload.model_extra or {}).get("conversation")
     if conversation is None or (isinstance(conversation, str) and not conversation.strip()):
         return policy
+    if policy.key is None:
+        conversation_key = str(conversation).strip()
+        if conversation_key:
+            policy = replace(
+                policy,
+                key=conversation_key,
+                kind=StickySessionKind.CODEX_SESSION,
+                codex_session_source="conversation",
+            )
     return replace(policy, require_unambiguous_account=True)
 
 

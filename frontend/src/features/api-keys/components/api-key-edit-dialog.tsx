@@ -36,6 +36,7 @@ import type {
   LimitRuleCreate,
   LimitType,
   ReasoningEffortType,
+  RoutingMode,
   ServiceTierType,
   TrafficClass,
   TransportPolicyOverride,
@@ -103,6 +104,7 @@ type ApiKeyEditDraft = {
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
+  routingMode: RoutingMode;
 };
 
 function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
@@ -120,6 +122,7 @@ function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
     enforcedServiceTier: apiKey.enforcedServiceTier || "none",
     trafficClass: apiKey.trafficClass || "foreground",
     transportPolicyOverride: apiKey.transportPolicyOverride,
+    routingMode: apiKey.routingMode,
   };
 }
 
@@ -164,6 +167,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
       name: values.name,
       allowedModels: draft.selectedModels.length > 0 ? draft.selectedModels : null,
       applyToCodexModel: draft.applyToCodexModel,
+      routingMode: draft.routingMode,
       enforcedModel: draft.enforcedModel.trim() ? draft.enforcedModel.trim() : null,
       enforcedReasoningEffort:
         draft.enforcedReasoningEffort === "none" ? null : draft.enforcedReasoningEffort as ReasoningEffortType,
@@ -227,6 +231,19 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
               <label htmlFor="edit-api-key-apply-to-codex-model" className="cursor-pointer">
                 {t("apiKeys.form.applyToCodexModel")}
               </label>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-sm font-medium">{t("apiKeys.form.routingMode")}</label>
+              <Select value={draft.routingMode} onValueChange={(routingMode) => updateDraft({ routingMode: routingMode as RoutingMode })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="balanced">{t("apiKeys.routing.balanced")}</SelectItem>
+                  <SelectItem value="account_first">{t("apiKeys.routing.accountFirst")}</SelectItem>
+                  <SelectItem value="provider_first">{t("apiKeys.routing.providerFirst")}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("apiKeys.routing.description")}</p>
             </div>
 
             <div className="space-y-1">

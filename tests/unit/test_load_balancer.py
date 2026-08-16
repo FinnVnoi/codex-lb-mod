@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import random
 import time
+from dataclasses import replace
 from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -25,7 +26,7 @@ from app.core.balancer import (
     plausible_rate_limit_reset_at,
     select_account,
 )
-from app.core.balancer.logic import DRAIN_PRIMARY_THRESHOLD_PCT, PROBE_QUIET_SECONDS
+from app.core.balancer.logic import DRAIN_PRIMARY_THRESHOLD_PCT, PROBE_QUIET_SECONDS, SECONDS_PER_DAY
 from app.core.usage.quota import apply_usage_quota
 from app.db.models import Account, AccountStatus, UsageHistory
 from app.modules.proxy.load_balancer import (
@@ -199,6 +200,180 @@ def test_select_account_ignores_reset_when_disabled():
     result = select_account(states, now=now, prefer_earlier_reset=False, routing_strategy="usage_weighted")
     assert result.account is not None
     assert result.account.account_id == "a"
+
+
+def test_select_account_prefers_earlier_subscription_renewal_before_usage():
+    now = time.time()
+    states = [
+        AccountState(
+            "renews-soon",
+            AccountStatus.ACTIVE,
+            used_percent=90.0,
+            renewal_at=now + 2 * 24 * 3600,
+        ),
+        AccountState(
+            "renews-later",
+            AccountStatus.ACTIVE,
+            used_percent=1.0,
+            renewal_at=now + 20 * 24 * 3600,
+        ),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "renews-soon"
+
+
+def test_select_account_renewal_preference_deprioritizes_missing_date():
+    now = time.time()
+    states = [
+        AccountState("unknown", AccountStatus.ACTIVE, used_percent=0.0, renewal_at=None),
+        AccountState(
+            "known",
+            AccountStatus.ACTIVE,
+            used_percent=95.0,
+            renewal_at=now + 3 * 24 * 3600,
+        ),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "known"
+
+
+def test_select_account_renewal_preference_falls_back_when_no_upcoming_date():
+    now = time.time()
+    states = [
+        AccountState("unknown", AccountStatus.ACTIVE, used_percent=10.0, renewal_at=None),
+        AccountState("elapsed", AccountStatus.ACTIVE, used_percent=80.0, renewal_at=now - 1),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "unknown"
+
+
+def test_round_robin_distributes_across_all_unstarted_accounts_before_renewal() -> None:
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "idle-renews-soon",
+            AccountStatus.ACTIVE,
+            primary_countdown_started=False,
+            renewal_at=now + SECONDS_PER_DAY,
+            last_selected_at=now - 10,
+        ),
+        AccountState(
+            "idle-renews-later",
+            AccountStatus.ACTIVE,
+            primary_countdown_started=False,
+            renewal_at=now + 20 * SECONDS_PER_DAY,
+            last_selected_at=None,
+        ),
+        AccountState(
+            "started",
+            AccountStatus.ACTIVE,
+            primary_countdown_started=True,
+            renewal_at=now + 60,
+            last_selected_at=None,
+        ),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="primary",
+        prefer_earlier_renewal=True,
+        routing_strategy="round_robin",
+        routing_costs={state.account_id: RoutingCost() for state in states},
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "idle-renews-later"
+
+
+def test_round_robin_distributes_inside_earliest_three_day_renewal_cohort() -> None:
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "earliest-recently-selected",
+            AccountStatus.ACTIVE,
+            renewal_at=now + SECONDS_PER_DAY,
+            last_selected_at=now - 10,
+        ),
+        AccountState(
+            "later-in-cohort",
+            AccountStatus.ACTIVE,
+            renewal_at=now + 3 * SECONDS_PER_DAY,
+            last_selected_at=None,
+        ),
+        AccountState(
+            "outside-cohort",
+            AccountStatus.ACTIVE,
+            renewal_at=now + 10 * SECONDS_PER_DAY,
+            last_selected_at=None,
+        ),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_earlier_renewal=True,
+        routing_strategy="round_robin",
+        routing_costs={state.account_id: RoutingCost() for state in states},
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "later-in-cohort"
+
+
+def test_select_account_renewal_preference_respects_burn_first_policy():
+    now = time.time()
+    states = [
+        AccountState(
+            "normal-soon",
+            AccountStatus.ACTIVE,
+            used_percent=1.0,
+            renewal_at=now + 3600,
+            routing_policy="normal",
+        ),
+        AccountState(
+            "burn-later",
+            AccountStatus.ACTIVE,
+            used_percent=80.0,
+            renewal_at=now + 10 * 24 * 3600,
+            routing_policy="burn_first",
+        ),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "burn-later"
 
 
 def test_select_account_prefers_burn_first_policy_before_usage():
@@ -5640,3 +5815,194 @@ def test_select_account_fill_first_primary_dominates_over_secondary():
     assert result.account is not None
     # Primary still wins -- only ties break on secondary.
     assert result.account.account_id == "high-secondary"
+
+
+def test_prefer_unstarted_quota_uses_selected_primary_window() -> None:
+    started = AccountState(
+        account_id="started",
+        status=AccountStatus.ACTIVE,
+        used_percent=1.0,
+        secondary_used_percent=1.0,
+        primary_countdown_started=True,
+        secondary_countdown_started=False,
+    )
+    idle = AccountState(
+        account_id="idle",
+        status=AccountStatus.ACTIVE,
+        used_percent=80.0,
+        secondary_used_percent=80.0,
+        primary_countdown_started=False,
+        secondary_countdown_started=True,
+    )
+
+    result = select_account(
+        [started, idle],
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="primary",
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is idle
+
+
+def test_prefer_unstarted_quota_both_requires_every_applicable_window_idle() -> None:
+    partially_started = AccountState(
+        account_id="partially-started",
+        status=AccountStatus.ACTIVE,
+        used_percent=1.0,
+        secondary_used_percent=1.0,
+        primary_countdown_started=False,
+        secondary_countdown_started=True,
+    )
+    both_idle = AccountState(
+        account_id="both-idle",
+        status=AccountStatus.ACTIVE,
+        used_percent=80.0,
+        secondary_used_percent=80.0,
+        primary_countdown_started=False,
+        secondary_countdown_started=False,
+    )
+
+    result = select_account(
+        [partially_started, both_idle],
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="both",
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is both_idle
+
+
+def test_prefer_unstarted_quota_falls_back_when_all_countdowns_started() -> None:
+    lower_usage = AccountState(
+        account_id="lower-usage",
+        status=AccountStatus.ACTIVE,
+        used_percent=20.0,
+        secondary_used_percent=20.0,
+        primary_countdown_started=True,
+        secondary_countdown_started=True,
+    )
+    higher_usage = AccountState(
+        account_id="higher-usage",
+        status=AccountStatus.ACTIVE,
+        used_percent=80.0,
+        secondary_used_percent=80.0,
+        primary_countdown_started=True,
+        secondary_countdown_started=True,
+    )
+
+    result = select_account(
+        [higher_usage, lower_usage],
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="both",
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is lower_usage
+
+
+def test_preference_priority_is_unstarted_then_renewal_then_reset() -> None:
+    now = 1_700_000_000.0
+    started_earlier_renewal_and_reset = AccountState(
+        account_id="started-earlier-renewal-and-reset",
+        status=AccountStatus.ACTIVE,
+        used_percent=90.0,
+        secondary_used_percent=90.0,
+        primary_reset_at=int(now + 60),
+        primary_window_minutes=300,
+        primary_countdown_started=True,
+        renewal_at=now + 100,
+    )
+    idle_later_renewal_and_reset = AccountState(
+        account_id="idle-later-renewal-and-reset",
+        status=AccountStatus.ACTIVE,
+        used_percent=1.0,
+        secondary_used_percent=1.0,
+        primary_reset_at=int(now + 2 * 86400),
+        primary_window_minutes=300,
+        primary_countdown_started=False,
+        renewal_at=now + 10_000,
+    )
+
+    countdown_wins = select_account(
+        [idle_later_renewal_and_reset, started_earlier_renewal_and_reset],
+        now=now,
+        prefer_earlier_reset=True,
+        prefer_earlier_reset_window="primary",
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="primary",
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+    assert countdown_wins.account is idle_later_renewal_and_reset
+
+    earlier_renewal_later_reset = replace(
+        started_earlier_renewal_and_reset,
+        account_id="earlier-renewal-later-reset",
+        primary_countdown_started=False,
+        primary_reset_at=int(now + 2 * 86400),
+        renewal_at=now + 100,
+    )
+    later_renewal_earlier_reset = replace(
+        idle_later_renewal_and_reset,
+        account_id="later-renewal-earlier-reset",
+        primary_reset_at=int(now + 60),
+        renewal_at=now + 10 * SECONDS_PER_DAY,
+    )
+    renewal_wins = select_account(
+        [
+            replace(later_renewal_earlier_reset, primary_countdown_started=True),
+            replace(earlier_renewal_later_reset, primary_countdown_started=True),
+        ],
+        now=now,
+        prefer_earlier_reset=True,
+        prefer_earlier_reset_window="primary",
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="primary",
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+    assert renewal_wins.account is not None
+    assert renewal_wins.account.account_id == earlier_renewal_later_reset.account_id
+
+    earlier_reset = replace(
+        later_renewal_earlier_reset,
+        account_id="earlier-reset",
+        renewal_at=now + 100,
+    )
+    later_reset = replace(
+        earlier_renewal_later_reset,
+        account_id="later-reset",
+        renewal_at=now + 100,
+    )
+    reset_wins = select_account(
+        [
+            replace(later_reset, primary_countdown_started=True),
+            replace(earlier_reset, primary_countdown_started=True),
+        ],
+        now=now,
+        prefer_earlier_reset=True,
+        prefer_earlier_reset_window="primary",
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="primary",
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+    assert reset_wins.account is not None
+    assert reset_wins.account.account_id == earlier_reset.account_id
+
+@pytest.mark.asyncio
+async def test_mark_overload_cooldown_temporarily_excludes_account(monkeypatch):
+    from app.modules.proxy.load_balancer import LoadBalancer
+
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    balancer = LoadBalancer(repo_factory=MagicMock())
+    account = _make_test_account(account_id="overloaded")
+
+    await balancer.mark_overload_cooldown(account, 600)
+
+    state = balancer._runtime[account.id]
+    assert state.cooldown_until == now + 600
+    assert state.last_error_at == now
+    assert state.error_count == 1

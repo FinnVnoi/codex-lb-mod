@@ -568,6 +568,13 @@ class _HTTPBridgeStreamingMixin:
         dashboard_settings = await _service_get_settings_cache().get()
         runtime_config = _http_bridge_runtime_config(dashboard_settings, _service_get_settings())
         request_id = ensure_request_id()
+        configured_upstream_transport = getattr(dashboard_settings, "upstream_stream_transport", "default")
+        if configured_upstream_transport == "http" and runtime_config.enabled:
+            logger.info(
+                "stream_responses bypassing http bridge because upstream transport is forced to HTTP/SSE request_id=%s",
+                request_id,
+            )
+            runtime_config = dataclasses.replace(runtime_config, enabled=False)
         self._raise_for_unsupported_input_image_references(payload)
         payload_size_estimate_bytes = len(
             json.dumps(payload.to_payload(), ensure_ascii=True, separators=(",", ":")).encode("utf-8")
@@ -595,7 +602,7 @@ class _HTTPBridgeStreamingMixin:
             runtime_config = dataclasses.replace(runtime_config, enabled=False)
         image_request = _responses_request_contains_input_image(payload)
         image_generation_request = _responses_request_uses_image_generation(payload)
-        force_upstream_stream_transport = "http" if image_request else None
+        force_upstream_stream_transport = "http" if configured_upstream_transport == "http" or image_request else None
         if runtime_config.enabled and (image_request or image_generation_request):
             logger.info(
                 "stream_responses bypassing http bridge for image-capable request input_image=%s "

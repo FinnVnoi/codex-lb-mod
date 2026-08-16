@@ -33,15 +33,21 @@ class AdditionalQuotaPolicy(DashboardModel):
 
 class DashboardSettingsResponse(DashboardModel):
     sticky_threads_enabled: bool
+    model_source_sticky_enabled: bool = True
+    model_source_sticky_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
     upstream_stream_transport: str = Field(pattern=r"^(default|auto|http|websocket)$")
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str = Field(pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN)
     proxy_account_response_create_limit: int = Field(ge=0)
     proxy_account_stream_limit: int = Field(ge=0)
     proxy_account_stream_recovery_reserve: int = Field(ge=0)
+    overload_cooldown_seconds: int = Field(default=600, ge=0, le=86400)
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool
+    prefer_unstarted_quota_accounts: bool
+    prefer_unstarted_quota_window: str = Field(pattern=r"^(primary|secondary|both)$")
+    prefer_earlier_renewal_accounts: bool
     prefer_earlier_reset_window: str = Field(pattern=r"^(primary|secondary)$")
     show_reset_credit_badges: bool
     auto_redeem_reset_credits_before_expiry: bool
@@ -90,6 +96,8 @@ class DashboardSettingsResponse(DashboardModel):
 class DashboardSettingsUpdateRequest(DashboardModel):
     expected_version: int | None = Field(default=None, ge=1)
     sticky_threads_enabled: bool | None = None
+    model_source_sticky_enabled: bool | None = None
+    model_source_sticky_ttl_seconds: int | None = Field(default=None, ge=60, le=86400)
     upstream_stream_transport: str | None = Field(
         default=None,
         pattern=r"^(default|auto|http|websocket)$",
@@ -102,9 +110,13 @@ class DashboardSettingsUpdateRequest(DashboardModel):
     proxy_account_response_create_limit: int | None = Field(default=None, ge=0)
     proxy_account_stream_limit: int | None = Field(default=None, ge=0)
     proxy_account_stream_recovery_reserve: int | None = Field(default=None, ge=0)
+    overload_cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
     upstream_proxy_routing_enabled: bool | None = None
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool | None = None
+    prefer_unstarted_quota_accounts: bool | None = None
+    prefer_unstarted_quota_window: str | None = Field(default=None, pattern=r"^(primary|secondary|both)$")
+    prefer_earlier_renewal_accounts: bool | None = None
     prefer_earlier_reset_window: str | None = Field(default=None, pattern=r"^(primary|secondary)$")
     show_reset_credit_badges: bool | None = None
     auto_redeem_reset_credits_before_expiry: bool | None = None

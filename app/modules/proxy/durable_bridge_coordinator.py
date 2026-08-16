@@ -164,6 +164,20 @@ class DurableBridgeSessionCoordinator:
                     )
             if snapshot is None:
                 return None
+            # Quarantine intentionally leaves the canonical row as an audit
+            # tombstone, but clears every ownership/continuity field. Do not
+            # treat that CLOSED ownerless tombstone as hard continuity evidence
+            # for a later request using the same canonical session key. Normal
+            # release/drain rows keep their account metadata and remain
+            # eligible for reattachment.
+            if (
+                snapshot.state == HttpBridgeSessionState.CLOSED
+                and snapshot.owner_instance_id is None
+                and snapshot.account_id is None
+                and snapshot.latest_turn_state is None
+                and snapshot.latest_response_id is None
+            ):
+                return None
             return _to_lookup(snapshot)
 
     async def lookup_turn_state_target(
@@ -276,6 +290,24 @@ class DurableBridgeSessionCoordinator:
         if snapshot is None:
             return None
         return _to_lookup(snapshot)
+
+    async def quarantine_live_session(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+    ) -> DurableBridgeLookup | None:
+        """Clear a fenced bridge lineage that timed out before event one."""
+
+        async with self._session() as session:
+            repository = DurableBridgeRepository(session)
+            snapshot = await repository.quarantine_session(
+                session_id=session_id,
+                instance_id=instance_id,
+                owner_epoch=owner_epoch,
+            )
+            return _to_lookup(snapshot) if snapshot is not None else None
 
     async def mark_instance_draining(self, *, instance_id: str) -> int:
         async with self._session() as session:

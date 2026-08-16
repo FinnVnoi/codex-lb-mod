@@ -118,7 +118,9 @@ export function ModelSourcesSettings({ disabled = false }: ModelSourcesSettingsP
                   <div className="flex flex-wrap items-center gap-1 pt-1">
                     {source.models.map((model) => (
                       <Badge key={model.id} variant={model.isEnabled ? "outline" : "secondary"}>
-                        {model.model}
+                        {model.upstreamModel && model.upstreamModel !== model.model
+                          ? `${model.model} → ${model.upstreamModel}`
+                          : model.model}
                       </Badge>
                     ))}
                     {modelPriceLabel(source) ? (

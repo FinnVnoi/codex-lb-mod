@@ -4,7 +4,9 @@ import asyncio
 import socket
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from tempfile import SpooledTemporaryFile
+from types import SimpleNamespace
 from typing import TypeAlias, cast
+from unittest.mock import MagicMock
 
 import pytest
 import starlette.formparsers as starlette_formparsers
@@ -12,6 +14,7 @@ from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 from sqlalchemy import select
 
+from app.core.openai.requests import ResponsesRequest
 from app.core.utils.time import utcnow
 from app.db.models import ApiKeyUsageReservation, RequestLog
 from app.db.session import SessionLocal
@@ -33,6 +36,7 @@ async def _create_model_source(
     name: str,
     model: str,
     base_url: str,
+    upstream_model: str | None = None,
     input_per_1m: float | None = None,
     cached_input_per_1m: float | None = None,
     output_per_1m: float | None = None,
@@ -50,6 +54,8 @@ async def _create_model_source(
         "supportsStreaming": supports_streaming,
         "supportsTools": True,
     }
+    if upstream_model is not None:
+        model_entry["upstreamModel"] = upstream_model
     if raw_metadata_json is not None:
         model_entry["rawMetadataJson"] = raw_metadata_json
     if input_per_1m is not None:
@@ -235,6 +241,52 @@ async def test_source_audio_transcription_routes_multipart_and_settles_usage(
         assert log.input_tokens == 37
         assert log.output_tokens == 0
         assert log.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_source_audio_transcription_retries_other_provider_when_model_is_unavailable(
+    async_client, source_upstream
+):
+    hits: list[str] = []
+    model = "whisper-provider-fallback"
+
+    async def missing_model(_request: web.Request) -> web.Response:
+        hits.append("missing")
+        return web.json_response(
+            {"error": {"message": "model not found", "code": "model_not_found"}},
+            status=404,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response({"text": "fallback transcript", "usage": {"prompt_tokens": 4, "completion_tokens": 0}})
+
+    missing_url = await source_upstream(missing_model)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(
+        async_client,
+        name="audio-fallback-a-missing",
+        model=model,
+        base_url=missing_url,
+        supports_audio_transcriptions=True,
+    )
+    await _create_model_source(
+        async_client,
+        name="audio-fallback-b-healthy",
+        model=model,
+        base_url=healthy_url,
+        supports_audio_transcriptions=True,
+    )
+
+    response = await async_client.post(
+        "/v1/audio/transcriptions",
+        data={"model": model},
+        files={"file": ("sample.wav", b"\x01\x02", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "fallback transcript"
+    assert hits == ["missing", "healthy"]
 
 
 @pytest.mark.asyncio
@@ -472,6 +524,29 @@ async def test_source_unreachable_returns_error_envelope_and_releases_reservatio
 
 
 @pytest.mark.asyncio
+async def test_model_source_collection_accepts_slashless_list_and_create(async_client):
+    listed = await async_client.get("/api/model-sources")
+    assert listed.status_code == 200
+    assert listed.json() == {"sources": []}
+
+    created = await async_client.post(
+        "/api/model-sources",
+        json={
+            "name": "slashless-source",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "apiKey": "token-slashless-source",
+            "models": [],
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["name"] == "slashless-source"
+
+    listed_with_slash = await async_client.get("/api/model-sources/")
+    assert listed_with_slash.status_code == 200
+    assert [row["id"] for row in listed_with_slash.json()["sources"]] == [created.json()["id"]]
+
+
+@pytest.mark.asyncio
 async def test_patch_model_source_returns_updated_model_list(async_client):
     source_id = await _create_model_source(
         async_client,
@@ -527,6 +602,125 @@ async def test_responses_source_selector_can_require_streaming(async_client):
 
 
 @pytest.mark.asyncio
+async def test_anthropic_messages_routes_to_responses_model_source(async_client, source_upstream):
+    seen: dict[str, object] = {}
+
+    async def responses_source(request: web.Request) -> web.StreamResponse:
+        seen["path"] = request.path
+        seen["payload"] = await request.json()
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n')
+        await response.write(
+            b'data: {"type":"response.completed","response":{"id":"resp_source_messages",'
+            b'"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(responses_source)
+    model = "anthropic-source-model"
+    await _create_model_source(
+        async_client,
+        name="anthropic-responses-source",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+
+    response = await async_client.post(
+        "/v1/messages",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["content"] == [{"type": "text", "text": "hello"}]
+    assert seen["path"] == "/v1/responses"
+    seen_payload = seen["payload"]
+    assert isinstance(seen_payload, dict)
+    assert seen_payload.get("model") == model
+
+
+@pytest.mark.asyncio
+async def test_source_responses_drops_codex_reasoning_history_before_tool_output(async_client, source_upstream):
+    seen_input: list[object] = []
+
+    async def responses_source(request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        seen_input.extend(body["input"])
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            b'data: {"type":"response.completed","response":{"id":"resp_continuation",'
+            b'"output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(responses_source)
+    model = "responses-continuation-source"
+    await _create_model_source(
+        async_client,
+        name="responses-continuation",
+        model=model,
+        base_url=base_url,
+        raw_metadata_json='{"supports_reasoning":true}',
+        supports_responses=True,
+    )
+
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={
+            "model": model,
+            "stream": True,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [],
+                    "encrypted_content": "opaque-provider-state",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "ok",
+                },
+            ],
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines()]
+
+    assert seen_input == [
+        {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "shell",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "ok",
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_responses_source_raw_alias_lookup_requires_exact_allowlist(async_client):
     import app.modules.proxy.api as proxy_api
 
@@ -578,8 +772,8 @@ async def test_responses_source_raw_alias_lookup_requires_exact_allowlist(async_
 
     assert canonical_selection is None
     assert exact_selection is not None
-    source, selected_model = exact_selection
-    assert source.name == "responses-alias-like-allowlist-source"
+    sources, selected_model = exact_selection
+    assert [source.name for source in sources] == ["responses-alias-like-allowlist-source"]
     assert selected_model == model
 
 
@@ -1279,6 +1473,143 @@ async def test_source_chat_prefers_raw_alias_like_model_slug(async_client, sourc
 
 
 @pytest.mark.asyncio
+async def test_source_chat_forwards_configured_upstream_model_alias(async_client, source_upstream):
+    captured: dict[str, object] = {}
+
+    async def capture(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(_chat_completion_body("vendor/real-model"))
+
+    base_url = await source_upstream(capture)
+    public_model = "gpt-5.5"
+    upstream_model = "vendor/real-model"
+    source_id = await _create_model_source(
+        async_client,
+        name="renamed-source",
+        model=public_model,
+        upstream_model=upstream_model,
+        base_url=base_url,
+    )
+    await _enable_api_key_auth(async_client)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "renamed-source-key",
+            "assignedSourceIds": [source_id],
+            "allowedModels": [public_model],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={"model": public_model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert captured["model"] == upstream_model
+
+
+@pytest.mark.asyncio
+async def test_native_model_routing_modes_choose_account_provider_and_balanced(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "gpt-5.6-sol"
+    await _create_model_source(
+        async_client,
+        name="native-overlap-provider",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+    )
+
+    def key(mode: str) -> ApiKeyData:
+        return ApiKeyData(
+            id=f"key_{mode}",
+            name=mode,
+            key_prefix="***",
+            allowed_models=[model],
+            enforced_model=None,
+            enforced_reasoning_effort=None,
+            enforced_service_tier=None,
+            expires_at=None,
+            is_active=True,
+            created_at=utcnow(),
+            last_used_at=None,
+            routing_mode=mode,
+        )
+
+    assert await proxy_api._select_chat_model_source(model, key("account_first")) is None
+    assert await proxy_api._select_chat_model_source(model, key("provider_first")) is not None
+    balanced_first = await proxy_api._select_chat_model_source(model, key("balanced"))
+    balanced_second = await proxy_api._select_chat_model_source(model, key("balanced"))
+    assert (balanced_first is None) != (balanced_second is None)
+
+
+@pytest.mark.asyncio
+async def test_chat_source_selector_sticks_to_prompt_cache_key(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "sticky-source-model"
+    first_id = await _create_model_source(async_client, name="sticky-a", model=model, base_url="http://127.0.0.1:9/v1")
+    second_id = await _create_model_source(
+        async_client, name="sticky-b", model=model, base_url="http://127.0.0.1:10/v1"
+    )
+    key = ApiKeyData(
+        id="key_sticky_source",
+        name="sticky",
+        key_prefix="sk-sticky",
+        allowed_models=[model],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+        routing_mode="provider_first",
+    )
+    payload = ResponsesRequest.model_validate(
+        {"model": model, "instructions": "", "input": "same session", "prompt_cache_key": "cache-key-1"}
+    )
+    first = await proxy_api._select_chat_model_source(model, key, payload=payload)
+    assert first is not None
+    selected = first[0][0]
+    proxy_api._remember_sticky_source(f"{key.id}:{model}:cache-key-1", selected)
+    second = await proxy_api._select_chat_model_source(model, key, payload=payload)
+    assert second is not None
+    assert second[0][0].id == selected.id
+    assert {source.id for source in second[0]} == {first_id, second_id}
+
+
+@pytest.mark.asyncio
+async def test_chat_source_selector_round_robins_eligible_providers(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "round-robin-source-model"
+    await _create_model_source(
+        async_client,
+        name="round-robin-a",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+    )
+    await _create_model_source(
+        async_client,
+        name="round-robin-b",
+        model=model,
+        base_url="http://127.0.0.1:10/v1",
+    )
+
+    first = await proxy_api._select_chat_model_source(model, None)
+    second = await proxy_api._select_chat_model_source(model, None)
+
+    assert first is not None
+    assert second is not None
+    assert [source.name for source in first[0]] == ["round-robin-a", "round-robin-b"]
+    assert [source.name for source in second[0]] == ["round-robin-b", "round-robin-a"]
+
+
+@pytest.mark.asyncio
 async def test_source_chat_raw_alias_lookup_requires_exact_allowlist(async_client):
     import app.modules.proxy.api as proxy_api
 
@@ -1329,8 +1660,8 @@ async def test_source_chat_raw_alias_lookup_requires_exact_allowlist(async_clien
 
     assert canonical_selection is None
     assert exact_selection is not None
-    source, selected_model = exact_selection
-    assert source.name == "alias-like-allowlist-source"
+    sources, selected_model = exact_selection
+    assert [source.name for source in sources] == ["alias-like-allowlist-source"]
     assert selected_model == model
 
 
@@ -1390,6 +1721,9 @@ async def test_source_chat_payload_keeps_reasoning_toggles_for_optin_model(async
     assert captured["include_reasoning"] is True
     assert captured["reasoning_effort"] == "high"
     assert "tools" not in captured
+    async with SessionLocal() as session:
+        log = (await session.execute(select(RequestLog).where(RequestLog.model == model))).scalar_one()
+        assert log.reasoning_effort == "high"
 
 
 @pytest.mark.asyncio
@@ -1436,6 +1770,9 @@ async def test_source_chat_payload_overrides_enforced_reasoning_object(async_cli
     assert response.status_code == 200
     assert captured["reasoning"] == {"effort": "high", "summary": "auto"}
     assert captured["reasoning_effort"] == "high"
+    async with SessionLocal() as session:
+        log = (await session.execute(select(RequestLog).where(RequestLog.model == model))).scalar_one()
+        assert log.reasoning_effort == "high"
 
 
 @pytest.mark.asyncio
@@ -1635,3 +1972,920 @@ async def test_source_stream_success_passes_through_sse(async_client, source_ups
 
     assert b'"content":"hello"' in received
     assert b"[DONE]" in received
+
+
+@pytest.mark.asyncio
+async def test_source_chat_retries_other_provider_when_model_is_unavailable(async_client, source_upstream):
+    hits: list[str] = []
+
+    async def missing_model(_request: web.Request) -> web.Response:
+        hits.append("missing")
+        return web.json_response(
+            {"error": {"message": "model not found on this provider", "code": "model_not_found"}},
+            status=404,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(_chat_completion_body("provider-fallback-model"))
+
+    model = "provider-fallback-model"
+    missing_url = await source_upstream(missing_model)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(async_client, name="fallback-a-missing", model=model, base_url=missing_url)
+    await _create_model_source(async_client, name="fallback-b-healthy", model=model, base_url=healthy_url)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert hits == ["missing", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_source_responses_retries_other_provider_when_model_is_unavailable(async_client, source_upstream):
+    hits: list[str] = []
+    model = "responses-provider-fallback-model"
+
+    async def missing_model(_request: web.Request) -> web.Response:
+        hits.append("missing")
+        return web.json_response(
+            {"error": {"message": "deployment not found", "code": "deployment_not_found"}},
+            status=404,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(
+            {
+                "id": "resp_provider_fallback",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    missing_url = await source_upstream(missing_model)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(
+        async_client,
+        name="responses-fallback-a-missing",
+        model=model,
+        base_url=missing_url,
+        supports_responses=True,
+    )
+    await _create_model_source(
+        async_client,
+        name="responses-fallback-b-healthy",
+        model=model,
+        base_url=healthy_url,
+        supports_responses=True,
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": model, "input": "hi", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_provider_fallback"
+    assert hits == ["missing", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_does_not_retry_generic_client_payload_error(async_client, source_upstream):
+    hits: list[str] = []
+
+    async def invalid_payload(_request: web.Request) -> web.Response:
+        hits.append("invalid")
+        return web.json_response(
+            {"error": {"message": "messages[0].content is required", "code": "invalid_request_error"}},
+            status=400,
+        )
+
+    async def should_not_run(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(_chat_completion_body("provider-no-retry-model"))
+
+    model = "provider-no-retry-model"
+    invalid_url = await source_upstream(invalid_payload)
+    healthy_url = await source_upstream(should_not_run)
+    await _create_model_source(async_client, name="no-retry-a-invalid", model=model, base_url=invalid_url)
+    await _create_model_source(async_client, name="no-retry-b-healthy", model=model, base_url=healthy_url)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 400
+    assert hits == ["invalid"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_provider_failover_is_capped_at_three(async_client, source_upstream):
+    hits: list[str] = []
+    model = "provider-three-attempt-cap-model"
+
+    def failing_handler(name: str):
+        async def handler(_request: web.Request) -> web.Response:
+            hits.append(name)
+            return web.json_response(
+                {"error": {"message": "model not found", "code": "model_not_found"}},
+                status=404,
+            )
+
+        return handler
+
+    for name in ("cap-a", "cap-b", "cap-c", "cap-d"):
+        base_url = await source_upstream(failing_handler(name))
+        await _create_model_source(async_client, name=name, model=model, base_url=base_url)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 404
+    assert hits == ["cap-a", "cap-b", "cap-c"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_error_falls_back_to_account_branch(async_client, source_upstream, monkeypatch):
+    await _enable_api_key_auth(async_client)
+
+    async def completion(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.4"
+    source_id = await _create_model_source(async_client, name="provider-down", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "provider-fallback-key", "assignedSourceIds": [source_id]},
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_account_fallback", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_account_fallback"
+
+
+@pytest.mark.asyncio
+async def test_source_chat_with_tools_prefers_account_before_next_provider(async_client, source_upstream, monkeypatch):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_provider(_request: web.Request) -> web.Response:
+        hits.append("provider-1")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    async def provider_two(_request: web.Request) -> web.Response:
+        hits.append("provider-2")
+        return web.json_response(_chat_completion_body(model))
+
+    first_url = await source_upstream(failed_provider)
+    second_url = await source_upstream(provider_two)
+    first_id = await _create_model_source(async_client, name="account-first-a-failed", model=model, base_url=first_url)
+    second_id = await _create_model_source(
+        async_client, name="account-first-b-provider", model=model, base_url=second_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [first_id, second_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_account_first", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl_sanitized"
+    assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+async def test_codex_responses_with_tools_falls_back_from_provider_to_account(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    base_url = await source_upstream(failed_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="codex-tools-account-fallback-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "codex-tools-account-fallback-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    from fastapi.responses import StreamingResponse
+
+    async def fallback_body():
+        yield 'data: {"type":"response.completed","response":{"id":"resp_codex_tools_account"}}\n\n'
+
+    async def fake_stream(*_args, **_kwargs):
+        hits.append("account")
+        return StreamingResponse(fallback_body(), media_type="text/event-stream")
+
+    monkeypatch.setattr("app.modules.proxy.api._stream_responses", fake_stream)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "stream": True,
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "resp_codex_tools_account" in response.text
+    assert hits == ["provider", "account"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_tries_next_provider_after_account_pool_unavailable(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_provider(_request: web.Request) -> web.Response:
+        hits.append("provider-1")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    async def provider_two(_request: web.Request) -> web.Response:
+        hits.append("provider-2")
+        return web.json_response(_chat_completion_body(model))
+
+    first_url = await source_upstream(failed_provider)
+    second_url = await source_upstream(provider_two)
+    first_id = await _create_model_source(async_client, name="account-empty-a-failed", model=model, base_url=first_url)
+    second_id = await _create_model_source(
+        async_client, name="account-empty-b-provider", model=model, base_url=second_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-empty-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [first_id, second_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            status_code=503,
+        )
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+async def test_source_reasoning_only_response_falls_back_to_account_then_next_provider(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def reasoning_only(_request: web.Request) -> web.Response:
+        hits.append("provider-1")
+        return web.json_response(
+            {
+                "id": "chatcmpl_reasoning_only",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "", "reasoning_content": "internal"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+            }
+        )
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider-2")
+        return web.json_response(_chat_completion_body(model))
+
+    first_url = await source_upstream(reasoning_only)
+    second_url = await source_upstream(healthy_provider)
+    first_id = await _create_model_source(async_client, name="semantic-empty-provider", model=model, base_url=first_url)
+    second_id = await _create_model_source(
+        async_client, name="semantic-visible-provider", model=model, base_url=second_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "semantic-empty-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [first_id, second_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def empty_account(*_args, **_kwargs):
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_empty", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", empty_account)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "4"
+    assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": "visible"},
+        {"role": "assistant", "content": None, "refusal": "cannot comply"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    ],
+)
+async def test_source_semantic_success_accepts_text_refusal_and_tool_calls(async_client, source_upstream, message):
+    await _enable_api_key_auth(async_client)
+    model = "gpt-5.4"
+
+    async def completion(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "id": "chatcmpl_semantic_success",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    base_url = await source_upstream(completion)
+    source_id = await _create_model_source(
+        async_client, name=f"semantic-success-{len(str(message))}", model=model, base_url=base_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": f"semantic-success-key-{len(str(message))}",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl_semantic_success"
+
+
+@pytest.mark.asyncio
+async def test_source_zero_token_response_falls_back_to_account_branch(async_client, source_upstream, monkeypatch):
+    await _enable_api_key_auth(async_client)
+
+    async def completion(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "id": "chatcmpl_zero",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-5.4",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.4"
+    source_id = await _create_model_source(async_client, name="provider-zero", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "provider-zero-key", "assignedSourceIds": [source_id]},
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_zero_fallback", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_zero_fallback"
+
+
+@pytest.mark.asyncio
+async def test_source_stream_error_before_downstream_bytes_falls_back_to_account(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+
+    async def completion(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        request.transport.close()
+        return response
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.4"
+    source_id = await _create_model_source(async_client, name="provider-stream-down", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "provider-stream-fallback-key", "assignedSourceIds": [source_id]},
+    )
+    key = created.json()["key"]
+
+    from fastapi.responses import StreamingResponse
+
+    async def fallback_body():
+        yield 'data: {"type":"response.completed","response":{"id":"resp_stream_fallback"}}\n\n'
+
+    async def fake_stream(*_args, **_kwargs):
+        return StreamingResponse(fallback_body(), media_type="text/event-stream")
+
+    monkeypatch.setattr("app.modules.proxy.api._stream_responses", fake_stream)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "resp_stream_fallback" in response.text
+
+
+@pytest.mark.asyncio
+async def test_account_first_chat_no_accounts_falls_back_to_provider(async_client, source_upstream, monkeypatch):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(_chat_completion_body(model))
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-first-chat-provider",
+        model=model,
+        base_url=base_url,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-chat-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert hits == ["provider"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_code", ["usage_limit_reached", "insufficient_quota"])
+async def test_account_first_responses_account_quota_falls_back_to_provider(
+    async_client, source_upstream, monkeypatch, upstream_code
+):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {
+                "id": "resp_account_quota_to_provider",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name=f"account-quota-{upstream_code}",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": f"account-quota-key-{upstream_code}",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                429,
+                {"error": {"message": "The selected account has exhausted its quota", "code": upstream_code}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hi", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_account_quota_to_provider"
+    assert hits == ["provider"]
+
+
+@pytest.mark.asyncio
+async def test_account_first_responses_no_accounts_falls_back_to_provider(async_client, source_upstream, monkeypatch):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {
+                "id": "resp_account_to_provider",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-first-responses-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-responses-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hi", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_account_to_provider"
+    assert hits == ["provider"]
+
+
+@pytest.mark.asyncio
+async def test_account_first_responses_continuation_does_not_switch_provider(
+    async_client, source_upstream, monkeypatch
+):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def provider_must_not_run(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response({"id": "unsafe"})
+
+    base_url = await source_upstream(provider_must_not_run)
+    source_id = await _create_model_source(
+        async_client,
+        name="continuation-no-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "continuation-no-provider-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "Owner unavailable", "code": "previous_response_owner_unavailable"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "input": "continue",
+            "previous_response_id": "resp_owner_state",
+            "stream": False,
+        },
+    )
+
+    assert response.status_code in {502, 503}
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_account_first_streaming_chat_no_accounts_falls_back_before_client_bytes(
+    async_client, source_upstream, monkeypatch
+):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(request: web.Request) -> web.StreamResponse:
+        hits.append("provider")
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            (
+                'data: {"id":"chatcmpl_provider","object":"chat.completion.chunk",'
+                '"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"},'
+                '"finish_reason":null}]}\n\n'
+            ).encode()
+        )
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-first-stream-provider",
+        model=model,
+        base_url=base_url,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-stream-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as response:
+        body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    assert response.status_code == 200
+    assert b'"content":"ok"' in body
+    assert b"no_accounts" not in body
+    assert hits == ["provider"]
+
+
+@pytest.mark.asyncio
+async def test_balanced_route_decision_is_stable_within_one_request(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "gpt-5.6-sol"
+    await _create_model_source(
+        async_client,
+        name="stable-request-provider",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+    )
+    key = ApiKeyData(
+        id="key_balanced_request_stable",
+        name="balanced stable",
+        key_prefix="sk-stable",
+        allowed_models=[model],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+        routing_mode="balanced",
+    )
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    proxy_api._SOURCE_ROUTE_CURSOR.pop(f"mixed:{key.id}:{model}", None)
+
+    first = await proxy_api._select_chat_model_source(model, key, request=request)
+    repeated = await proxy_api._select_responses_model_source(model, key, request=request)
+    next_request = MagicMock()
+    next_request.state = SimpleNamespace()
+    next_selection = await proxy_api._select_chat_model_source(model, key, request=next_request)
+
+    assert first is not None
+    assert repeated is not None
+    assert next_selection is None
+    assert proxy_api._SOURCE_ROUTE_CURSOR[f"mixed:{key.id}:{model}"] == 2

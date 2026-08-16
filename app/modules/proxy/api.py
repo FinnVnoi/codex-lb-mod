@@ -164,6 +164,7 @@ from app.modules.model_sources.catalog import (
     source_model_request_overrides,
     source_model_supported_tool_types,
     source_model_supports_reasoning,
+    source_model_upstream_slug,
     source_models_to_upstream_models,
 )
 from app.modules.model_sources.forwarding import (
@@ -297,6 +298,45 @@ _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES = frozenset(
 )
 _PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT = 64
 _SOURCE_LIMITED_STREAM_BUFFER_BYTES = 16 * 1024 * 1024
+_SOURCE_MAX_PROVIDER_ATTEMPTS = 3
+_ACCOUNT_BRANCH_MODEL_PREFIXES = ("gpt-5", "codex-")
+_SOURCE_FALLBACK_ERROR_CODES = frozenset(
+    {
+        "model_source_unreachable",
+        "model_source_credentials_error",
+        "invalid_upstream_response",
+        "model_source_error",
+        "model_source_stream_error",
+        "source_zero_token_response",
+        "usage_unavailable",
+    }
+)
+_SOURCE_MODEL_UNAVAILABLE_ERROR_CODES = frozenset(
+    {
+        "deployment_not_found",
+        "invalid_model",
+        "model_not_available",
+        "model_not_found",
+        "model_not_supported",
+        "no_available_model",
+        "no_available_provider",
+        "unsupported_model",
+        "unknown_model",
+    }
+)
+_SOURCE_MODEL_UNAVAILABLE_MESSAGE_FRAGMENTS = (
+    "does not exist",
+    "invalid model",
+    "model is not available",
+    "model is not supported",
+    "model not available",
+    "model not found",
+    "no available model",
+    "no endpoints found",
+    "no provider available",
+    "unknown model",
+    "unsupported model",
+)
 
 
 class _V1ResetCreditFreshCredentials:
@@ -864,29 +904,53 @@ async def responses(
     except ClientPayloadError as exc:
         error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
-    source = None
+    sources: list[ModelSource] = []
     if compact_trigger_input is None and not extract_input_file_ids(responses_payload.input):
         source_selection = await _select_responses_model_source(
             responses_payload.model,
             api_key,
             raw_model=raw_source_model,
             require_streaming=True,
+            request=request,
+            payload=responses_payload,
         )
         if source_selection is not None:
-            source, selected_model = source_selection
+            sources, selected_model = source_selection
             responses_payload.model = selected_model
-    if source is not None:
+    if sources:
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
         # not reject them.
         responses_payload.stream = True
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+        account_fallback: Callable[[], Awaitable[Response]] | None = None
+        if _model_can_use_account_branch(responses_payload.model) and _responses_request_allows_safe_branch_fallback(
+            responses_payload
+        ):
+
+            async def account_fallback() -> Response:
+                account_payload = responses_payload.model_copy(deep=True)
+                account_payload.stream = True
+                return await _stream_responses(
+                    request,
+                    account_payload,
+                    context,
+                    api_key,
+                    codex_session_affinity=True,
+                    openai_cache_affinity=True,
+                    prefer_http_bridge=True,
+                    prohibit_fast_mode=prohibit_fast_mode,
+                    enforce_openai_sdk_contract=openai_sdk_request,
+                    native_codex_heartbeat=native_codex_heartbeat,
+                )
+
         return await _source_responses_response(
             request,
             responses_payload,
-            source=source,
+            sources=sources,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
+            account_fallback=account_fallback,
         )
 
     apply_enforced_service_tier_model_fallback(
@@ -894,7 +958,7 @@ async def responses(
         service_tier_was_enforced=service_tier_was_enforced,
     )
 
-    return await _stream_responses(
+    account_response = await _stream_responses(
         request,
         responses_payload,
         context,
@@ -909,6 +973,17 @@ async def responses(
         enforce_openai_sdk_contract=openai_sdk_request,
         native_codex_heartbeat=native_codex_heartbeat,
     )
+    if _account_response_allows_provider_fallback(account_response):
+        rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+        provider_response = await _account_responses_provider_fallback_response(
+            request,
+            responses_payload,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+        )
+        if provider_response is not None:
+            return provider_response
+    return account_response
 
 
 @router.get("/opportunistic/admission")
@@ -998,29 +1073,62 @@ async def v1_responses(
             api_key,
             raw_model=raw_source_model,
             require_streaming=responses_payload.stream is True,
+            request=request,
+            payload=responses_payload,
         )
     )
-    source = source_selection[0] if source_selection is not None else None
+    sources = source_selection[0] if source_selection is not None else []
     if source_selection is not None:
         responses_payload.model = source_selection[1]
-    if source is not None:
+    if sources:
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
         # not reject them.
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
+        account_fallback: Callable[[], Awaitable[Response]] | None = None
+        if _model_can_use_account_branch(responses_payload.model) and _responses_request_allows_safe_branch_fallback(
+            responses_payload
+        ):
+
+            async def account_fallback() -> Response:
+                account_payload = responses_payload.model_copy(deep=True)
+                if account_payload.stream:
+                    return await _stream_responses(
+                        request,
+                        account_payload,
+                        context,
+                        api_key,
+                        codex_session_affinity=False,
+                        openai_cache_affinity=True,
+                        prefer_http_bridge=True,
+                        prohibit_fast_mode=prohibit_fast_mode,
+                    )
+                return await _collect_responses(
+                    request,
+                    account_payload,
+                    context,
+                    api_key,
+                    codex_session_affinity=False,
+                    openai_cache_affinity=True,
+                    prefer_http_bridge=True,
+                    prohibit_fast_mode=prohibit_fast_mode,
+                )
+
         return await _source_responses_response(
             request,
             responses_payload,
-            source=source,
+            sources=sources,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
+            account_fallback=account_fallback,
         )
     apply_enforced_service_tier_model_fallback(
         responses_payload,
         service_tier_was_enforced=service_tier_was_enforced,
     )
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
     if responses_payload.stream:
-        return await _stream_responses(
+        account_response = await _stream_responses(
             request,
             responses_payload,
             context,
@@ -1030,16 +1138,27 @@ async def v1_responses(
             prefer_http_bridge=True,
             prohibit_fast_mode=prohibit_fast_mode,
         )
-    return await _collect_responses(
-        request,
-        responses_payload,
-        context,
-        api_key,
-        codex_session_affinity=False,
-        openai_cache_affinity=True,
-        prefer_http_bridge=True,
-        prohibit_fast_mode=prohibit_fast_mode,
-    )
+    else:
+        account_response = await _collect_responses(
+            request,
+            responses_payload,
+            context,
+            api_key,
+            codex_session_affinity=False,
+            openai_cache_affinity=True,
+            prefer_http_bridge=True,
+            prohibit_fast_mode=prohibit_fast_mode,
+        )
+    if _account_response_allows_provider_fallback(account_response):
+        provider_response = await _account_responses_provider_fallback_response(
+            request,
+            responses_payload,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+        )
+        if provider_response is not None:
+            return provider_response
+    return account_response
 
 
 @internal_router.post(
@@ -2093,15 +2212,15 @@ async def v1_audio_transcriptions(
     multipart = await _parse_transcription_multipart(request, require_model=True)
     assert multipart.model is not None
     model = multipart.model
-    source = await _select_audio_transcriptions_model_source(model, api_key)
-    if source is not None:
+    sources = await _select_audio_transcriptions_model_source(model, api_key)
+    if sources:
         validate_model_access(api_key, model)
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
         return await _source_audio_transcription_response(
             request=request,
             model=model,
             multipart=multipart,
-            source=source,
+            sources=sources,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
         )
@@ -3612,7 +3731,33 @@ async def v1_anthropic_messages(
         error = openai_validation_error(exc)
         return _anthropic_logged_error_response(request, 400, error, headers=rate_limit_headers)
 
+    raw_source_model = _effective_optional_model_for_api_key(api_key, responses_payload.model)
     apply_api_key_enforcement(responses_payload, api_key)
+    validate_model_access(api_key, responses_payload.model)
+    source_selection = (
+        None
+        if extract_input_file_ids(responses_payload.input)
+        else await _select_responses_model_source(
+            responses_payload.model,
+            api_key,
+            raw_model=raw_source_model,
+            require_streaming=True,
+            request=request,
+            payload=responses_payload,
+        )
+    )
+    if source_selection is not None:
+        sources, selected_model = source_selection
+        responses_payload.model = selected_model
+        return await _source_anthropic_messages_response(
+            request,
+            responses_payload,
+            sources=sources,
+            api_key=api_key,
+            stream_response=bool(payload.stream),
+            rate_limit_headers=await _rate_limit_headers_for_request(context, api_key),
+        )
+
     admission_denial = await _opportunistic_admission_denial(request, context, api_key, model=responses_payload.model)
     if admission_denial is not None:
         return _anthropic_response_from_openai_json_response(request, admission_denial)
@@ -3680,6 +3825,75 @@ async def v1_anthropic_messages(
     )
 
 
+async def _source_anthropic_messages_response(
+    request: Request,
+    payload: ResponsesRequest,
+    *,
+    sources: list[ModelSource],
+    api_key: ApiKeyData | None,
+    stream_response: bool,
+    rate_limit_headers: Mapping[str, str],
+) -> Response:
+    """Forward Anthropic Messages traffic through a Responses model source."""
+
+    payload.stream = True
+    source_response = await _source_responses_response(
+        request,
+        payload,
+        sources=sources,
+        api_key=api_key,
+        rate_limit_headers=rate_limit_headers,
+    )
+    if not isinstance(source_response, StreamingResponse):
+        return _anthropic_response_from_openai_json_response(request, cast(JSONResponse, source_response))
+
+    response_stream = _decode_source_sse_events(cast(AsyncIterator[bytes], source_response.body_iterator))
+    if stream_response:
+        return StreamingResponse(
+            stream_anthropic_messages(response_stream, model=payload.model),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache, no-transform",
+                "X-Accel-Buffering": "no",
+                **rate_limit_headers,
+            },
+        )
+
+    result = await collect_chat_completion(response_stream, model=payload.model)
+    if isinstance(result, OpenAIErrorEnvelopeModel):
+        return _anthropic_logged_error_response(
+            request,
+            _status_for_error(result.error),
+            result.model_dump(mode="json", exclude_none=True),
+            headers=rate_limit_headers,
+        )
+    anthropic = anthropic_message_from_chat_completion(result, model=payload.model)
+    return JSONResponse(
+        content=anthropic.model_dump(mode="json", exclude_none=True),
+        status_code=200,
+        headers=rate_limit_headers,
+    )
+
+
+async def _decode_source_sse_events(stream: AsyncIterator[bytes]) -> AsyncIterator[str]:
+    """Decode arbitrary source byte chunks into complete SSE event blocks."""
+
+    buffer = b""
+    try:
+        async for chunk in stream:
+            if not chunk:
+                continue
+            buffer += chunk.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+            while b"\n\n" in buffer:
+                raw_event, buffer = buffer.split(b"\n\n", 1)
+                if raw_event.strip():
+                    yield raw_event.decode("utf-8", errors="replace") + "\n\n"
+        if buffer.strip():
+            yield buffer.decode("utf-8", errors="replace")
+    finally:
+        await _aclose_stream(stream)
+
+
 @v1_router.post(
     "/chat/completions",
     response_model=ChatCompletionResult,
@@ -3741,13 +3955,15 @@ async def v1_chat_completions(
             api_key,
             raw_model=effective_model,
             require_streaming=payload.stream is True,
+            request=request,
+            payload=responses_payload,
         )
         if not responses_shaped_payload and payload.messages is not None
         else None
     )
-    source = source_selection[0] if source_selection is not None else None
+    sources = source_selection[0] if source_selection is not None else []
     request_model = source_selection[1] if source_selection is not None else responses_payload.model
-    if source is None:
+    if not sources:
         apply_enforced_service_tier_model_fallback(
             responses_payload,
             service_tier_was_enforced=service_tier_was_enforced,
@@ -3766,15 +3982,44 @@ async def v1_chat_completions(
         request_service_tier=responses_payload.service_tier,
         request_usage_budget=estimate_api_key_request_usage(responses_payload),
     )
-    if source is not None:
+    if sources:
+        account_fallback: Callable[[], Awaitable[Response]] | None = None
+        if _model_can_use_account_branch(request_model) and _responses_request_allows_safe_branch_fallback(
+            responses_payload
+        ):
+
+            async def account_fallback() -> Response:
+                account_payload = responses_payload.model_copy(deep=True)
+                account_payload.stream = bool(payload.stream)
+                if payload.stream:
+                    return await _stream_responses(
+                        request,
+                        account_payload,
+                        context,
+                        api_key,
+                        codex_session_affinity=False,
+                        openai_cache_affinity=True,
+                        suppress_text_done_events=True,
+                    )
+                return await _collect_responses(
+                    request,
+                    account_payload,
+                    context,
+                    api_key,
+                    codex_session_affinity=False,
+                    openai_cache_affinity=True,
+                    suppress_text_done_events=True,
+                )
+
         return await _source_chat_completion_response(
             request,
             payload,
-            source=source,
+            sources=sources,
             model=request_model,
             api_key=api_key,
             reservation=reservation,
             rate_limit_headers=rate_limit_headers,
+            account_fallback=account_fallback,
         )
     responses_payload.stream = True
     stream = context.service.stream_responses(
@@ -3819,7 +4064,26 @@ async def v1_chat_completions(
                 payload,
                 headers=rate_limit_headers,
             )
-        return _stream_startup_error_response(request, startup_error, headers=rate_limit_headers)
+        account_error_response = _stream_startup_error_response(request, startup_error, headers=rate_limit_headers)
+        startup_code, startup_message = _startup_error_details(startup_error)
+        if _responses_request_allows_safe_branch_fallback(
+            responses_payload
+        ) and _account_error_allows_provider_fallback(
+            status_code=(startup_error.status_code if isinstance(startup_error, ProxyResponseError) else 502),
+            code=startup_code,
+            message=startup_message,
+        ):
+            provider_response = await _account_chat_provider_fallback_response(
+                request,
+                payload,
+                model=responses_payload.model,
+                api_key=api_key,
+                rate_limit_headers=rate_limit_headers,
+                account_reservation=reservation,
+            )
+            if provider_response is not None:
+                return provider_response
+        return account_error_response
     if payload.stream:
         stream_options = payload.stream_options
         include_usage = cursor_compat_client or bool(stream_options and stream_options.include_usage)
@@ -3830,6 +4094,25 @@ async def v1_chat_completions(
         )
         if cursor_compat_client:
             chat_stream = _stream_with_cursor_usage_fallback(chat_stream, payload)
+        if _responses_request_allows_safe_branch_fallback(responses_payload):
+            chat_stream, has_visible_output = await _probe_chat_completion_stream_visible_output(chat_stream)
+            if not has_visible_output:
+                await _release_reservation(reservation)
+                provider_response = await _account_chat_provider_fallback_response(
+                    request,
+                    payload,
+                    model=responses_payload.model,
+                    api_key=api_key,
+                    rate_limit_headers=rate_limit_headers,
+                )
+                if provider_response is not None:
+                    return provider_response
+                return _logged_error_json_response(
+                    request,
+                    502,
+                    _empty_assistant_response_error(),
+                    headers=rate_limit_headers,
+                )
         return StreamingResponse(
             inject_sse_keepalives(
                 chat_stream,
@@ -3852,19 +4135,215 @@ async def v1_chat_completions(
         error = result.error
         code = error.code if error else None
         status_code = 503 if code in _UNAVAILABLE_SELECTION_ERROR_CODES else 502
-        return _logged_error_json_response(
+        account_error_response = _logged_error_json_response(
             request,
             status_code,
             content=result.model_dump(mode="json", exclude_none=True),
             headers=rate_limit_headers,
         )
+        if _responses_request_allows_safe_branch_fallback(
+            responses_payload
+        ) and _account_response_allows_provider_fallback(account_error_response):
+            provider_response = await _account_chat_provider_fallback_response(
+                request,
+                payload,
+                model=responses_payload.model,
+                api_key=api_key,
+                rate_limit_headers=rate_limit_headers,
+                account_reservation=reservation,
+            )
+            if provider_response is not None:
+                return provider_response
+        return account_error_response
     if cursor_compat_client and isinstance(result, ChatCompletion):
         _apply_cursor_usage_fallback(result, payload, source="non_stream")
+    if isinstance(result, ChatCompletion) and not _chat_completion_has_assistant_visible_output(result):
+        await _release_reservation(reservation)
+        if _responses_request_allows_safe_branch_fallback(responses_payload):
+            provider_response = await _account_chat_provider_fallback_response(
+                request,
+                payload,
+                model=responses_payload.model,
+                api_key=api_key,
+                rate_limit_headers=rate_limit_headers,
+            )
+            if provider_response is not None:
+                return provider_response
+        return _logged_error_json_response(
+            request,
+            502,
+            _empty_assistant_response_error(),
+            headers=rate_limit_headers,
+        )
     return JSONResponse(
         content=result.model_dump(mode="json", exclude_none=True),
         status_code=200,
         headers=rate_limit_headers,
     )
+
+
+_SOURCE_ROUTE_CURSOR: dict[str, int] = {}
+_SOURCE_STICKY: dict[str, tuple[str, float]] = {}
+_SOURCE_STICKY_DEFAULT_TTL_SECONDS = 1800
+_SOURCE_STICKY_MAX_ENTRIES = 20_000
+
+
+def _source_is_last_resort(source: ModelSource) -> bool:
+    return getattr(source, "routing_policy", "normal") == "fallback_only"
+
+
+def _rotate_model_sources(sources: list[ModelSource], *, route_key: str) -> list[ModelSource]:
+    """Round-robin regular providers while keeping last-resort providers last."""
+    regular_sources = [source for source in sources if not _source_is_last_resort(source)]
+    last_resort_sources = [source for source in sources if _source_is_last_resort(source)]
+    if len(regular_sources) < 2:
+        return [*regular_sources, *last_resort_sources]
+    index = _SOURCE_ROUTE_CURSOR.get(route_key, 0) % len(regular_sources)
+    _SOURCE_ROUTE_CURSOR[route_key] = index + 1
+    return [*regular_sources[index:], *regular_sources[:index], *last_resort_sources]
+
+
+def _source_sticky_key(
+    api_key: ApiKeyData | None,
+    *,
+    model: str,
+    request: Request | None = None,
+    payload: ResponsesRequest | None = None,
+) -> str | None:
+    if api_key is None:
+        return None
+    locality: str | None = None
+    if payload is not None:
+        locality = getattr(payload, "prompt_cache_key", None)
+        if not isinstance(locality, str) or not locality.strip():
+            locality = None
+    if locality is None and request is not None:
+        normalized = {key.lower(): value for key, value in request.headers.items()}
+        for header in (
+            "x-codex-conversation-id",
+            "x-codex-session-id",
+            "session_id",
+            "session-id",
+            "x-session-id",
+            "thread-id",
+        ):
+            value = normalized.get(header)
+            if isinstance(value, str) and value.strip():
+                locality = value.strip()
+                break
+    if locality is None and payload is not None:
+        conversation = getattr(payload, "conversation", None)
+        if isinstance(conversation, str) and conversation.strip():
+            locality = conversation.strip()
+    if locality is None:
+        return None
+    return f"{api_key.id}:{model}:{locality.strip()}"
+
+
+def _source_burn_order(sources: list[ModelSource]) -> list[ModelSource]:
+    rank = {"burn_first": 0, "normal": 1, "preserve": 2, "fallback_only": 3}
+    return sorted(sources, key=lambda source: rank.get(getattr(source, "routing_policy", "normal"), 1))
+
+
+def _sticky_source_order(
+    sources: list[ModelSource],
+    *,
+    sticky_key: str | None,
+    request_settings: object,
+) -> list[ModelSource]:
+    if not sources or sticky_key is None:
+        return sources
+    now = time.monotonic()
+    ttl_seconds = int(getattr(request_settings, "model_source_sticky_ttl_seconds", _SOURCE_STICKY_DEFAULT_TTL_SECONDS))
+    if len(_SOURCE_STICKY) > _SOURCE_STICKY_MAX_ENTRIES:
+        cutoff = now - ttl_seconds
+        for key, (_, seen_at) in list(_SOURCE_STICKY.items()):
+            if seen_at < cutoff:
+                _SOURCE_STICKY.pop(key, None)
+    selected_id, seen_at = _SOURCE_STICKY.get(sticky_key, ("", 0.0))
+    if now - seen_at >= ttl_seconds or selected_id not in {source.id for source in sources}:
+        return sources
+    selected = next(source for source in sources if source.id == selected_id)
+    return [selected, *(source for source in sources if source.id != selected_id)]
+
+
+def _source_sticky_order_without_last_resort_promotion(
+    sources: list[ModelSource],
+    *,
+    sticky_key: str,
+    request_settings: object,
+) -> list[ModelSource]:
+    """Prefer sticky regular providers, never promote a fallback-only provider."""
+    regular_sources = [source for source in sources if not _source_is_last_resort(source)]
+    last_resort_sources = [source for source in sources if _source_is_last_resort(source)]
+    ordered_regular = _sticky_source_order(
+        regular_sources,
+        sticky_key=sticky_key,
+        request_settings=request_settings,
+    )
+    return [*ordered_regular, *last_resort_sources]
+
+
+def _remember_sticky_source(sticky_key: str | None, source: ModelSource) -> None:
+    if sticky_key is not None:
+        _SOURCE_STICKY[sticky_key] = (source.id, time.monotonic())
+
+
+def _forget_sticky_source(sticky_key: str | None, source: ModelSource) -> None:
+    if sticky_key is None:
+        return
+    selected_id, _ = _SOURCE_STICKY.get(sticky_key, ("", 0.0))
+    if selected_id == source.id:
+        _SOURCE_STICKY.pop(sticky_key, None)
+
+
+def _api_key_routing_mode(api_key: ApiKeyData | None) -> str:
+    mode = getattr(api_key, "routing_mode", "balanced") if api_key is not None else "account_first"
+    return mode if mode in {"balanced", "account_first", "provider_first"} else "balanced"
+
+
+def _model_can_use_account_branch(model: str) -> bool:
+    return model in get_model_registry().get_models_with_fallback()
+
+
+def _responses_request_allows_safe_branch_fallback(payload: ResponsesRequest) -> bool:
+    # Tool definitions alone do not make a request stateful. Source responses
+    # are buffered before any downstream byte is emitted whenever account
+    # fallback is available, so switching branches before visible output
+    # cannot duplicate a tool call. Keep blocking only server-owned response
+    # continuations, whose state is pinned to the original upstream.
+    return payload.previous_response_id is None and payload.conversation is None
+
+
+def _route_to_provider_for_native_model(
+    api_key: ApiKeyData | None,
+    *,
+    model: str,
+    request: Request | None = None,
+) -> bool:
+    mode = _api_key_routing_mode(api_key)
+    if mode == "provider_first":
+        return True
+    if mode == "account_first":
+        return False
+    # Balanced alternates the preferred route per API key + model. Cache the
+    # decision on the inbound request so chat/responses normalization, fallback
+    # probes, or repeated selector calls cannot advance the cursor twice.
+    key_id = api_key.id if api_key is not None else "dashboard"
+    route_key = f"mixed:{key_id}:{model}"
+    if request is not None:
+        decisions = getattr(request.state, "balanced_route_decisions", None)
+        if decisions is None:
+            decisions = {}
+            request.state.balanced_route_decisions = decisions
+        if route_key in decisions:
+            return bool(decisions[route_key])
+    index = _SOURCE_ROUTE_CURSOR.get(route_key, 0)
+    decision = index % 2 == 0
+    _SOURCE_ROUTE_CURSOR[route_key] = index + 1
+    if request is not None:
+        decisions[route_key] = decision
+    return decision
 
 
 async def _select_chat_model_source(
@@ -3873,7 +4352,10 @@ async def _select_chat_model_source(
     *,
     raw_model: str | None = None,
     require_streaming: bool = False,
-) -> tuple[ModelSource, str] | None:
+    allow_native_provider_fallback: bool = False,
+    request: Request | None = None,
+    payload: ResponsesRequest | None = None,
+) -> tuple[list[ModelSource], str] | None:
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
     candidates = [candidate for candidate in (raw_model, model) if candidate]
@@ -3887,22 +4369,42 @@ async def _select_chat_model_source(
             if exact_allowed_models is not None and candidate not in exact_allowed_models:
                 continue
             subscription_model = registry_models.get(candidate)
-            if assigned_source_ids is None and subscription_model is not None:
+            if (
+                subscription_model is not None
+                and not allow_native_provider_fallback
+                and not _route_to_provider_for_native_model(api_key, model=candidate, request=request)
+            ):
                 continue
-            source = await repository.find_chat_source_for_model(
+            sources = await repository.find_chat_sources_for_model(
                 candidate,
                 allowed_source_ids=assigned_source_ids,
                 require_streaming=require_streaming,
             )
-            if source is not None:
+            if sources:
                 break
         else:
-            source = None
+            sources = []
         # ``close_session`` rolls back the read transaction, which would
-        # expire the loaded row; detach it so the forwarding path can read
-        # its attributes after this session boundary.
+        # expire the loaded rows; detach them so the forwarding path can read
+        # their attributes after this session boundary.
         detach_session_objects(session)
-        return (source, candidate) if source is not None else None
+        sources = _source_burn_order(sources)
+        request_settings = await get_settings_cache().get()
+        if not request_settings.model_source_sticky_enabled:
+            _SOURCE_STICKY.clear()
+        sticky_key = (
+            _source_sticky_key(api_key, model=candidate, request=request, payload=payload)
+            if request_settings.model_source_sticky_enabled
+            else None
+        )
+        sources = (
+            _source_sticky_order_without_last_resort_promotion(
+                sources, sticky_key=sticky_key, request_settings=request_settings
+            )
+            if sticky_key is not None
+            else _rotate_model_sources(sources, route_key=f"chat:{candidate}")
+        )
+        return (sources, candidate) if sources else None
 
 
 async def _select_responses_model_source(
@@ -3911,7 +4413,10 @@ async def _select_responses_model_source(
     *,
     raw_model: str | None = None,
     require_streaming: bool = False,
-) -> tuple[ModelSource, str] | None:
+    allow_native_provider_fallback: bool = False,
+    request: Request | None = None,
+    payload: ResponsesRequest | None = None,
+) -> tuple[list[ModelSource], str] | None:
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
     candidates = [candidate for candidate in (raw_model, model) if candidate]
@@ -3925,38 +4430,58 @@ async def _select_responses_model_source(
             if exact_allowed_models is not None and candidate not in exact_allowed_models:
                 continue
             subscription_model = registry_models.get(candidate)
-            if assigned_source_ids is None and subscription_model is not None:
+            if (
+                subscription_model is not None
+                and not allow_native_provider_fallback
+                and not _route_to_provider_for_native_model(api_key, model=candidate, request=request)
+            ):
                 continue
-            source = await repository.find_responses_source_for_model(
+            sources = await repository.find_responses_sources_for_model(
                 candidate,
                 allowed_source_ids=assigned_source_ids,
                 require_streaming=require_streaming,
             )
-            if source is not None:
+            if sources:
                 break
         else:
-            source = None
+            sources = []
         # ``close_session`` rolls back the read transaction, which would
-        # expire the loaded row; detach it so the forwarding path can read
-        # its attributes after this session boundary.
+        # expire the loaded rows; detach them so the forwarding path can read
+        # their attributes after this session boundary.
         detach_session_objects(session)
-        return (source, candidate) if source is not None else None
+        sources = _source_burn_order(sources)
+        request_settings = await get_settings_cache().get()
+        if not request_settings.model_source_sticky_enabled:
+            _SOURCE_STICKY.clear()
+        sticky_key = (
+            _source_sticky_key(api_key, model=candidate, request=request, payload=payload)
+            if request_settings.model_source_sticky_enabled
+            else None
+        )
+        sources = (
+            _source_sticky_order_without_last_resort_promotion(
+                sources, sticky_key=sticky_key, request_settings=request_settings
+            )
+            if sticky_key is not None
+            else _rotate_model_sources(sources, route_key=f"responses:{candidate}")
+        )
+        return (sources, candidate) if sources else None
 
 
-async def _select_audio_transcriptions_model_source(model: str, api_key: ApiKeyData | None) -> ModelSource | None:
+async def _select_audio_transcriptions_model_source(model: str, api_key: ApiKeyData | None) -> list[ModelSource]:
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = _exact_source_allowed_models_for_api_key(api_key)
     if exact_allowed_models is not None and model not in exact_allowed_models:
-        return None
+        return []
     if assigned_source_ids is None and model == _TRANSCRIPTION_MODEL:
-        return None
+        return []
     async with get_background_session() as session:
-        source = await ModelSourcesRepository(session).find_audio_transcriptions_source_for_model(
+        sources = await ModelSourcesRepository(session).find_audio_transcriptions_sources_for_model(
             model,
             allowed_source_ids=assigned_source_ids,
         )
         detach_session_objects(session)
-        return source
+        return _rotate_model_sources(sources, route_key=f"audio:{model}")
 
 
 def _allowed_source_ids_for_api_key(api_key: ApiKeyData | None) -> set[str] | None:
@@ -3995,7 +4520,7 @@ async def _source_audio_transcription_response(
     request: Request,
     model: str,
     multipart: _ParsedTranscriptionMultipart,
-    source: ModelSource,
+    sources: list[ModelSource],
     api_key: ApiKeyData | None,
     rate_limit_headers: Mapping[str, str],
 ) -> Response:
@@ -4004,27 +4529,44 @@ async def _source_audio_transcription_response(
         request_model=model,
         request_service_tier=None,
     )
-    try:
-        result = await forward_source_audio_transcription(
-            source,
-            audio_bytes=multipart.audio_bytes,
-            filename=multipart.filename,
-            content_type=multipart.content_type,
-            fields=list(multipart.ordered_text_fields),
-        )
-    except ModelSourceForwardingError as exc:
+    candidates = _source_provider_candidates(sources)
+    for attempt, source in enumerate(candidates):
+        try:
+            result = await forward_source_audio_transcription(
+                source,
+                audio_bytes=multipart.audio_bytes,
+                filename=multipart.filename,
+                content_type=multipart.content_type,
+                fields=[
+                    (key, source_model_upstream_slug(source, model) if key == "model" else value)
+                    for key, value in multipart.ordered_text_fields
+                ],
+            )
+            break
+        except ModelSourceForwardingError as exc:
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code=_source_error_code(exc.payload),
+                error_message=_source_error_message(exc.payload),
+                upstream_status_code=exc.upstream_status_code,
+            )
+            if attempt + 1 < len(candidates) and _source_error_allows_provider_fallback(exc):
+                request.state.model_source_fallback = True
+                continue
+            await _release_reservation(reservation)
+            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+    else:  # Defensive: selectors never call this helper with an empty list.
         await _release_reservation(reservation)
-        await _log_source_chat_completion(
+        return _logged_error_json_response(
             request,
-            source=source,
-            api_key=api_key,
-            model=model,
-            status="error",
-            error_code=_source_error_code(exc.payload),
-            error_message=_source_error_message(exc.payload),
-            upstream_status_code=exc.upstream_status_code,
+            503,
+            openai_error("model_source_unavailable", "No model source is available", error_type="server_error"),
+            headers=rate_limit_headers,
         )
-        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
 
     # ASR billing prefers audio duration: when the source model has a
     # per-minute rate and the response carries a duration, settle cost from
@@ -4105,41 +4647,92 @@ async def _source_responses_response(
     request: Request,
     payload: ResponsesRequest,
     *,
-    source: ModelSource,
+    sources: list[ModelSource],
     api_key: ApiKeyData | None,
     rate_limit_headers: Mapping[str, str],
+    account_fallback: Callable[[], Awaitable[Response]] | None = None,
 ) -> Response:
+    candidates = _source_provider_candidates(sources)
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
         request_service_tier=payload.service_tier,
         request_usage_budget=estimate_api_key_request_usage(payload),
     )
-    source_payload = payload.model_dump_for_forwarding()
-    source_payload["stream"] = bool(payload.stream)
-    _apply_source_response_request_overrides(source_payload, source_model_request_overrides(source, payload.model))
-    _drop_unsupported_source_response_tools(
-        source_payload,
-        supported_tool_types=source_model_supported_tool_types(source, payload.model),
-    )
+
+    def build_source_payload(source: ModelSource) -> dict[str, JsonValue]:
+        source_payload = payload.model_dump_for_forwarding()
+        source_payload["model"] = source_model_upstream_slug(source, payload.model)
+        source_payload["stream"] = bool(payload.stream)
+        _normalize_source_response_input(source_payload)
+        _apply_source_response_request_overrides(source_payload, source_model_request_overrides(source, payload.model))
+        _drop_unsupported_source_response_tools(
+            source_payload,
+            supported_tool_types=source_model_supported_tool_types(source, payload.model),
+        )
+        return source_payload
+
+    def provider_fallback_after(attempt: int) -> Callable[[], Awaitable[Response]] | None:
+        remaining_sources = candidates[attempt + 1 :]
+        if not remaining_sources:
+            return None
+
+        async def fallback() -> Response:
+            return await _source_responses_response(
+                request,
+                payload,
+                sources=remaining_sources,
+                api_key=api_key,
+                rate_limit_headers=rate_limit_headers,
+                account_fallback=None,
+            )
+
+        return fallback
 
     if payload.stream:
-        try:
-            stream = await stream_source_responses(source, source_payload)
-        except ModelSourceForwardingError as exc:
+        for attempt, source in enumerate(candidates):
+            source_payload = build_source_payload(source)
+            request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
+            try:
+                stream = await stream_source_responses(source, source_payload)
+                _remember_sticky_source(
+                    _source_sticky_key(api_key, model=payload.model, request=request, payload=payload),
+                    source,
+                )
+                break
+            except ModelSourceForwardingError as exc:
+                await _log_source_chat_completion(
+                    request,
+                    source=source,
+                    api_key=api_key,
+                    model=payload.model,
+                    status="error",
+                    error_code=_source_error_code(exc.payload),
+                    error_message=_source_error_message(exc.payload),
+                    upstream_status_code=exc.upstream_status_code,
+                )
+                provider_fallback = provider_fallback_after(attempt)
+                await _release_reservation(reservation)
+                if account_fallback is not None and _source_error_allows_account_fallback(exc):
+                    return await _source_account_first_fallback(
+                        request,
+                        account_fallback=account_fallback,
+                        provider_fallback=provider_fallback,
+                    )
+                if provider_fallback is not None and _source_error_allows_provider_fallback(exc):
+                    request.state.model_source_fallback = True
+                    return await provider_fallback()
+                return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        else:  # Defensive: selectors never call this helper with an empty list.
             await _release_reservation(reservation)
-            await _log_source_chat_completion(
+            return _logged_error_json_response(
                 request,
-                source=source,
-                api_key=api_key,
-                model=payload.model,
-                status="error",
-                error_code=_source_error_code(exc.payload),
-                error_message=_source_error_message(exc.payload),
-                upstream_status_code=exc.upstream_status_code,
+                503,
+                openai_error("model_source_unavailable", "No model source is available", error_type="server_error"),
+                headers=rate_limit_headers,
             )
-            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
-        if _reservation_requires_usage(reservation):
+        provider_fallback = provider_fallback_after(attempt)
+        if _reservation_requires_usage(reservation) or account_fallback is not None or provider_fallback is not None:
             return await _buffered_limited_source_chat_stream_response(
                 request,
                 source=source,
@@ -4149,6 +4742,8 @@ async def _source_responses_response(
                 stream=stream.body,
                 usage_holder=stream.usage_holder,
                 rate_limit_headers=rate_limit_headers,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
             )
         body = _source_chat_stream_with_settlement(
             stream.body,
@@ -4169,9 +4764,92 @@ async def _source_responses_response(
             },
         )
 
-    try:
-        result = await forward_source_responses(source, source_payload)
-    except ModelSourceForwardingError as exc:
+    for attempt, source in enumerate(candidates):
+        source_payload = build_source_payload(source)
+        request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
+        try:
+            result = await forward_source_responses(source, source_payload)
+            _remember_sticky_source(
+                _source_sticky_key(api_key, model=payload.model, request=request, payload=payload),
+                source,
+            )
+        except ModelSourceForwardingError as exc:
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=payload.model,
+                status="error",
+                error_code=_source_error_code(exc.payload),
+                error_message=_source_error_message(exc.payload),
+                upstream_status_code=exc.upstream_status_code,
+            )
+            provider_fallback = provider_fallback_after(attempt)
+            await _release_reservation(reservation)
+            if account_fallback is not None and _source_error_allows_account_fallback(exc):
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            if provider_fallback is not None and _source_error_allows_provider_fallback(exc):
+                request.state.model_source_fallback = True
+                return await provider_fallback()
+            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        if _source_completion_is_zero_token(result.usage) and attempt + 1 < len(candidates):
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=payload.model,
+                status="error",
+                usage=result.usage,
+                error_code="source_zero_token_response",
+                error_message="source response reported zero total tokens",
+                upstream_status_code=result.upstream_status_code,
+            )
+            await _release_reservation(reservation)
+            provider_fallback = provider_fallback_after(attempt)
+            if account_fallback is not None:
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            request.state.model_source_fallback = True
+            return await provider_fallback()
+        if result.usage is None and _reservation_requires_usage(reservation) and attempt + 1 < len(candidates):
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=payload.model,
+                status="error",
+                error_code="usage_unavailable",
+                error_message="source response missing usage",
+                upstream_status_code=result.upstream_status_code,
+            )
+            await _release_reservation(reservation)
+            provider_fallback = provider_fallback_after(attempt)
+            if account_fallback is not None:
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            request.state.model_source_fallback = True
+            return await provider_fallback()
+        break
+    else:  # Defensive: selectors never call this helper with an empty list.
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            503,
+            openai_error("model_source_unavailable", "No model source is available", error_type="server_error"),
+            headers=rate_limit_headers,
+        )
+
+    if _source_completion_is_zero_token(result.usage):
         await _release_reservation(reservation)
         await _log_source_chat_completion(
             request,
@@ -4179,11 +4857,24 @@ async def _source_responses_response(
             api_key=api_key,
             model=payload.model,
             status="error",
-            error_code=_source_error_code(exc.payload),
-            error_message=_source_error_message(exc.payload),
-            upstream_status_code=exc.upstream_status_code,
+            usage=result.usage,
+            error_code="source_zero_token_response",
+            error_message="source response reported zero total tokens",
+            upstream_status_code=result.upstream_status_code,
         )
-        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        if account_fallback is not None:
+            request.state.model_source_fallback = True
+            return await account_fallback()
+        return _logged_error_json_response(
+            request,
+            502,
+            openai_error(
+                "source_zero_token_response",
+                "OpenAI-compatible model source returned a zero-token response",
+                error_type="server_error",
+            ),
+            headers=rate_limit_headers,
+        )
 
     if result.usage is None and _reservation_requires_usage(reservation):
         await _release_reservation(reservation)
@@ -4239,6 +4930,25 @@ async def _source_responses_response(
 # is owned by source selection, and the stream flag drives SSE-vs-JSON response
 # handling on the proxy side.
 _SOURCE_RESPONSE_OVERRIDE_PROTECTED_KEYS = frozenset({"model", "stream"})
+
+
+def _normalize_source_response_input(payload: dict[str, JsonValue]) -> None:
+    """Drop only provider-owned reasoning state at a Model Source boundary.
+
+    Codex Desktop can replay encrypted ``reasoning`` items owned by a previous
+    upstream. Those cannot safely move to another provider. Standard OpenAI
+    Responses tool-history items (``function_call`` and
+    ``function_call_output``) must remain structured; flattening them into
+    assistant/user prose can leak internal tool metadata into visible model
+    output and breaks OpenAI-compatible tool semantics.
+    """
+
+    input_items = payload.get("input")
+    if not isinstance(input_items, list):
+        return
+    payload["input"] = [
+        item for item in input_items if not (isinstance(item, dict) and item.get("type") == "reasoning")
+    ]
 
 
 def _apply_source_response_request_overrides(
@@ -4410,47 +5120,177 @@ def _drop_dangling_source_tool_choice(payload: dict[str, JsonValue], kept_types:
         payload.pop("tool_choice", None)
 
 
+async def _account_chat_provider_fallback_response(
+    request: Request,
+    payload: ChatCompletionsRequest,
+    *,
+    model: str,
+    api_key: ApiKeyData | None,
+    rate_limit_headers: Mapping[str, str],
+    account_reservation: ApiKeyUsageReservationData | None = None,
+) -> Response | None:
+    selection = await _select_chat_model_source(
+        model,
+        api_key,
+        raw_model=model,
+        require_streaming=payload.stream is True,
+        allow_native_provider_fallback=True,
+        request=request,
+        payload=payload,
+    )
+    if selection is None:
+        return None
+    await _release_reservation(account_reservation)
+    sources, selected_model = selection
+    reservation = await _enforce_request_limits(
+        api_key,
+        request_model=selected_model,
+        request_service_tier=None,
+    )
+    request.state.model_source_fallback = True
+    return await _source_chat_completion_response(
+        request,
+        payload,
+        sources=sources,
+        model=selected_model,
+        api_key=api_key,
+        reservation=reservation,
+        rate_limit_headers=rate_limit_headers,
+        account_fallback=None,
+    )
+
+
+async def _account_responses_provider_fallback_response(
+    request: Request,
+    payload: ResponsesRequest,
+    *,
+    api_key: ApiKeyData | None,
+    rate_limit_headers: Mapping[str, str],
+) -> Response | None:
+    if not _responses_request_allows_safe_branch_fallback(payload):
+        return None
+    selection = await _select_responses_model_source(
+        payload.model,
+        api_key,
+        raw_model=payload.model,
+        require_streaming=payload.stream is True,
+        allow_native_provider_fallback=True,
+        request=request,
+        payload=payload,
+    )
+    if selection is None:
+        return None
+    sources, selected_model = selection
+    provider_payload = payload.model_copy(deep=True)
+    provider_payload.model = selected_model
+    request.state.model_source_fallback = True
+    return await _source_responses_response(
+        request,
+        provider_payload,
+        sources=sources,
+        api_key=api_key,
+        rate_limit_headers=rate_limit_headers,
+        account_fallback=None,
+    )
+
+
 async def _source_chat_completion_response(
     request: Request,
     payload: ChatCompletionsRequest,
     *,
-    source: ModelSource,
+    sources: list[ModelSource],
     model: str,
     api_key: ApiKeyData | None,
     reservation: ApiKeyUsageReservationData | None,
     rate_limit_headers: Mapping[str, str],
+    account_fallback: Callable[[], Awaitable[Response]] | None = None,
 ) -> Response:
-    source_payload = payload.model_dump(mode="json", exclude_none=True)
-    source_payload["model"] = model
-    source_payload["stream"] = bool(payload.stream)
-    apply_api_key_enforcement_to_chat_payload(source_payload, api_key)
-    sanitize_source_chat_payload(
-        source_payload,
-        allow_reasoning=source_model_supports_reasoning(source, model),
-    )
+    candidates = _source_provider_candidates(sources)
+
+    def build_source_payload(source: ModelSource) -> dict[str, JsonValue]:
+        source_payload = payload.model_dump(mode="json", exclude_none=True)
+        source_payload["model"] = source_model_upstream_slug(source, model)
+        source_payload["stream"] = bool(payload.stream)
+        apply_api_key_enforcement_to_chat_payload(source_payload, api_key)
+        sanitize_source_chat_payload(
+            source_payload,
+            allow_reasoning=source_model_supports_reasoning(source, model),
+        )
+        return source_payload
+
+    def provider_fallback_after(attempt: int) -> Callable[[], Awaitable[Response]] | None:
+        remaining_sources = candidates[attempt + 1 :]
+        if not remaining_sources:
+            return None
+
+        async def fallback() -> Response:
+            fallback_reservation = await _enforce_request_limits(
+                api_key,
+                request_model=model,
+                request_service_tier=None,
+            )
+            return await _source_chat_completion_response(
+                request,
+                payload,
+                sources=remaining_sources,
+                model=model,
+                api_key=api_key,
+                reservation=fallback_reservation,
+                rate_limit_headers=rate_limit_headers,
+                account_fallback=None,
+            )
+
+        return fallback
 
     if payload.stream:
-        stream_options = source_payload.get("stream_options")
-        if isinstance(stream_options, dict):
-            stream_options["include_usage"] = True
-        else:
-            source_payload["stream_options"] = {"include_usage": True}
-        try:
-            stream = await stream_source_chat_completion(source, source_payload)
-        except ModelSourceForwardingError as exc:
+        for attempt, source in enumerate(candidates):
+            source_payload = build_source_payload(source)
+            request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
+            stream_options = source_payload.get("stream_options")
+            if isinstance(stream_options, dict):
+                stream_options["include_usage"] = True
+            else:
+                source_payload["stream_options"] = {"include_usage": True}
+            try:
+                stream = await stream_source_chat_completion(source, source_payload)
+                _remember_sticky_source(
+                    _source_sticky_key(api_key, model=model, request=request, payload=payload),
+                    source,
+                )
+                break
+            except ModelSourceForwardingError as exc:
+                await _log_source_chat_completion(
+                    request,
+                    source=source,
+                    api_key=api_key,
+                    model=model,
+                    status="error",
+                    error_code=_source_error_code(exc.payload),
+                    error_message=_source_error_message(exc.payload),
+                    upstream_status_code=exc.upstream_status_code,
+                )
+                provider_fallback = provider_fallback_after(attempt)
+                await _release_reservation(reservation)
+                if account_fallback is not None and _source_error_allows_account_fallback(exc):
+                    return await _source_account_first_fallback(
+                        request,
+                        account_fallback=account_fallback,
+                        provider_fallback=provider_fallback,
+                    )
+                if provider_fallback is not None and _source_error_allows_provider_fallback(exc):
+                    request.state.model_source_fallback = True
+                    return await provider_fallback()
+                return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        else:  # Defensive: selectors never call this helper with an empty list.
             await _release_reservation(reservation)
-            await _log_source_chat_completion(
+            return _logged_error_json_response(
                 request,
-                source=source,
-                api_key=api_key,
-                model=model,
-                status="error",
-                error_code=_source_error_code(exc.payload),
-                error_message=_source_error_message(exc.payload),
-                upstream_status_code=exc.upstream_status_code,
+                503,
+                openai_error("model_source_unavailable", "No model source is available", error_type="server_error"),
+                headers=rate_limit_headers,
             )
-            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
-        if _reservation_requires_usage(reservation):
+        provider_fallback = provider_fallback_after(attempt)
+        if _reservation_requires_usage(reservation) or account_fallback is not None or provider_fallback is not None:
             return await _buffered_limited_source_chat_stream_response(
                 request,
                 source=source,
@@ -4460,6 +5300,8 @@ async def _source_chat_completion_response(
                 stream=stream.body,
                 usage_holder=stream.usage_holder,
                 rate_limit_headers=rate_limit_headers,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
             )
         body = _source_chat_stream_with_settlement(
             stream.body,
@@ -4476,9 +5318,125 @@ async def _source_chat_completion_response(
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
         )
 
-    try:
-        result = await forward_chat_completion(source, source_payload)
-    except ModelSourceForwardingError as exc:
+    for attempt, source in enumerate(candidates):
+        source_payload = build_source_payload(source)
+        request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
+        try:
+            result = await forward_chat_completion(source, source_payload)
+            _remember_sticky_source(
+                _source_sticky_key(api_key, model=model, request=request, payload=payload),
+                source,
+            )
+        except ModelSourceForwardingError as exc:
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code=_source_error_code(exc.payload),
+                error_message=_source_error_message(exc.payload),
+                upstream_status_code=exc.upstream_status_code,
+            )
+            provider_fallback = provider_fallback_after(attempt)
+            await _release_reservation(reservation)
+            if account_fallback is not None and _source_error_allows_account_fallback(exc):
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            if provider_fallback is not None and _source_error_allows_provider_fallback(exc):
+                request.state.model_source_fallback = True
+                return await provider_fallback()
+            return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        if not _chat_completion_payload_has_assistant_visible_output(result.payload):
+            _forget_sticky_source(
+                _source_sticky_key(api_key, model=model, request=request, payload=payload),
+                source,
+            )
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                usage=result.usage,
+                error_code="empty_assistant_response",
+                error_message="source response contained no assistant-visible text, refusal, or tool call",
+                upstream_status_code=result.upstream_status_code,
+            )
+            await _release_reservation(reservation)
+            provider_fallback = provider_fallback_after(attempt)
+            if account_fallback is not None:
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            if provider_fallback is not None:
+                request.state.model_source_fallback = True
+                return await provider_fallback()
+            return _logged_error_json_response(
+                request,
+                502,
+                _empty_assistant_response_error(),
+                headers=rate_limit_headers,
+            )
+        if _source_completion_is_zero_token(result.usage) and attempt + 1 < len(candidates):
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                usage=result.usage,
+                error_code="source_zero_token_response",
+                error_message="source response reported zero total tokens",
+                upstream_status_code=result.upstream_status_code,
+            )
+            await _release_reservation(reservation)
+            provider_fallback = provider_fallback_after(attempt)
+            if account_fallback is not None:
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            request.state.model_source_fallback = True
+            return await provider_fallback()
+        if result.usage is None and _reservation_requires_usage(reservation) and attempt + 1 < len(candidates):
+            await _log_source_chat_completion(
+                request,
+                source=source,
+                api_key=api_key,
+                model=model,
+                status="error",
+                error_code="usage_unavailable",
+                error_message="source response missing usage",
+                upstream_status_code=result.upstream_status_code,
+            )
+            await _release_reservation(reservation)
+            provider_fallback = provider_fallback_after(attempt)
+            if account_fallback is not None:
+                return await _source_account_first_fallback(
+                    request,
+                    account_fallback=account_fallback,
+                    provider_fallback=provider_fallback,
+                )
+            request.state.model_source_fallback = True
+            return await provider_fallback()
+        break
+    else:  # Defensive: selectors never call this helper with an empty list.
+        await _release_reservation(reservation)
+        return _logged_error_json_response(
+            request,
+            503,
+            openai_error("model_source_unavailable", "No model source is available", error_type="server_error"),
+            headers=rate_limit_headers,
+        )
+
+    if _source_completion_is_zero_token(result.usage):
         await _release_reservation(reservation)
         await _log_source_chat_completion(
             request,
@@ -4486,11 +5444,24 @@ async def _source_chat_completion_response(
             api_key=api_key,
             model=model,
             status="error",
-            error_code=_source_error_code(exc.payload),
-            error_message=_source_error_message(exc.payload),
-            upstream_status_code=exc.upstream_status_code,
+            usage=result.usage,
+            error_code="source_zero_token_response",
+            error_message="source response reported zero total tokens",
+            upstream_status_code=result.upstream_status_code,
         )
-        return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
+        if account_fallback is not None:
+            request.state.model_source_fallback = True
+            return await account_fallback()
+        return _logged_error_json_response(
+            request,
+            502,
+            openai_error(
+                "source_zero_token_response",
+                "OpenAI-compatible model source returned a zero-token response",
+                error_type="server_error",
+            ),
+            headers=rate_limit_headers,
+        )
 
     if result.usage is None and _reservation_requires_usage(reservation):
         await _release_reservation(reservation)
@@ -4552,6 +5523,8 @@ async def _buffered_limited_source_chat_stream_response(
     stream: AsyncIterator[bytes],
     usage_holder: SourceUsageHolder,
     rate_limit_headers: Mapping[str, str],
+    account_fallback: Callable[[], Awaitable[Response]] | None = None,
+    provider_fallback: Callable[[], Awaitable[Response]] | None = None,
 ) -> Response:
     chunks: list[bytes] = []
     total_bytes = 0
@@ -4603,6 +5576,15 @@ async def _buffered_limited_source_chat_stream_response(
             error_message=_source_error_message(exc.payload),
             upstream_status_code=exc.upstream_status_code,
         )
+        if account_fallback is not None and _source_error_allows_account_fallback(exc):
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
+            )
+        if provider_fallback is not None and _source_error_allows_provider_fallback(exc):
+            request.state.model_source_fallback = True
+            return await provider_fallback()
         return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
     except Exception as exc:
         await _release_reservation(reservation)
@@ -4620,7 +5602,80 @@ async def _buffered_limited_source_chat_stream_response(
             error_code="model_source_stream_error",
             error_message=exc.__class__.__name__,
         )
+        if account_fallback is not None:
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
+            )
+        if provider_fallback is not None:
+            request.state.model_source_fallback = True
+            return await provider_fallback()
         return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
+
+    if not _chat_completion_sse_bytes_has_assistant_visible_output(chunks):
+        _forget_sticky_source(
+            _source_sticky_key(api_key, model=model, request=request),
+            source,
+        )
+        await _release_reservation(reservation)
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            usage=usage_holder.usage,
+            error_code="empty_assistant_response",
+            error_message="source stream contained no assistant-visible text, refusal, or tool call",
+        )
+        if account_fallback is not None:
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
+            )
+        if provider_fallback is not None:
+            request.state.model_source_fallback = True
+            return await provider_fallback()
+        return _logged_error_json_response(
+            request,
+            502,
+            _empty_assistant_response_error(),
+            headers=rate_limit_headers,
+        )
+
+    if _source_completion_is_zero_token(usage_holder.usage):
+        await _release_reservation(reservation)
+        await _log_source_chat_completion(
+            request,
+            source=source,
+            api_key=api_key,
+            model=model,
+            status="error",
+            usage=usage_holder.usage,
+            error_code="source_zero_token_response",
+            error_message="source stream reported zero total tokens",
+        )
+        if account_fallback is not None:
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
+            )
+        if provider_fallback is not None:
+            request.state.model_source_fallback = True
+            return await provider_fallback()
+        return _logged_error_json_response(
+            request,
+            502,
+            openai_error(
+                "source_zero_token_response",
+                "OpenAI-compatible model source returned a zero-token stream",
+                error_type="server_error",
+            ),
+            headers=rate_limit_headers,
+        )
 
     if usage_holder.usage is None:
         await _release_reservation(reservation)
@@ -4638,6 +5693,15 @@ async def _buffered_limited_source_chat_stream_response(
             error_code="usage_unavailable",
             error_message="source stream missing usage",
         )
+        if account_fallback is not None:
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=provider_fallback,
+            )
+        if provider_fallback is not None:
+            request.state.model_source_fallback = True
+            return await provider_fallback()
         return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
 
     settled = await _settle_source_reservation(reservation, source=source, model=model, usage=usage_holder.usage)
@@ -4970,11 +6034,25 @@ async def _stream_responses(
     if startup_error is not None:
         if owns_reservation:
             await _release_reservation(reservation)
-        return _stream_startup_error_response(
+        account_error_response = _stream_startup_error_response(
             request,
             startup_error,
             headers=rate_limit_headers,
         )
+        if not forwarded_request and _account_error_allows_provider_fallback(
+            status_code=(startup_error.status_code if isinstance(startup_error, ProxyResponseError) else 502),
+            code=_startup_error_details(startup_error)[0],
+            message=_startup_error_details(startup_error)[1],
+        ):
+            provider_response = await _account_responses_provider_fallback_response(
+                request,
+                payload,
+                api_key=api_key,
+                rate_limit_headers=rate_limit_headers,
+            )
+            if provider_response is not None:
+                return provider_response
+        return account_error_response
     stream = _normalize_public_responses_stream(
         _stream_response_error_events(
             stream,
@@ -5091,6 +6169,25 @@ async def _collect_responses(
         await _release_reservation(reservation)
         error = _parse_error_envelope(exc.payload)
         status_code, error = _mask_previous_response_not_found_error(error, default_status=exc.status_code)
+        if not _responses_request_allows_safe_branch_fallback(payload) or not _account_error_allows_provider_fallback(
+            status_code=status_code,
+            code=error.error.code if error.error else None,
+            message=error.error.message if error.error else None,
+        ):
+            return _logged_error_json_response(
+                request,
+                status_code,
+                error.model_dump(mode="json", exclude_none=True),
+                headers={**captured_turn_state_headers, **rate_limit_headers},
+            )
+        provider_response = await _account_responses_provider_fallback_response(
+            request,
+            payload,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+        )
+        if provider_response is not None:
+            return provider_response
         return _logged_error_json_response(
             request,
             status_code,
@@ -5101,12 +6198,27 @@ async def _collect_responses(
         if response_payload.status == "failed":
             error_payload = _error_envelope_from_response(response_payload.error)
             status_code, error_payload = _mask_previous_response_not_found_error(error_payload)
-            return _logged_error_json_response(
+            account_error_response = _logged_error_json_response(
                 request,
                 status_code,
                 error_payload.model_dump(mode="json", exclude_none=True),
                 headers={**turn_state_headers, **captured_turn_state_headers, **rate_limit_headers},
             )
+            if _account_error_allows_provider_fallback(
+                status_code=status_code,
+                code=error_payload.error.code if error_payload.error else None,
+                message=error_payload.error.message if error_payload.error else None,
+            ):
+                await _release_reservation(reservation)
+                provider_response = await _account_responses_provider_fallback_response(
+                    request,
+                    payload,
+                    api_key=api_key,
+                    rate_limit_headers=rate_limit_headers,
+                )
+                if provider_response is not None:
+                    return provider_response
+            return account_error_response
         return JSONResponse(
             content=response_payload.model_dump(mode="json", exclude_none=True),
             headers={**turn_state_headers, **captured_turn_state_headers, **rate_limit_headers},
@@ -5968,6 +7080,106 @@ def _chat_completion_result_chars(result: ChatCompletion) -> int:
     return total
 
 
+def _chat_completion_has_assistant_visible_output(result: ChatCompletion) -> bool:
+    return _chat_completion_result_chars(result) > 0
+
+
+def _chat_completion_payload_has_assistant_visible_output(payload: Mapping[str, JsonValue]) -> bool:
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+        message = choice.get("message")
+        if not isinstance(message, Mapping):
+            continue
+        for key in ("content", "refusal"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+            if isinstance(value, list) and _json_text_chars(cast(JsonValue, value)) > 0:
+                return True
+        tool_calls = message.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+        function_call = message.get("function_call")
+        if isinstance(function_call, Mapping) and function_call:
+            return True
+    return False
+
+
+def _responses_payload_has_assistant_visible_output(payload: Mapping[str, JsonValue]) -> bool:
+    output = payload.get("output")
+    if not isinstance(output, list):
+        return False
+    for item in output:
+        if not isinstance(item, Mapping):
+            continue
+        item_type = item.get("type")
+        if item_type in {"function_call", "custom_tool_call", "computer_call", "local_shell_call"}:
+            return True
+        if item_type != "message":
+            continue
+        content = item.get("content")
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, Mapping):
+                continue
+            if part.get("type") in {"output_text", "refusal"}:
+                text = part.get("text") or part.get("refusal")
+                if isinstance(text, str) and text.strip():
+                    return True
+    return False
+
+
+def _chat_completion_delta_has_assistant_visible_output(payload: Mapping[str, JsonValue]) -> bool:
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return False
+    for choice in choices:
+        if not isinstance(choice, Mapping):
+            continue
+        delta = choice.get("delta")
+        if not isinstance(delta, Mapping):
+            continue
+        for key in ("content", "refusal"):
+            value = delta.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            return True
+        function_call = delta.get("function_call")
+        if isinstance(function_call, Mapping) and function_call:
+            return True
+    return False
+
+
+async def _probe_chat_completion_stream_visible_output(
+    stream: AsyncIterator[str],
+) -> tuple[AsyncIterator[str], bool]:
+    buffered: list[str] = []
+    async for chunk in stream:
+        buffered.append(chunk)
+        payload = _parse_chat_completion_sse(chunk)
+        if payload is not None and _chat_completion_delta_has_assistant_visible_output(payload):
+            return _prepend_items(buffered, stream), True
+    return _prepend_items(buffered, stream), False
+
+
+def _chat_completion_sse_bytes_has_assistant_visible_output(chunks: list[bytes]) -> bool:
+    body = b"".join(chunks).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    for event in body.split(b"\n\n"):
+        if not event.strip():
+            continue
+        payload = _parse_chat_completion_sse(event.decode("utf-8", errors="replace"))
+        if payload is not None and _chat_completion_delta_has_assistant_visible_output(payload):
+            return True
+    return False
+
+
 async def _probe_chat_stream_startup_error(
     stream: AsyncIterator[str],
     *,
@@ -6553,6 +7765,124 @@ def _source_usage_cost_usd(source: ModelSource, model: str, usage: SourceUsage |
     return 0.0 if cost_usd is None else cost_usd
 
 
+def _source_payload_reasoning_effort(payload: Mapping[str, JsonValue]) -> str | None:
+    direct = payload.get("reasoning_effort")
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip().lower()
+    reasoning = payload.get("reasoning")
+    if isinstance(reasoning, Mapping):
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.strip():
+            return effort.strip().lower()
+    return None
+
+
+def _source_completion_is_zero_token(usage: SourceUsage | None) -> bool:
+    return usage is not None and usage.input_tokens + usage.output_tokens <= 0
+
+
+def _source_provider_candidates(sources: list[ModelSource]) -> list[ModelSource]:
+    """Try regular providers first, then one final fallback-only provider."""
+    regular_sources = [source for source in sources if not _source_is_last_resort(source)]
+    last_resort_sources = [source for source in sources if _source_is_last_resort(source)]
+    return [*regular_sources[:_SOURCE_MAX_PROVIDER_ATTEMPTS], *last_resort_sources[:1]]
+
+
+def _source_error_allows_provider_fallback(exc: ModelSourceForwardingError) -> bool:
+    """Retry failures owned by a provider, not generic client payload errors."""
+    code = (_source_error_code(exc.payload) or "").strip().lower()
+    message = (_source_error_message(exc.payload) or "").strip().lower()
+    if code in _SOURCE_FALLBACK_ERROR_CODES or code in _SOURCE_MODEL_UNAVAILABLE_ERROR_CODES:
+        return True
+    if exc.status_code in {401, 403, 408, 409, 405, 415, 425, 429} or exc.status_code >= 500:
+        return True
+    return exc.status_code in {400, 404, 422} and any(
+        fragment in message for fragment in _SOURCE_MODEL_UNAVAILABLE_MESSAGE_FRAGMENTS
+    )
+
+
+def _source_error_allows_account_fallback(exc: ModelSourceForwardingError) -> bool:
+    # The account branch is another upstream route, so only provider-owned
+    # failures are eligible. Generic client payload errors must stop here.
+    return _source_error_allows_provider_fallback(exc)
+
+
+def _account_error_allows_provider_fallback(
+    *,
+    status_code: int,
+    code: str | None,
+    message: str | None,
+) -> bool:
+    normalized_code = (code or "").strip().lower()
+    normalized_message = (message or "").strip().lower()
+    # This helper runs only after the account branch has been selected, so
+    # quota errors here belong to the upstream account. Downstream API-key
+    # quota is enforced before branch selection and cannot reach this path.
+    if normalized_code in {"usage_limit_reached", "insufficient_quota"}:
+        return True
+    if normalized_code == "rate_limit_exceeded" and "usage resets at" in normalized_message:
+        return False
+    if normalized_code in {
+        "account_model_unsupported",
+        "model_not_supported",
+        "no_accounts",
+        "no_available_accounts",
+        "quota_exhausted",
+        "previous_response_owner_unavailable",
+        "upstream_error",
+        "upstream_rate_limit",
+        *_SOURCE_FALLBACK_ERROR_CODES,
+        *_SOURCE_MODEL_UNAVAILABLE_ERROR_CODES,
+    }:
+        return True
+    if status_code in {401, 403, 408, 409, 425, 429} or status_code >= 500:
+        return True
+    return status_code in {400, 404, 422} and any(
+        fragment in normalized_message for fragment in _SOURCE_MODEL_UNAVAILABLE_MESSAGE_FRAGMENTS
+    )
+
+
+def _account_response_allows_provider_fallback(response: Response) -> bool:
+    """Return whether an account branch may try another provider before visible output."""
+    try:
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+    except (AttributeError, JSONDecodeError, UnicodeDecodeError):
+        payload = None
+    if response.status_code < 400:
+        if not isinstance(payload, Mapping):
+            return False
+        response_payload = cast(Mapping[str, JsonValue], payload)
+        if response_payload.get("object") == "response":
+            return not _responses_payload_has_assistant_visible_output(response_payload)
+        if response_payload.get("object") == "chat.completion":
+            return not _chat_completion_payload_has_assistant_visible_output(response_payload)
+        return False
+    code: str | None = None
+    message: str | None = None
+    if isinstance(payload, Mapping):
+        code, message = _error_details_from_content(cast(Mapping[str, JsonValue], payload))
+    return _account_error_allows_provider_fallback(
+        status_code=response.status_code,
+        code=code,
+        message=message,
+    )
+
+
+async def _source_account_first_fallback(
+    request: Request,
+    *,
+    account_fallback: Callable[[], Awaitable[Response]],
+    provider_fallback: Callable[[], Awaitable[Response]] | None,
+) -> Response:
+    """Try the account pool once (internally up to 3 accounts), then providers."""
+    request.state.model_source_fallback = True
+    response = await account_fallback()
+    if provider_fallback is not None and _account_response_allows_provider_fallback(response):
+        request.state.model_source_fallback = True
+        return await provider_fallback()
+    return response
+
+
 async def _log_source_chat_completion(
     request: Request,
     *,
@@ -6577,6 +7907,7 @@ async def _log_source_chat_completion(
                 api_key_id=api_key.id if api_key is not None else None,
                 request_id=ensure_request_id(),
                 model=model,
+                reasoning_effort=getattr(request.state, "oaic_reasoning_effort", None),
                 input_tokens=usage.input_tokens if usage is not None else None,
                 output_tokens=usage.output_tokens if usage is not None else None,
                 cached_input_tokens=usage.cached_input_tokens if usage is not None else None,
@@ -6620,6 +7951,14 @@ def _source_usage_settlement_failed_error() -> OpenAIErrorEnvelope:
     return openai_error(
         "usage_settlement_failed",
         "OpenAI-compatible model source usage could not be settled",
+        error_type="server_error",
+    )
+
+
+def _empty_assistant_response_error() -> OpenAIErrorEnvelope:
+    return openai_error(
+        "empty_assistant_response",
+        "Upstream completed without assistant-visible text, refusal, or tool call",
         error_type="server_error",
     )
 

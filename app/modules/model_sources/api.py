@@ -25,6 +25,7 @@ router = APIRouter(
 )
 
 
+@router.get("", response_model=ModelSourcesResponse, include_in_schema=False)
 @router.get("/", response_model=ModelSourcesResponse)
 async def list_model_sources(
     context: ModelSourcesContext = Depends(get_model_sources_context),
@@ -32,6 +33,7 @@ async def list_model_sources(
     return ModelSourcesResponse(sources=await context.service.list_sources())
 
 
+@router.post("", response_model=ModelSourceResponse, include_in_schema=False)
 @router.post("/", response_model=ModelSourceResponse)
 async def create_model_source(
     request: Request,

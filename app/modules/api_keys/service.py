@@ -51,6 +51,12 @@ _EXPIRING_KEY_PREFIX = "sk-amin"
 TRAFFIC_CLASS_FOREGROUND = "foreground"
 TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 _SUPPORTED_TRAFFIC_CLASSES = frozenset({TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC})
+ROUTING_MODE_BALANCED = "balanced"
+ROUTING_MODE_ACCOUNT_FIRST = "account_first"
+ROUTING_MODE_PROVIDER_FIRST = "provider_first"
+_SUPPORTED_ROUTING_MODES = frozenset(
+    {ROUTING_MODE_BALANCED, ROUTING_MODE_ACCOUNT_FIRST, ROUTING_MODE_PROVIDER_FIRST}
+)
 _SUPPORTED_TRANSPORT_POLICY_OVERRIDES = frozenset({"smart", "always_http", "always_websocket"})
 
 
@@ -88,6 +94,7 @@ class ApiKeysRepositoryProtocol(Protocol):
         enforced_reasoning_effort: str | None | _Unset = ...,
         enforced_service_tier: str | None | _Unset = ...,
         traffic_class: str | _Unset = ...,
+        routing_mode: str | _Unset = ...,
         transport_policy_override: str | None | _Unset = ...,
         usage_sections: str | _Unset = ...,
         account_assignment_scope_enabled: bool | _Unset = ...,
@@ -280,6 +287,7 @@ class ApiKeyCreateData:
     expires_at: datetime | None = None
     assigned_account_ids: list[str] | None = None
     assigned_source_ids: list[str] | None = None
+    routing_mode: str = ROUTING_MODE_BALANCED
     limits: list[LimitRuleInput] = field(default_factory=list)
 
 
@@ -311,6 +319,8 @@ class ApiKeyUpdateData:
     assigned_account_ids_set: bool = False
     assigned_source_ids: list[str] | None = None
     assigned_source_ids_set: bool = False
+    routing_mode: str | None = None
+    routing_mode_set: bool = False
     limits: list[LimitRuleInput] | None = None
     limits_set: bool = False
     reset_usage: bool = False
@@ -339,6 +349,7 @@ class ApiKeyData:
     source_assignment_scope_enabled: bool = False
     assigned_account_ids: list[str] = field(default_factory=list)
     assigned_source_ids: list[str] = field(default_factory=list)
+    routing_mode: str = ROUTING_MODE_BALANCED
     pooled_credits: "PooledCreditData | None" = None
 
 
@@ -468,6 +479,7 @@ class ApiKeysService:
         traffic_class = _normalize_traffic_class(payload.traffic_class)
         transport_policy_override = _normalize_transport_policy_override(payload.transport_policy_override)
         usage_sections = _normalize_usage_sections(payload.usage_sections)
+        routing_mode = _normalize_routing_mode(payload.routing_mode)
         _validate_model_enforcement(enforced_model=enforced_model, allowed_models=normalized_allowed_models)
         row = ApiKey(
             id=str(__import__("uuid").uuid4()),
@@ -481,6 +493,7 @@ class ApiKeysService:
             enforced_service_tier=enforced_service_tier,
             account_assignment_scope_enabled=bool(assigned_account_ids),
             source_assignment_scope_enabled=bool(assigned_source_ids),
+            routing_mode=routing_mode,
             traffic_class=traffic_class,
             transport_policy_override=transport_policy_override,
             usage_sections=usage_sections,
@@ -617,6 +630,9 @@ class ApiKeysService:
         usage_sections: str | _Unset = _UNSET
         if payload.usage_sections_set:
             usage_sections = _normalize_usage_sections(payload.usage_sections)
+        routing_mode: str | _Unset = _UNSET
+        if payload.routing_mode_set:
+            routing_mode = _normalize_routing_mode(payload.routing_mode)
 
         if payload.allowed_models_set or payload.enforced_model_set:
             effective_allowed_models = (
@@ -662,6 +678,7 @@ class ApiKeysService:
                 traffic_class=traffic_class_update,
                 transport_policy_override=transport_policy_override_update,
                 usage_sections=usage_sections,
+                routing_mode=routing_mode,
                 account_assignment_scope_enabled=account_assignment_scope_enabled,
                 source_assignment_scope_enabled=source_assignment_scope_enabled,
                 expires_at=expires_at if payload.expires_at_set else _UNSET,
@@ -699,6 +716,7 @@ class ApiKeysService:
             or payload.traffic_class_set
             or payload.transport_policy_override_set
             or payload.usage_sections_set
+            or payload.routing_mode_set
             or payload.expires_at_set
             or payload.is_active_set
         ):
@@ -1398,6 +1416,19 @@ def _normalize_service_tier_lenient(value: str | None) -> str | None:
     return None
 
 
+def _normalize_routing_mode(value: str | None) -> str:
+    normalized = (value or ROUTING_MODE_BALANCED).strip().lower()
+    if normalized not in _SUPPORTED_ROUTING_MODES:
+        options = ", ".join(sorted(_SUPPORTED_ROUTING_MODES))
+        raise ApiKeyValidationError(f"Unsupported routing mode '{normalized}'. Expected one of: {options}")
+    return normalized
+
+
+def _normalize_routing_mode_lenient(value: str | None) -> str:
+    normalized = (value or ROUTING_MODE_BALANCED).strip().lower()
+    return normalized if normalized in _SUPPORTED_ROUTING_MODES else ROUTING_MODE_BALANCED
+
+
 def _normalize_traffic_class(value: str | None) -> str:
     normalized = (value or TRAFFIC_CLASS_FOREGROUND).strip().lower()
     if normalized not in _SUPPORTED_TRAFFIC_CLASSES:
@@ -1648,6 +1679,7 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         source_assignment_scope_enabled=data.source_assignment_scope_enabled,
         assigned_account_ids=data.assigned_account_ids,
         assigned_source_ids=data.assigned_source_ids,
+        routing_mode=data.routing_mode,
         key=key,
     )
 
@@ -1685,6 +1717,7 @@ def _to_api_key_data(
         source_assignment_scope_enabled=getattr(row, "source_assignment_scope_enabled", False),
         assigned_account_ids=[assignment.account_id for assignment in account_assignments],
         assigned_source_ids=[assignment.source_id for assignment in source_assignments],
+        routing_mode=_normalize_routing_mode_lenient(getattr(row, "routing_mode", None)),
         pooled_credits=pooled_credits,
     )
 

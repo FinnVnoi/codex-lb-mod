@@ -59,6 +59,7 @@ class ModelSourcesService:
             supports_audio_transcriptions=payload.supports_audio_transcriptions,
             timeout_seconds=payload.timeout_seconds,
             max_concurrency=payload.max_concurrency,
+            routing_policy=payload.routing_policy,
             models=model_rows,
         )
         try:
@@ -92,6 +93,8 @@ class ModelSourcesService:
             row.timeout_seconds = payload.timeout_seconds
         if "max_concurrency" in fields:
             row.max_concurrency = payload.max_concurrency
+        if "routing_policy" in fields and payload.routing_policy is not None:
+            row.routing_policy = payload.routing_policy
 
         models_replaced = False
         try:
@@ -165,6 +168,11 @@ def _model_inputs_to_rows(models: list[ModelSourceModelInput]) -> list[ModelSour
         rows.append(
             ModelSourceModel(
                 model=model,
+                upstream_model=(
+                    _normalize_model_slug(item.upstream_model)
+                    if item.upstream_model is not None and item.upstream_model.strip()
+                    else None
+                ),
                 display_name=item.display_name.strip() if item.display_name else None,
                 context_window=item.context_window,
                 max_output_tokens=item.max_output_tokens,
@@ -196,6 +204,7 @@ def _to_model_response(row: ModelSourceModel) -> ModelSourceModelResponse:
         id=row.id,
         source_id=row.source_id,
         model=row.model,
+        upstream_model=row.upstream_model,
         display_name=row.display_name,
         context_window=row.context_window,
         max_output_tokens=row.max_output_tokens,
@@ -226,6 +235,7 @@ def _to_response(row: ModelSource) -> ModelSourceResponse:
         supports_audio_transcriptions=row.supports_audio_transcriptions,
         timeout_seconds=row.timeout_seconds,
         max_concurrency=row.max_concurrency,
+        routing_policy=row.routing_policy,
         created_at=row.created_at,
         updated_at=row.updated_at,
         models=[_to_model_response(model) for model in row.models],

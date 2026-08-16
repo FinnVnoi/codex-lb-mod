@@ -14,15 +14,21 @@ from app.modules.usage.additional_quota_keys import (
 @dataclass(frozen=True, slots=True)
 class DashboardSettingsData:
     sticky_threads_enabled: bool
+    model_source_sticky_enabled: bool
+    model_source_sticky_ttl_seconds: int
     upstream_stream_transport: str
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str
     proxy_account_response_create_limit: int
     proxy_account_stream_limit: int
     proxy_account_stream_recovery_reserve: int
+    overload_cooldown_seconds: int
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None
     prefer_earlier_reset_accounts: bool
+    prefer_unstarted_quota_accounts: bool
+    prefer_unstarted_quota_window: str
+    prefer_earlier_renewal_accounts: bool
     prefer_earlier_reset_window: str
     show_reset_credit_badges: bool
     auto_redeem_reset_credits_before_expiry: bool
@@ -68,15 +74,21 @@ class DashboardSettingsData:
 @dataclass(frozen=True, slots=True)
 class DashboardSettingsUpdateData:
     sticky_threads_enabled: bool
+    model_source_sticky_enabled: bool
+    model_source_sticky_ttl_seconds: int
     upstream_stream_transport: str
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str
     proxy_account_response_create_limit: int | None
     proxy_account_stream_limit: int | None
     proxy_account_stream_recovery_reserve: int | None
+    overload_cooldown_seconds: int
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None
     prefer_earlier_reset_accounts: bool
+    prefer_unstarted_quota_accounts: bool
+    prefer_unstarted_quota_window: str
+    prefer_earlier_renewal_accounts: bool
     prefer_earlier_reset_window: str
     show_reset_credit_badges: bool
     auto_redeem_reset_credits_before_expiry: bool
@@ -126,6 +138,8 @@ class SettingsService:
         row = await self._repository.get_or_create()
         return DashboardSettingsData(
             sticky_threads_enabled=row.sticky_threads_enabled,
+            model_source_sticky_enabled=row.model_source_sticky_enabled,
+            model_source_sticky_ttl_seconds=row.model_source_sticky_ttl_seconds,
             upstream_stream_transport=row.upstream_stream_transport,
             prohibit_fast_mode=row.prohibit_fast_mode,
             http_downstream_transport_policy=row.http_downstream_transport_policy,
@@ -136,9 +150,13 @@ class SettingsService:
             proxy_account_stream_recovery_reserve=_effective_stream_recovery_reserve(
                 row.proxy_account_stream_recovery_reserve
             ),
+            overload_cooldown_seconds=row.overload_cooldown_seconds,
             upstream_proxy_routing_enabled=row.upstream_proxy_routing_enabled,
             upstream_proxy_default_pool_id=row.upstream_proxy_default_pool_id,
             prefer_earlier_reset_accounts=row.prefer_earlier_reset_accounts,
+            prefer_unstarted_quota_accounts=row.prefer_unstarted_quota_accounts,
+            prefer_unstarted_quota_window=row.prefer_unstarted_quota_window,
+            prefer_earlier_renewal_accounts=row.prefer_earlier_renewal_accounts,
             prefer_earlier_reset_window=row.prefer_earlier_reset_window,
             show_reset_credit_badges=row.show_reset_credit_badges,
             auto_redeem_reset_credits_before_expiry=row.auto_redeem_reset_credits_before_expiry,
@@ -197,15 +215,21 @@ class SettingsService:
         row = await self._repository.update(
             expected_version=expected_version,
             sticky_threads_enabled=payload.sticky_threads_enabled,
+            model_source_sticky_enabled=payload.model_source_sticky_enabled,
+            model_source_sticky_ttl_seconds=payload.model_source_sticky_ttl_seconds,
             upstream_stream_transport=payload.upstream_stream_transport,
             prohibit_fast_mode=payload.prohibit_fast_mode,
             http_downstream_transport_policy=payload.http_downstream_transport_policy,
             proxy_account_response_create_limit=payload.proxy_account_response_create_limit,
             proxy_account_stream_limit=payload.proxy_account_stream_limit,
             proxy_account_stream_recovery_reserve=payload.proxy_account_stream_recovery_reserve,
+            overload_cooldown_seconds=payload.overload_cooldown_seconds,
             upstream_proxy_routing_enabled=payload.upstream_proxy_routing_enabled,
             upstream_proxy_default_pool_id=payload.upstream_proxy_default_pool_id,
             prefer_earlier_reset_accounts=payload.prefer_earlier_reset_accounts,
+            prefer_unstarted_quota_accounts=payload.prefer_unstarted_quota_accounts,
+            prefer_unstarted_quota_window=payload.prefer_unstarted_quota_window,
+            prefer_earlier_renewal_accounts=payload.prefer_earlier_renewal_accounts,
             prefer_earlier_reset_window=payload.prefer_earlier_reset_window,
             show_reset_credit_badges=payload.show_reset_credit_badges,
             auto_redeem_reset_credits_before_expiry=payload.auto_redeem_reset_credits_before_expiry,
@@ -250,6 +274,8 @@ class SettingsService:
         )
         return DashboardSettingsData(
             sticky_threads_enabled=row.sticky_threads_enabled,
+            model_source_sticky_enabled=row.model_source_sticky_enabled,
+            model_source_sticky_ttl_seconds=row.model_source_sticky_ttl_seconds,
             upstream_stream_transport=row.upstream_stream_transport,
             prohibit_fast_mode=row.prohibit_fast_mode,
             http_downstream_transport_policy=row.http_downstream_transport_policy,
@@ -260,9 +286,13 @@ class SettingsService:
             proxy_account_stream_recovery_reserve=_effective_stream_recovery_reserve(
                 row.proxy_account_stream_recovery_reserve
             ),
+            overload_cooldown_seconds=row.overload_cooldown_seconds,
             upstream_proxy_routing_enabled=row.upstream_proxy_routing_enabled,
             upstream_proxy_default_pool_id=row.upstream_proxy_default_pool_id,
             prefer_earlier_reset_accounts=row.prefer_earlier_reset_accounts,
+            prefer_unstarted_quota_accounts=row.prefer_unstarted_quota_accounts,
+            prefer_unstarted_quota_window=row.prefer_unstarted_quota_window,
+            prefer_earlier_renewal_accounts=row.prefer_earlier_renewal_accounts,
             prefer_earlier_reset_window=row.prefer_earlier_reset_window,
             show_reset_credit_badges=row.show_reset_credit_badges,
             auto_redeem_reset_credits_before_expiry=row.auto_redeem_reset_credits_before_expiry,

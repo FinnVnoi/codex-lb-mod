@@ -643,12 +643,14 @@ class _TransientStreamError(Exception):
         *,
         preserve_on_selection_exhausted: bool = False,
         account_health_error: bool = False,
+        response_id: str | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
         self.error = error
         self.preserve_on_selection_exhausted = preserve_on_selection_exhausted
         self.account_health_error = account_health_error
+        self.response_id = response_id
 
 
 class _TerminalStreamError(Exception):
@@ -680,6 +682,7 @@ class _StreamSettlement:
     record_success: bool = True
     downstream_visible: bool = False
     downstream_text_visible: bool = False
+    downstream_side_effect_visible: bool = False
     response_id: str | None = None
     usage_settlement_transferred: bool = False
 
@@ -932,6 +935,7 @@ class _HTTPBridgeSession:
     upstream_proxy_endpoint_id: str | None = None
     upstream_proxy_fallback_used: bool | None = None
     upstream_proxy_fail_closed_reason: str | None = None
+    quarantine_durable_on_close: bool = False
 
 
 def _http_bridge_session_supports_service_tier(

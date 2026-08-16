@@ -4,13 +4,55 @@ import base64
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from uuid import uuid4
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 DEFAULT_EMAIL = "unknown@example.com"
 DEFAULT_PLAN = "unknown"
+
+
+def _parse_claim_datetime(value: object) -> datetime | None:
+    """Parse OpenAI subscription timestamps without rejecting the whole JWT.
+
+    The subscription claims have appeared as ISO-8601 strings in current
+    Codex/CPA tokens, while older token tooling deliberately modeled them as
+    ``any``. Accept Unix seconds/milliseconds too and treat malformed optional
+    values as absent so one bad entitlement timestamp cannot hide all identity
+    claims from an otherwise usable token.
+    """
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        numeric: float | None = None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            numeric = float(value)
+        elif isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                numeric = float(text)
+            except ValueError:
+                try:
+                    parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+                except ValueError:
+                    return None
+        else:
+            return None
+        if numeric is not None:
+            if abs(numeric) >= 100_000_000_000:
+                numeric /= 1000
+            try:
+                parsed = datetime.fromtimestamp(numeric, tz=timezone.utc)
+            except (OverflowError, OSError, ValueError):
+                return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 class AuthTokens(BaseModel):
@@ -92,6 +134,8 @@ class OpenAIAuthClaims(BaseModel):
         ),
     )
     chatgpt_plan_type: str | None = None
+    chatgpt_subscription_active_start: datetime | None = None
+    chatgpt_subscription_active_until: datetime | None = None
     workspace_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -121,6 +165,15 @@ class OpenAIAuthClaims(BaseModel):
         ),
     )
 
+    @field_validator(
+        "chatgpt_subscription_active_start",
+        "chatgpt_subscription_active_until",
+        mode="before",
+    )
+    @classmethod
+    def _parse_subscription_datetime(cls, value: object) -> datetime | None:
+        return _parse_claim_datetime(value)
+
 
 class OpenAIProfileClaims(BaseModel):
     model_config = ConfigDict(extra="ignore")
@@ -142,6 +195,8 @@ class IdTokenClaims(BaseModel):
         ),
     )
     chatgpt_plan_type: str | None = None
+    chatgpt_subscription_active_start: datetime | None = None
+    chatgpt_subscription_active_until: datetime | None = None
     workspace_id: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -179,6 +234,15 @@ class IdTokenClaims(BaseModel):
         default=None,
         alias="https://api.openai.com/profile",
     )
+
+    @field_validator(
+        "chatgpt_subscription_active_start",
+        "chatgpt_subscription_active_until",
+        mode="before",
+    )
+    @classmethod
+    def _parse_subscription_datetime(cls, value: object) -> datetime | None:
+        return _parse_claim_datetime(value)
 
 
 @dataclass

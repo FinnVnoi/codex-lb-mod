@@ -27,6 +27,7 @@ class LimitRuleResponse(DashboardModel):
 class ApiKeyCreateRequest(DashboardModel):
     name: str = Field(min_length=1, max_length=128)
     allowed_models: list[str] | None = None
+    routing_mode: str = Field(default="balanced", pattern=r"^(balanced|account_first|provider_first)$")
     apply_to_codex_model: bool = False
     enforced_model: str | None = Field(default=None, min_length=1)
     enforced_reasoning_effort: str | None = Field(
@@ -46,6 +47,9 @@ class ApiKeyCreateRequest(DashboardModel):
 class ApiKeyUpdateRequest(DashboardModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     allowed_models: list[str] | None = None
+    routing_mode: str | None = Field(
+        default=None, pattern=r"^(balanced|account_first|provider_first)$"
+    )
     apply_to_codex_model: bool | None = None
     enforced_model: str | None = Field(default=None, min_length=1)
     enforced_reasoning_effort: str | None = Field(
@@ -89,6 +93,7 @@ class ApiKeyResponse(DashboardModel):
     source_assignment_scope_enabled: bool = False
     assigned_account_ids: list[str] = Field(default_factory=list)
     assigned_source_ids: list[str] = Field(default_factory=list)
+    routing_mode: str = "balanced"
     created_at: datetime
     last_used_at: datetime | None
     limits: list[LimitRuleResponse] = Field(default_factory=list)

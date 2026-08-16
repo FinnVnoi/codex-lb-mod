@@ -14,6 +14,7 @@ describe("DashboardSettingsSchema", () => {
       upstreamProxyRoutingEnabled: true,
       upstreamProxyDefaultPoolId: "pool_1",
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "relative_availability",
       preferEarlierResetWindow: "secondary",
       showResetCreditBadges: false,
@@ -87,6 +88,7 @@ describe("DashboardSettingsSchema", () => {
     const parsed = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       stickyReallocationBudgetThresholdPct: 95,
@@ -129,6 +131,7 @@ describe("DashboardSettingsSchema", () => {
       stickyThreadsEnabled: true,
       upstreamStreamTransport: "default",
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "round_robin",
       openaiCacheAffinityMaxAgeSeconds: 300,
       dashboardSessionTtlSeconds: 43200,
@@ -148,6 +151,7 @@ describe("DashboardSettingsSchema", () => {
       stickyThreadsEnabled: true,
       upstreamStreamTransport: "default",
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "round_robin",
       openaiCacheAffinityMaxAgeSeconds: 300,
       dashboardSessionTtlSeconds: 43200,
@@ -173,6 +177,7 @@ describe("SettingsUpdateRequestSchema", () => {
       upstreamProxyRoutingEnabled: true,
       upstreamProxyDefaultPoolId: null,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "relative_availability",
       preferEarlierResetWindow: "secondary",
       showResetCreditBadges: false,
@@ -240,6 +245,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       dashboardSessionTtlSeconds: 31536000,
     });
 
@@ -250,6 +256,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
     });
 
     expect(parsed.upstreamStreamTransport).toBeUndefined();
@@ -279,6 +286,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const result = SettingsUpdateRequestSchema.safeParse({
       stickyThreadsEnabled: "yes",
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
     });
 
     expect(result.success).toBe(false);
@@ -294,6 +302,7 @@ describe("SettingsUpdateRequestSchema", () => {
         SettingsUpdateRequestSchema.safeParse({
           stickyThreadsEnabled: false,
           preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
           ...payload,
         }).success,
       ).toBe(false);
@@ -305,6 +314,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         proxyAccountStreamLimit: 2,
         proxyAccountStreamRecoveryReserve: 3,
       }).success,
@@ -315,6 +325,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: true,
       totpRequiredOnLogin: false,
       totpConfigured: false,
@@ -331,6 +342,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "fill_first",
     });
 
@@ -341,6 +353,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const result = SettingsUpdateRequestSchema.safeParse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "fill_last",
     });
 
@@ -352,6 +365,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         weeklyPaceWorkingDays: "0,1,7",
       }).success,
     ).toBe(false);
@@ -362,6 +376,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         weeklyPaceSmoothingMinutes: 45,
       }).success,
     ).toBe(false);
@@ -372,6 +387,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupModel: "m".repeat(129),
       }).success,
     ).toBe(false);
@@ -379,6 +395,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupPrompt: "p".repeat(513),
       }).success,
     ).toBe(false);
@@ -389,6 +406,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupExhaustedThresholdPercent: 0,
       }).success,
     ).toBe(false);
@@ -396,6 +414,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupExhaustedThresholdPercent: 100.1,
       }).success,
     ).toBe(false);
@@ -441,6 +460,7 @@ describe("retention fields", () => {
     const withValues = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       totpConfigured: false,
@@ -458,6 +478,7 @@ describe("retention fields", () => {
     const withoutValues = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       totpConfigured: false,

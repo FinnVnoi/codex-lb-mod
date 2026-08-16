@@ -20,6 +20,7 @@ function createModelSource(overrides: Partial<ModelSource> = {}): ModelSource {
     supportsAudioTranscriptions: false,
     timeoutSeconds: null,
     maxConcurrency: null,
+    routingPolicy: "normal",
     createdAt: "2026-07-03T00:00:00Z",
     updatedAt: "2026-07-03T00:00:00Z",
     models: [
@@ -27,6 +28,7 @@ function createModelSource(overrides: Partial<ModelSource> = {}): ModelSource {
         id: 1,
         sourceId: "src_1",
         model: "Qwen/Qwen3.6-27B-FP8",
+        upstreamModel: null,
         displayName: "Qwen/Qwen3.6-27B-FP8",
         contextWindow: 32768,
         maxOutputTokens: 4096,
@@ -61,7 +63,9 @@ describe("ModelSourceEditDialog", () => {
 
     expect(screen.getByLabelText("Name")).toHaveValue("vllm-local");
     expect(screen.getByLabelText("Base URL")).toHaveValue("http://127.0.0.1:8000/v1");
-    expect(screen.getByDisplayValue("Qwen/Qwen3.6-27B-FP8")).toBeInTheDocument();
+    expect(screen.getByLabelText("Public model ID")).toHaveValue("Qwen/Qwen3.6-27B-FP8");
+    expect(screen.getByLabelText("Upstream model ID")).toHaveValue("Qwen/Qwen3.6-27B-FP8");
+    expect(screen.getByRole("checkbox", { name: "Enabled" })).toBeChecked();
     expect(screen.getByDisplayValue("0.5")).toBeInTheDocument();
     expect(screen.getByDisplayValue("1.5")).toBeInTheDocument();
   });
@@ -136,9 +140,9 @@ describe("ModelSourceEditDialog", () => {
       />,
     );
 
-    const outputPrice = screen.getByDisplayValue("1.5");
-    await user.clear(outputPrice);
-    await user.type(outputPrice, "2.0");
+    const outputPrices = screen.getAllByDisplayValue("1.5");
+    await user.clear(outputPrices[0]);
+    await user.type(outputPrices[0], "2.0");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await waitFor(() => {
@@ -158,14 +162,14 @@ describe("ModelSourceEditDialog", () => {
           model: "disabled-model",
           isEnabled: false,
           contextWindow: 4096,
-          outputPer1M: 2,
+          outputPer1M: 1.5,
           supportsVision: false,
         }),
       ]),
     );
   });
 
-  it("omits model rows when only source-level fields changed", async () => {
+  it("preserves per-model rows when only source-level fields changed", async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn().mockResolvedValue(undefined);
     const source = createModelSource({
@@ -208,7 +212,12 @@ describe("ModelSourceEditDialog", () => {
 
     const payload = onSubmit.mock.calls[0][1];
     expect(payload.name).toBe("vllm-local-updated");
-    expect(payload.models).toBeUndefined();
+    expect(payload.models).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ model: "m-one", contextWindow: 2048, outputPer1M: 1 }),
+        expect.objectContaining({ model: "m-two", contextWindow: 4096, outputPer1M: 2 }),
+      ]),
+    );
   });
 
   it("prefills and submits the audio per-minute rate", async () => {

@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { EmptyState } from "@/components/empty-state";
 import { StatusBadge } from "@/components/status-badge";
+import { SubscriptionRenewal } from "@/features/accounts/components/subscription-renewal";
 import { Button } from "@/components/ui/button";
 import type { AccountAction } from "@/features/dashboard/components/account-card";
 import type { AccountSummary } from "@/features/dashboard/schemas";
@@ -21,7 +22,7 @@ import {
 
 const ACCOUNT_LIST_VISIBLE_ROWS = 8;
 const ACCOUNT_LIST_ROW_HEIGHT_REM = 4.5;
-const ACCOUNT_LIST_COLUMNS = "minmax(13rem,1.3fr) 7.75rem 5rem minmax(14rem,1.2fr) 6rem minmax(8rem,0.8fr) 6.5rem";
+const ACCOUNT_LIST_COLUMNS = "minmax(13rem,1.3fr) 7.75rem 5rem minmax(14rem,1.2fr) 6rem minmax(8rem,0.8fr) minmax(8.5rem,0.75fr) 6.5rem";
 
 type AccountListProps = {
   accounts: AccountSummary[];
@@ -31,7 +32,7 @@ type AccountListProps = {
   onAction?: (account: AccountSummary, action: AccountAction) => void;
 };
 
-export type AccountListSortKey = "account" | "status" | "plan" | "quota" | "credits" | "warmup";
+export type AccountListSortKey = "account" | "status" | "plan" | "quota" | "credits" | "warmup" | "renewal";
 export type SortDirection = "asc" | "desc";
 export type AccountListSort = {
   key: AccountListSortKey;
@@ -45,6 +46,7 @@ const SORTABLE_HEADERS: Array<{ key: AccountListSortKey; label: string }> = [
   { key: "quota", label: "Quota" },
   { key: "credits", label: "Credits" },
   { key: "warmup", label: "Warm-up" },
+  { key: "renewal", label: "Renewal" },
 ];
 
 const SORTABLE_HEADER_KEY: Record<AccountListSortKey, string> = {
@@ -54,6 +56,7 @@ const SORTABLE_HEADER_KEY: Record<AccountListSortKey, string> = {
   quota: "dashboard.accountList.headers.quota",
   credits: "dashboard.accountList.headers.credits",
   warmup: "dashboard.accountList.headers.warmup",
+  renewal: "dashboard.accountList.headers.renewal",
 };
 
 function formatWarmupWindow(window: string): string {
@@ -195,13 +198,20 @@ function compareAccountsBySort(a: AccountSummary, b: AccountSummary, sort: Accou
     case "warmup":
       result = compareText(accountWarmupSortValue(a), accountWarmupSortValue(b));
       break;
+    case "renewal":
+      result = compareNullableNumber(
+        a.subscriptionActiveUntil ? new Date(a.subscriptionActiveUntil).getTime() : null,
+        b.subscriptionActiveUntil ? new Date(b.subscriptionActiveUntil).getTime() : null,
+        sort.direction,
+      );
+      break;
   }
 
   if (result === 0) {
     result = compareText(accountTitle(a), accountTitle(b));
     return sort.direction === "asc" ? result : -result;
   }
-  if (sort.key === "quota" || sort.key === "credits") {
+  if (sort.key === "quota" || sort.key === "credits" || sort.key === "renewal") {
     return result;
   }
   return sort.direction === "asc" ? result : -result;
@@ -325,7 +335,7 @@ export function AccountList({
       className="overflow-x-auto rounded-lg border bg-card"
     >
       <div
-        className="min-w-[54rem] divide-y overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
+        className="min-w-[64rem] divide-y overflow-y-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden"
         style={{ maxHeight: `${ACCOUNT_LIST_VISIBLE_ROWS * ACCOUNT_LIST_ROW_HEIGHT_REM}rem` }}
       >
         <div
@@ -404,6 +414,12 @@ export function AccountList({
 	                </p>
                 <p className="truncate text-[11px] text-muted-foreground">{warmupDetail}</p>
               </div>
+              <SubscriptionRenewal
+                activeUntil={account.subscriptionActiveUntil}
+                showIcon
+                showLabel={false}
+                className="text-xs"
+              />
               <div className="flex justify-end gap-1">
                 <Button
                   type="button"

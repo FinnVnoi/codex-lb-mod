@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import InstrumentedAttribute, selectinload
 
 from app.db.models import ModelSource, ModelSourceModel
 
@@ -32,6 +32,50 @@ class ModelSourcesRepository:
         )
         return result.scalar_one_or_none()
 
+    def _model_source_stmt(
+        self,
+        model: str,
+        *,
+        capability_column: InstrumentedAttribute[bool],
+        allowed_source_ids: set[str] | None,
+        require_streaming: bool,
+    ):
+        stmt = (
+            select(ModelSource)
+            .options(selectinload(ModelSource.models))
+            .join(ModelSourceModel, ModelSourceModel.source_id == ModelSource.id)
+            .where(ModelSource.kind == "openai_compatible")
+            .where(ModelSource.is_enabled.is_(True))
+            .where(capability_column.is_(True))
+            .where(ModelSourceModel.model == model)
+            .where(ModelSourceModel.is_enabled.is_(True))
+            .order_by(ModelSource.name, ModelSource.id)
+        )
+        if require_streaming:
+            stmt = stmt.where(ModelSourceModel.supports_streaming.is_(True))
+        if allowed_source_ids is not None:
+            stmt = stmt.where(ModelSource.id.in_(allowed_source_ids))
+        return stmt
+
+    async def find_chat_sources_for_model(
+        self,
+        model: str,
+        *,
+        allowed_source_ids: set[str] | None = None,
+        require_streaming: bool = False,
+    ) -> list[ModelSource]:
+        if allowed_source_ids is not None and not allowed_source_ids:
+            return []
+        result = await self._session.execute(
+            self._model_source_stmt(
+                model,
+                capability_column=ModelSource.supports_chat_completions,
+                allowed_source_ids=allowed_source_ids,
+                require_streaming=require_streaming,
+            )
+        )
+        return list(result.scalars().unique().all())
+
     async def find_chat_source_for_model(
         self,
         model: str,
@@ -39,26 +83,31 @@ class ModelSourcesRepository:
         allowed_source_ids: set[str] | None = None,
         require_streaming: bool = False,
     ) -> ModelSource | None:
-        stmt = (
-            select(ModelSource)
-            .options(selectinload(ModelSource.models))
-            .join(ModelSourceModel, ModelSourceModel.source_id == ModelSource.id)
-            .where(ModelSource.kind == "openai_compatible")
-            .where(ModelSource.is_enabled.is_(True))
-            .where(ModelSource.supports_chat_completions.is_(True))
-            .where(ModelSourceModel.model == model)
-            .where(ModelSourceModel.is_enabled.is_(True))
-            .order_by(ModelSource.name, ModelSource.id)
-            .limit(1)
+        sources = await self.find_chat_sources_for_model(
+            model,
+            allowed_source_ids=allowed_source_ids,
+            require_streaming=require_streaming,
         )
-        if require_streaming:
-            stmt = stmt.where(ModelSourceModel.supports_streaming.is_(True))
-        if allowed_source_ids is not None:
-            if not allowed_source_ids:
-                return None
-            stmt = stmt.where(ModelSource.id.in_(allowed_source_ids))
-        result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        return sources[0] if sources else None
+
+    async def find_responses_sources_for_model(
+        self,
+        model: str,
+        *,
+        allowed_source_ids: set[str] | None = None,
+        require_streaming: bool = False,
+    ) -> list[ModelSource]:
+        if allowed_source_ids is not None and not allowed_source_ids:
+            return []
+        result = await self._session.execute(
+            self._model_source_stmt(
+                model,
+                capability_column=ModelSource.supports_responses,
+                allowed_source_ids=allowed_source_ids,
+                require_streaming=require_streaming,
+            )
+        )
+        return list(result.scalars().unique().all())
 
     async def find_responses_source_for_model(
         self,
@@ -67,26 +116,30 @@ class ModelSourcesRepository:
         allowed_source_ids: set[str] | None = None,
         require_streaming: bool = False,
     ) -> ModelSource | None:
-        stmt = (
-            select(ModelSource)
-            .options(selectinload(ModelSource.models))
-            .join(ModelSourceModel, ModelSourceModel.source_id == ModelSource.id)
-            .where(ModelSource.kind == "openai_compatible")
-            .where(ModelSource.is_enabled.is_(True))
-            .where(ModelSource.supports_responses.is_(True))
-            .where(ModelSourceModel.model == model)
-            .where(ModelSourceModel.is_enabled.is_(True))
-            .order_by(ModelSource.name, ModelSource.id)
-            .limit(1)
+        sources = await self.find_responses_sources_for_model(
+            model,
+            allowed_source_ids=allowed_source_ids,
+            require_streaming=require_streaming,
         )
-        if require_streaming:
-            stmt = stmt.where(ModelSourceModel.supports_streaming.is_(True))
-        if allowed_source_ids is not None:
-            if not allowed_source_ids:
-                return None
-            stmt = stmt.where(ModelSource.id.in_(allowed_source_ids))
-        result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        return sources[0] if sources else None
+
+    async def find_audio_transcriptions_sources_for_model(
+        self,
+        model: str,
+        *,
+        allowed_source_ids: set[str] | None = None,
+    ) -> list[ModelSource]:
+        if allowed_source_ids is not None and not allowed_source_ids:
+            return []
+        result = await self._session.execute(
+            self._model_source_stmt(
+                model,
+                capability_column=ModelSource.supports_audio_transcriptions,
+                allowed_source_ids=allowed_source_ids,
+                require_streaming=False,
+            )
+        )
+        return list(result.scalars().unique().all())
 
     async def find_audio_transcriptions_source_for_model(
         self,
@@ -94,24 +147,11 @@ class ModelSourcesRepository:
         *,
         allowed_source_ids: set[str] | None = None,
     ) -> ModelSource | None:
-        stmt = (
-            select(ModelSource)
-            .options(selectinload(ModelSource.models))
-            .join(ModelSourceModel, ModelSourceModel.source_id == ModelSource.id)
-            .where(ModelSource.kind == "openai_compatible")
-            .where(ModelSource.is_enabled.is_(True))
-            .where(ModelSource.supports_audio_transcriptions.is_(True))
-            .where(ModelSourceModel.model == model)
-            .where(ModelSourceModel.is_enabled.is_(True))
-            .order_by(ModelSource.name, ModelSource.id)
-            .limit(1)
+        sources = await self.find_audio_transcriptions_sources_for_model(
+            model,
+            allowed_source_ids=allowed_source_ids,
         )
-        if allowed_source_ids is not None:
-            if not allowed_source_ids:
-                return None
-            stmt = stmt.where(ModelSource.id.in_(allowed_source_ids))
-        result = await self._session.execute(stmt)
-        return result.scalar_one_or_none()
+        return sources[0] if sources else None
 
     async def create(self, row: ModelSource, *, commit: bool = True) -> ModelSource:
         self._session.add(row)

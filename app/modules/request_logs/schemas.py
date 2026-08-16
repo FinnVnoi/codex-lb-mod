@@ -27,6 +27,7 @@ class RequestLogEntry(DashboardModel):
     model: str
     source: str | None = None
     model_source_id: str | None = None
+    model_source_name: str | None = None
     model_source_kind: str | None = None
     useragent: str | None = None
     useragent_group: str | None = None

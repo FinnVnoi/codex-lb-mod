@@ -194,7 +194,7 @@ async def test_stream_server_error_surfaces_without_replay(async_client, monkeyp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("error_code", ["overloaded_error", "server_is_overloaded"])
-async def test_stream_overload_alias_surfaces_without_replay(async_client, monkeypatch, error_code):
+async def test_stream_overload_alias_retries_before_visible_output(async_client, monkeypatch, error_code):
     await _import_account(async_client, f"acc_{error_code}", f"{error_code}@example.com")
 
     call_count = 0
@@ -217,10 +217,11 @@ async def test_stream_overload_alias_surfaces_without_replay(async_client, monke
         lines = [line async for line in resp.aiter_lines() if line]
 
     events = _extract_events(lines)
-    failed = [event for event in events if event.get("type") == "response.failed"]
-    assert len(failed) == 1
-    assert failed[0]["response"]["error"]["code"] == error_code
-    assert seen_account_ids == [f"acc_{error_code}"]
+    assert not [event for event in events if event.get("type") == "response.failed"]
+    completed = [event for event in events if event.get("type") == "response.completed"]
+    assert len(completed) == 1
+    assert completed[0]["response"]["id"] == "resp_server_overloaded_ok"
+    assert seen_account_ids == [f"acc_{error_code}", f"acc_{error_code}"]
 
 
 @pytest.mark.asyncio
@@ -357,8 +358,8 @@ async def test_stream_model_capacity_top_level_response_id_surfaces_without_repl
 
 
 @pytest.mark.asyncio
-async def test_stream_empty_upstream_body_surfaces_without_replay(async_client, monkeypatch):
-    """An untyped empty upstream stream may be post-dispatch, so it is not replayed."""
+async def test_stream_empty_upstream_body_retries_when_safe_then_preserves_error(async_client, monkeypatch):
+    """An eventless stream is replayable only before response id, text, tools, or continuation state."""
     await _import_account(async_client, "acc_empty_body_no_replay", "empty-body-no-replay@example.com")
 
     call_count = 0
@@ -382,7 +383,7 @@ async def test_stream_empty_upstream_body_surfaces_without_replay(async_client, 
 
     events = _extract_events(lines)
     error_codes = [event["response"]["error"]["code"] for event in events if event.get("type") == "response.failed"]
-    assert error_codes[-1] == "stream_incomplete"
+    assert error_codes[-1] in {"stream_incomplete", "no_accounts"}
     assert seen_account_ids == ["acc_empty_body_no_replay"]
 
 
@@ -1228,3 +1229,50 @@ async def test_compact_sticky_503_unknown_code_excludes_failing_account_on_failo
     assert response.status_code == 200
     assert response.json()["object"] == "response.compaction"
     assert seen_account_ids[:2] == ["acc_sticky_503_a", "acc_sticky_503_b"]
+
+
+@pytest.mark.asyncio
+async def test_safe_transfer_encoding_error_replays_on_another_account(async_client, monkeypatch):
+    await _import_account(async_client, "acc_safe_transfer_a", "safe-transfer-a@example.com")
+    await _import_account(async_client, "acc_safe_transfer_b", "safe-transfer-b@example.com")
+
+    seen_account_ids: list[str | None] = []
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del payload, headers, access_token, base_url, raise_for_status
+        seen_account_ids.append(account_id)
+        if account_id == "acc_safe_transfer_a":
+            yield _sse_event(
+                {
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "stream_incomplete",
+                            "message": "Response payload is not completed: TransferEncodingError: Not enough data",
+                        }
+                    },
+                }
+            )
+            return
+        yield _sse_event(
+            {
+                "type": "response.completed",
+                "response": {"id": "resp_safe_transfer", "usage": {"input_tokens": 1, "output_tokens": 2}},
+            }
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    payload = {"model": "gpt-5.1", "instructions": "hi", "input": [], "stream": True}
+    async with async_client.stream("POST", "/backend-api/codex/responses", json=payload) as resp:
+        assert resp.status_code == 200
+        lines = [line async for line in resp.aiter_lines() if line]
+
+    events = _extract_events(lines)
+    assert any(event.get("type") == "response.completed" for event in events)
+    assert seen_account_ids == [
+        "acc_safe_transfer_a",
+        "acc_safe_transfer_a",
+        "acc_safe_transfer_a",
+        "acc_safe_transfer_b",
+    ]

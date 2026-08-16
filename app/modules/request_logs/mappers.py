@@ -30,7 +30,12 @@ def log_status(log: RequestLog) -> str:
     return normalize_log_status(log.status, log.error_code)
 
 
-def to_request_log_entry(log: RequestLog, *, api_key_name: str | None = None) -> RequestLogEntry:
+def to_request_log_entry(
+    log: RequestLog,
+    *,
+    api_key_name: str | None = None,
+    model_source_name: str | None = None,
+) -> RequestLogEntry:
     log_like = typing_cast(RequestLogLike, log)
     cost_breakdown = cost_breakdown_from_log(log_like, precision=6)
     return RequestLogEntry(
@@ -46,6 +51,7 @@ def to_request_log_entry(log: RequestLog, *, api_key_name: str | None = None) ->
         model=log.model,
         source=log.source,
         model_source_id=log.model_source_id,
+        model_source_name=model_source_name,
         model_source_kind=log.model_source_kind,
         useragent=log.useragent,
         useragent_group=log.useragent_group,

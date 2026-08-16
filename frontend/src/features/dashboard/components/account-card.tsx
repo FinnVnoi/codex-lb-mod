@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 import { usePrivacyStore } from "@/hooks/use-privacy";
 import { Button } from "@/components/ui/button";
 import { StatusBadge } from "@/components/status-badge";
+import { SubscriptionRenewal } from "@/features/accounts/components/subscription-renewal";
 import { cn } from "@/lib/utils";
 import type { AccountSummary } from "@/features/dashboard/schemas";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
@@ -198,11 +199,18 @@ export function AccountCard({ account, showAccountId = false, readOnly = false, 
         </Button>
       </div>
 
-      <div className="mt-3 text-xs text-muted-foreground">
-        {t("components.donut.credits")}:{" "}
-        <span className="font-medium tabular-nums text-foreground">
-          {creditsLabel}
+      <div className="mt-3 flex min-w-0 items-center justify-between gap-3 text-xs text-muted-foreground">
+        <span className="shrink-0">
+          {t("components.donut.credits")}:{" "}
+          <span className="font-medium tabular-nums text-foreground">
+            {creditsLabel}
+          </span>
         </span>
+        <SubscriptionRenewal
+          activeUntil={account.subscriptionActiveUntil}
+          showIcon
+          className="justify-end"
+        />
       </div>
 
       {/* Actions */}

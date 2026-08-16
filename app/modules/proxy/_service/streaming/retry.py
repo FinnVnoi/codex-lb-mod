@@ -52,6 +52,7 @@ from app.modules.proxy._service.websocket.helpers import (
     _websocket_input_items_are_self_contained_fresh_replay,
 )
 from app.modules.proxy.affinity import (
+    _AffinityPolicy,
     _is_synthesized_turn_state,
     _owner_lookup_session_id_from_headers,
     _prompt_cache_key_from_request_model,
@@ -257,6 +258,9 @@ class _StreamingRetryMixin:
             request_transport=request_transport,
         )
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
+        prefer_unstarted_quota = bool(getattr(settings, "prefer_unstarted_quota_accounts", False))
+        prefer_unstarted_quota_window = getattr(settings, "prefer_unstarted_quota_window", "both")
+        prefer_earlier_renewal = bool(getattr(settings, "prefer_earlier_renewal_accounts", False))
         upstream_transport_policy_label = "explicit" if upstream_stream_transport_override is not None else "configured"
         upstream_transport_sticky = _http_downstream_request_is_sticky(payload, headers)
         upstream_stream_transport = upstream_stream_transport_override
@@ -360,6 +364,8 @@ class _StreamingRetryMixin:
         excluded_account_ids: set[str] = set()
         transient_failed_account_id: str | None = None
         hard_affinity_same_owner_retry_attempted = False
+        overload_owner_rebind_affinity: _AffinityPolicy | None = None
+        overload_replacement_persisted = False
         deferred_capacity_account: Account | None = None
         deferred_capacity_lease: AccountLease | None = None
         preferred_account_id: str | None = None
@@ -379,6 +385,34 @@ class _StreamingRetryMixin:
             headers=headers,
             api_key=api_key,
         )
+
+        async def _mark_overload_cooldown(failed_account: Account, error_code: str | None) -> None:
+            if error_code not in {"overloaded_error", "server_is_overloaded"}:
+                return
+            cooldown_seconds = max(0, int(getattr(settings, "overload_cooldown_seconds", 600)))
+            await proxy._load_balancer.mark_overload_cooldown(failed_account, cooldown_seconds)
+
+        def _can_rebind_previsible_account_owner() -> bool:
+            """Return whether this request can safely leave a failed hard-affinity owner."""
+            return (
+                request_transport == _REQUEST_TRANSPORT_HTTP
+                and payload.previous_response_id is None
+                and payload.conversation is None
+                and rewritten_file_account_id is None
+                and not settlement.downstream_text_visible
+                and not settlement.downstream_side_effect_visible
+            )
+
+        def _is_account_quota_failure(error_code: str | None) -> bool:
+            # These errors are returned by the selected upstream account.
+            # Downstream API-key quota is enforced before account selection.
+            return error_code in {
+                "usage_limit_reached",
+                "insufficient_quota",
+                "usage_not_included",
+                "quota_exceeded",
+                "quota_exhausted",
+            }
 
         async def _release_tracked_stream_lease(lease: AccountLease | None) -> None:
             if lease is None:
@@ -914,6 +948,9 @@ class _StreamingRetryMixin:
                             api_key=api_key,
                             affinity_policy=affinity,
                             prefer_earlier_reset_accounts=prefer_earlier_reset,
+                            prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                            prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                             prefer_earlier_reset_window=_facade()._prefer_earlier_reset_window(settings),
                             routing_strategy=routing_strategy,
                             model=payload.model,
@@ -968,6 +1005,43 @@ class _StreamingRetryMixin:
                     current_account_lease = selection.lease
                     if selection.lease is not None:
                         account_leases.append(selection.lease)
+                    if (
+                        not account
+                        and selection.error_code == "hard_affinity_saturated"
+                        and not hard_affinity_same_owner_retry_attempted
+                        and _can_rebind_previsible_account_owner()
+                        and affinity.codex_session_source == "session_header"
+                        and affinity.selection_key is not None
+                        and not require_preferred_account
+                        and not file_required_preferred_account
+                    ):
+                        # A concurrent request may have already failed the
+                        # durable session owner and be waiting to persist its
+                        # replacement. Do not send this request directly to
+                        # the provider while another eligible account exists:
+                        # temporarily unbind the soft session selection and
+                        # retry account admission. The original policy is
+                        # retained so the successful replacement is persisted
+                        # atomically below. Stored-object/file owners are
+                        # excluded by the replay-safety guards above.
+                        overload_owner_rebind_affinity = affinity
+                        affinity = replace(
+                            affinity,
+                            key=None,
+                            kind=None,
+                            reallocate_sticky=True,
+                            codex_session_source=None,
+                            require_unambiguous_account=False,
+                        )
+                        preferred_account_id = None
+                        require_preferred_account = False
+                        hard_affinity_same_owner_retry_attempted = True
+                        _facade().logger.info(
+                            "Retrying hard-affinity selection on alternate account request_id=%s error_code=%s",
+                            request_id,
+                            selection.error_code,
+                        )
+                        continue
                     if (
                         not account
                         and require_security_work_authorized
@@ -1045,6 +1119,21 @@ class _StreamingRetryMixin:
                         await _release_tracked_stream_lease(deferred_capacity_lease)
                         deferred_capacity_account = None
                         deferred_capacity_lease = None
+                    if (
+                        account is not None
+                        and overload_owner_rebind_affinity is not None
+                        and not overload_replacement_persisted
+                        and overload_owner_rebind_affinity.codex_session_source == "session_header"
+                        and overload_owner_rebind_affinity.selection_key is not None
+                        and overload_owner_rebind_affinity.kind is not None
+                    ):
+                        async with proxy._repo_factory() as repos:
+                            await repos.sticky_sessions.upsert(
+                                overload_owner_rebind_affinity.selection_key,
+                                account.id,
+                                kind=overload_owner_rebind_affinity.kind,
+                            )
+                        overload_replacement_persisted = True
                     if (
                         not account
                         and selection.error_code == "hard_affinity_saturated"
@@ -1777,6 +1866,7 @@ class _StreamingRetryMixin:
                                         _stream_settlement_error_payload(settlement),
                                         settlement.error_code or "upstream_error",
                                     )
+                                await _mark_overload_cooldown(account, settlement.error_code)
                                 return
                             if isinstance(tex, ProxyResponseError) and tex.status_code != 500:
                                 error = _parse_openai_error(tex.payload)
@@ -1909,6 +1999,26 @@ class _StreamingRetryMixin:
                                     action,
                                 )
                                 if action == "failover_next":
+                                    if _is_account_quota_failure(code) and _can_rebind_previsible_account_owner():
+                                        overload_owner_rebind_affinity = affinity
+                                        affinity = replace(
+                                            affinity,
+                                            key=None,
+                                            kind=None,
+                                            reallocate_sticky=True,
+                                            codex_session_source=None,
+                                            require_unambiguous_account=False,
+                                        )
+                                        preferred_account_id = None
+                                        require_preferred_account = False
+                                        hard_affinity_same_owner_retry_attempted = True
+                                        _facade().logger.info(
+                                            "Forcing alternate account after pre-visible quota exhaustion "
+                                            "request_id=%s account_id=%s code=%s",
+                                            request_id,
+                                            account.id,
+                                            code,
+                                        )
                                     last_transient_exc = tex
                                     transient_failed_account_id = account.id
                                     await _release_tracked_stream_lease(current_account_lease)
@@ -1921,6 +2031,8 @@ class _StreamingRetryMixin:
                                     break
                                 raise
                             error_code = tex.code if isinstance(tex, _TransientStreamError) else "server_error"
+                            if isinstance(tex, _TransientStreamError) and tex.response_id is not None:
+                                settlement.response_id = tex.response_id
                             error_payload: UpstreamError = (
                                 tex.error
                                 if isinstance(tex, _TransientStreamError)
@@ -1942,10 +2054,14 @@ class _StreamingRetryMixin:
                                 yield format_sse_event(_facade()._proxy_request_timeout_event(request_id))
                                 return
                             transient_retries += 1
+                            overload_error = error_code in {"overloaded_error", "server_is_overloaded"}
+                            if overload_error:
+                                await _mark_overload_cooldown(account, error_code)
                             if (
                                 transient_retries < _facade()._MAX_TRANSIENT_SAME_ACCOUNT_RETRIES
                                 and _facade()._remaining_budget_seconds(deadline) > 0
                                 and not settlement.downstream_visible
+                                and not overload_error
                             ):
                                 delay = backoff_seconds(transient_retries)
                                 _facade().logger.info(
@@ -1960,7 +2076,47 @@ class _StreamingRetryMixin:
                                 )
                                 await asyncio.sleep(delay)
                                 continue  # inner loop: retry same account
-                            # Exhausted same-account retries — penalize and failover
+                            # Exhausted same-account retries — penalize and failover.
+                            # For an overload that happened before any downstream
+                            # event, do not let hard session affinity immediately
+                            # force the same account again. The request body is
+                            # still self-contained at this point, so reallocate
+                            # the sticky owner and select an alternate account.
+                            if overload_error or (
+                                _is_account_quota_failure(error_code) and _can_rebind_previsible_account_owner()
+                            ):
+                                overload_owner_rebind_affinity = affinity
+                                affinity = replace(
+                                    affinity,
+                                    key=None,
+                                    kind=None,
+                                    reallocate_sticky=True,
+                                    codex_session_source=None,
+                                    require_unambiguous_account=False,
+                                )
+                                if (
+                                    request_transport == _REQUEST_TRANSPORT_HTTP
+                                    and payload.previous_response_id is None
+                                    and payload.conversation is None
+                                    and rewritten_file_account_id is None
+                                    and not settlement.downstream_text_visible
+                                    and not settlement.downstream_side_effect_visible
+                                ):
+                                    preferred_account_id = None
+                                    require_preferred_account = False
+                                    # The failed turn never created durable output,
+                                    # so continuing a client conversation on a
+                                    # quota-bearing replacement account is safer
+                                    # than surfacing hard_affinity_saturated.
+                                    affinity = replace(affinity, require_unambiguous_account=False)
+                                hard_affinity_same_owner_retry_attempted = True
+                                _facade().logger.info(
+                                    "Forcing alternate account after pre-visible account capacity/quota failure "
+                                    "request_id=%s account_id=%s code=%s",
+                                    request_id,
+                                    account.id,
+                                    error_code,
+                                )
                             _facade().logger.warning(
                                 "Transient retries exhausted for account "
                                 "request_id=%s account_id=%s retries=%s code=%s",
@@ -1990,6 +2146,25 @@ class _StreamingRetryMixin:
                             break  # outer loop: select different account
                         finally:
                             pop_stream_timeout_overrides(stream_timeout_tokens)
+                        safe_incomplete_replay = (
+                            settlement.error_code == "stream_incomplete"
+                            and payload.previous_response_id is None
+                            and not payload.tools
+                            and not settlement.downstream_text_visible
+                            and not settlement.downstream_side_effect_visible
+                            and settlement.response_id is None
+                            and attempt < max_attempts - 1
+                        )
+                        if safe_incomplete_replay:
+                            _facade().logger.info(
+                                "Retrying safe incomplete stream on another account request_id=%s account_id=%s",
+                                request_id,
+                                account.id,
+                            )
+                            await _release_tracked_stream_lease(current_account_lease)
+                            current_account_lease = None
+                            excluded_account_ids.add(account.id)
+                            break
                         settled = await _settle_stream_usage_before_pending_penalty(settlement)
                         if settlement.account_health_error:
                             await proxy._handle_stream_error(

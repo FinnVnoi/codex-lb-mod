@@ -54,6 +54,8 @@ const WeeklyPaceSmoothingMinutesSchema = z.union([
 export const DashboardSettingsSchema = z
   .object({
     stickyThreadsEnabled: z.boolean(),
+    modelSourceStickyEnabled: z.boolean().optional().default(true),
+    modelSourceStickyTtlSeconds: z.number().int().min(60).max(86400).optional().default(1800),
     upstreamStreamTransport:
       UpstreamStreamTransportSchema.optional().default("default"),
     prohibitFastMode: z.boolean().optional().default(false),
@@ -62,6 +64,9 @@ export const DashboardSettingsSchema = z
     upstreamProxyRoutingEnabled: z.boolean().optional().default(false),
     upstreamProxyDefaultPoolId: z.string().nullable().optional().default(null),
     preferEarlierResetAccounts: z.boolean(),
+    preferUnstartedQuotaAccounts: z.boolean().optional().default(false),
+    preferUnstartedQuotaWindow: LimitWarmupWindowsSchema.optional().default("both"),
+    preferEarlierRenewalAccounts: z.boolean().optional().default(false),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional().default("secondary"),
     showResetCreditBadges: z.boolean().optional().default(true),
     autoRedeemResetCreditsBeforeExpiry: z.boolean().optional().default(false),
@@ -79,6 +84,7 @@ export const DashboardSettingsSchema = z
     proxyAccountResponseCreateLimit: z.number().int().min(0).optional().default(4),
     proxyAccountStreamLimit: z.number().int().min(0).optional().default(8),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional().default(1),
+    overloadCooldownSeconds: z.number().int().min(0).max(86400).optional().default(600),
     openaiCacheAffinityMaxAgeSeconds: z
       .number()
       .int()
@@ -165,12 +171,17 @@ export const SettingsUpdateRequestSchema = z
   .object({
     expectedVersion: z.number().int().min(1).optional(),
     stickyThreadsEnabled: z.boolean().optional(),
+    modelSourceStickyEnabled: z.boolean().optional(),
+    modelSourceStickyTtlSeconds: z.number().int().min(60).max(86400).optional(),
     upstreamStreamTransport: UpstreamStreamTransportSchema.optional(),
     prohibitFastMode: z.boolean().optional(),
     httpDownstreamTransportPolicy: HttpDownstreamTransportPolicySchema.optional(),
     upstreamProxyRoutingEnabled: z.boolean().optional(),
     upstreamProxyDefaultPoolId: z.string().nullable().optional(),
     preferEarlierResetAccounts: z.boolean().optional(),
+    preferUnstartedQuotaAccounts: z.boolean().optional(),
+    preferUnstartedQuotaWindow: LimitWarmupWindowsSchema.optional(),
+    preferEarlierRenewalAccounts: z.boolean().optional(),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional(),
     showResetCreditBadges: z.boolean().optional(),
     autoRedeemResetCreditsBeforeExpiry: z.boolean().optional(),
@@ -182,6 +193,7 @@ export const SettingsUpdateRequestSchema = z
     proxyAccountResponseCreateLimit: z.number().int().min(0).optional(),
     proxyAccountStreamLimit: z.number().int().min(0).optional(),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional(),
+    overloadCooldownSeconds: z.number().int().min(0).max(86400).optional(),
     openaiCacheAffinityMaxAgeSeconds: z.number().int().positive().optional(),
     dashboardSessionTtlSeconds: z.number().int().min(3600).optional(),
     stickyReallocationBudgetThresholdPct: z.number().min(0).max(100).optional(),

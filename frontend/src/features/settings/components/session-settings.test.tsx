@@ -12,6 +12,7 @@ const baseSettings = createDashboardSettings({
   upstreamProxyRoutingEnabled: false,
   upstreamProxyDefaultPoolId: null,
   preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
   preferEarlierResetWindow: "secondary" as const,
   routingStrategy: "usage_weighted" as const,
   relativeAvailabilityPower: 2,

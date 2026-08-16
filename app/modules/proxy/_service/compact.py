@@ -601,6 +601,9 @@ class _CompactMixin:
         settings = await _service_get_settings_cache().get()
         concurrency_caps = effective_account_concurrency_caps(settings)
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
+        prefer_unstarted_quota = bool(getattr(settings, "prefer_unstarted_quota_accounts", False))
+        prefer_unstarted_quota_window = getattr(settings, "prefer_unstarted_quota_window", "both")
+        prefer_earlier_renewal = bool(getattr(settings, "prefer_earlier_renewal_accounts", False))
         had_prompt_cache_key = _prompt_cache_key_from_request_model(payload) is not None
         affinity = _sticky_key_for_compact_request(
             payload,
@@ -847,6 +850,9 @@ class _CompactMixin:
                     api_key=api_key,
                     affinity_policy=affinity,
                     prefer_earlier_reset_accounts=prefer_earlier_reset,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                     routing_strategy=routing_strategy,
                     model=payload.model,
@@ -878,6 +884,9 @@ class _CompactMixin:
                             api_key=api_key,
                             affinity_policy=affinity,
                             prefer_earlier_reset_accounts=prefer_earlier_reset,
+                            prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                            prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                             prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                             routing_strategy=routing_strategy,
                             model=payload.model,

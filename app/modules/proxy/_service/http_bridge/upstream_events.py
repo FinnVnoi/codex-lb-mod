@@ -433,6 +433,26 @@ class _HTTPBridgeUpstreamEventsMixin:
                             # Claim the session before cancelling receive so a
                             # gate waiter cannot reopen this ambiguous socket.
                             session.closed = True
+                            # The current request remains ambiguous and must
+                            # fail, but preserving this owner/anchor would pin
+                            # every later turn to the same poisoned lineage.
+                            # Quarantine immediately while this fenced owner is
+                            # still known. Deferring the only attempt to the
+                            # close path can lose cleanup when close is
+                            # interrupted or another retirement path wins. Keep
+                            # the close-path flag armed as a fallback if the
+                            # immediate fenced write fails.
+                            session.quarantine_durable_on_close = True
+                            try:
+                                await self._quarantine_durable_http_bridge_session(session)
+                            except Exception:
+                                logger.warning(
+                                    "Failed to quarantine durable HTTP bridge lineage at "
+                                    "missing response.created timeout; close will retry",
+                                    exc_info=True,
+                                )
+                            else:
+                                session.quarantine_durable_on_close = False
                             if receive_task is not None:
                                 receive_cancelled = await _cancel_http_bridge_reader_child(
                                     receive_task,
@@ -982,6 +1002,67 @@ class _HTTPBridgeUpstreamEventsMixin:
                     )
                     event_block = f"data: {rewritten_text}\n\n"
         elif (
+            retry_error_code in {"overloaded_error", "server_is_overloaded"}
+            and not is_previous_response_not_found_event
+            and status_request_state is not None
+            and status_request_state.previous_response_id is None
+            and _prepare_websocket_request_state_for_account_switch(status_request_state) is not None
+            and not status_request_state.file_required_preferred_account
+            and _websocket_request_can_replay_before_visible_output(status_request_state)
+        ):
+            overloaded_account_id = session.account.id
+            await self._handle_stream_error(
+                session.account,
+                {"message": _websocket_event_error_message(event_type, payload) or "Upstream overloaded"},
+                retry_error_code,
+            )
+            setattr(status_request_state, "account_health_error_handled", True)
+            status_request_state.precreated_replay_reason = retry_error_code
+            status_request_state.precreated_replay_account_id = overloaded_account_id
+            previous_upstream_turn_state = session.upstream_turn_state
+            previous_downstream_turn_state = session.downstream_turn_state
+            previous_headers = session.headers
+            await self._release_request_state_account_response_create_lease(status_request_state)
+            async with session.pending_lock:
+                if status_request_state not in session.pending_requests:
+                    session.pending_requests.appendleft(status_request_state)
+                    session.queued_request_count += 1
+                status_request_state.awaiting_response_created = True
+                status_request_state.response_id = None
+            retried = await self._retry_http_bridge_precreated_request(session)
+            if retried:
+                logger.info(
+                    "Retried HTTP bridge request on alternate account after overload "
+                    "request_id=%s overloaded_account_id=%s model=%s code=%s",
+                    status_request_state.request_log_id or status_request_state.request_id,
+                    overloaded_account_id,
+                    status_request_state.model,
+                    retry_error_code,
+                )
+                return
+            replacement_session_selected = session.account.id != overloaded_account_id
+            if not replacement_session_selected:
+                session.upstream_turn_state = previous_upstream_turn_state
+                session.downstream_turn_state = previous_downstream_turn_state
+                session.headers = previous_headers
+            async with session.pending_lock:
+                if status_request_state in session.pending_requests:
+                    session.pending_requests.remove(status_request_state)
+                    session.queued_request_count = max(0, session.queued_request_count - 1)
+            if replacement_session_selected:
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                await self._retire_http_bridge_after_drain_if_ready(session)
+            status_request_state.error_http_status_override = 502
+            (
+                _downstream_text,
+                event_block,
+                event,
+                payload,
+                event_type,
+            ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
+            _clear_websocket_precreated_replay_fallback(status_request_state)
+        elif (
             retry_error_code == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event
             and status_request_state is not None
@@ -1048,6 +1129,10 @@ class _HTTPBridgeUpstreamEventsMixin:
             retry_error_code is not None
             and retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event
+            and not (
+                retry_error_code in {"overloaded_error", "server_is_overloaded"}
+                and _websocket_response_id(None, payload) is not None
+            )
         ):
             await self._handle_stream_error(
                 session.account,
@@ -1057,6 +1142,11 @@ class _HTTPBridgeUpstreamEventsMixin:
             if status_request_state is not None:
                 setattr(status_request_state, "account_health_error_handled", True)
             if status_request_state is not None and status_request_state.previous_response_id is None:
+                # The retry may switch accounts. Release the failed account's
+                # response-create lease before re-enqueueing so a transient
+                # overload cannot pin capacity on both the old and replacement
+                # accounts for the same request.
+                await self._release_request_state_account_response_create_lease(status_request_state)
                 async with session.pending_lock:
                     if status_request_state not in session.pending_requests:
                         session.pending_requests.appendleft(status_request_state)

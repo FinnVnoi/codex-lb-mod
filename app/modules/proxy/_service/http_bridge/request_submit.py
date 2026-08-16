@@ -54,6 +54,7 @@ from app.core.utils.request_id import (
     set_request_id,
 )
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.db.models import AccountStatus
 from app.modules.api_keys.service import (
     ApiKeyData,
     ApiKeyUsageReservationData,
@@ -1401,6 +1402,9 @@ class _HTTPBridgeRequestSubmitMixin:
             key=session.key.affinity_key,
         )
         hard_owner_bound = _http_bridge_key_strength(session.key) == "hard"
+        original_session_affinity = session.affinity
+        owner_account_id = session.account.id
+        force_overload_failover = False
         async with session.pending_lock:
             retryable_requests = [
                 request_state
@@ -1411,6 +1415,10 @@ class _HTTPBridgeRequestSubmitMixin:
             if len(retryable_requests) != 1:
                 return False
             request_state = retryable_requests[0]
+            force_overload_failover = request_state.precreated_replay_reason in {
+                "overloaded_error",
+                "server_is_overloaded",
+            }
             if request_state.previous_response_id is not None and not (
                 request_state.proxy_injected_previous_response_id
                 and request_state.fresh_upstream_request_is_retry_safe
@@ -1462,11 +1470,29 @@ class _HTTPBridgeRequestSubmitMixin:
                     if not hard_owner_bound:
                         request_state.excluded_account_ids.add(session.account.id)
             else:
-                require_preferred_reconnect = account_neutral_recovery
+                require_preferred_reconnect = account_neutral_recovery and not force_overload_failover
                 request_text = _prepare_websocket_request_state_for_visible_output_replay(request_state)
                 if request_text is None:
                     return False
-                if account_neutral_recovery:
+                if force_overload_failover:
+                    if request_state.file_required_preferred_account:
+                        return False
+                    # Upstream overload before response.created is safe to replay
+                    # from the retained full body. Do not reconnect to the same
+                    # owner first: clear account-local routing inputs, exclude the
+                    # failed account, and rebind the session-header affinity after
+                    # a replacement socket is selected.
+                    request_state.preferred_account_id = None
+                    request_state.excluded_account_ids.add(owner_account_id)
+                    request_state.affinity_policy = replace(
+                        request_state.affinity_policy,
+                        key=None,
+                        kind=None,
+                        reallocate_sticky=True,
+                        codex_session_source=None,
+                    )
+                    request_state.force_refresh_account_id = None
+                elif account_neutral_recovery:
                     request_state.preferred_account_id = session.account.id
                 elif not request_state.file_required_preferred_account and not hard_owner_bound:
                     request_state.preferred_account_id = None
@@ -1487,12 +1513,141 @@ class _HTTPBridgeRequestSubmitMixin:
             model_class=_extract_model_class(session.request_model) if session.request_model else None,
         )
         try:
-            if hard_owner_bound:
-                await self._reconnect_http_bridge_session(
-                    session,
-                    request_state=request_state,
-                    require_same_account=True,
+            if force_overload_failover:
+                selection_affinity = replace(
+                    original_session_affinity,
+                    key=None,
+                    kind=None,
+                    reallocate_sticky=True,
+                    codex_session_source=None,
                 )
+                _log_http_bridge_event(
+                    "retry_precreated_overload_failover",
+                    session.key,
+                    account_id=owner_account_id,
+                    model=session.request_model,
+                    pending_count=1,
+                    detail=f"owner_error_code={request_state.precreated_replay_reason}",
+                    cache_key_family=session.key.affinity_kind,
+                    model_class=_extract_model_class(session.request_model) if session.request_model else None,
+                )
+                await self._release_request_state_account_response_create_lease(request_state)
+                await _call_with_supported_optional_kwargs(
+                    self._reconnect_http_bridge_session,
+                    session,
+                    optional_kwargs={
+                        "owner_rebind_affinity": original_session_affinity,
+                        "selection_affinity": selection_affinity,
+                    },
+                    request_state=request_state,
+                )
+                if session.account.id == owner_account_id:
+                    raise ProxyResponseError(
+                        503,
+                        openai_error(
+                            "server_is_overloaded",
+                            "No alternate account is available for overload failover",
+                            error_type="server_error",
+                        ),
+                    )
+                if (
+                    original_session_affinity.codex_session_source == "session_header"
+                    and original_session_affinity.selection_key is not None
+                    and original_session_affinity.kind is not None
+                ):
+                    async with self._repo_factory() as repos:
+                        await repos.sticky_sessions.upsert(
+                            original_session_affinity.selection_key,
+                            session.account.id,
+                            kind=original_session_affinity.kind,
+                        )
+            elif hard_owner_bound:
+                try:
+                    await self._reconnect_http_bridge_session(
+                        session,
+                        request_state=request_state,
+                        require_same_account=True,
+                    )
+                except ProxyResponseError as owner_exc:
+                    owner_error = _parse_openai_error(owner_exc.payload)
+                    owner_error_code = _normalize_error_code(
+                        owner_error.code if owner_error else None,
+                        owner_error.type if owner_error else None,
+                    )
+                    owner_quota_unavailable = owner_error_code in {
+                        "rate_limit_exceeded",
+                        "usage_limit_reached",
+                        "insufficient_quota",
+                        "usage_not_included",
+                        "quota_exceeded",
+                    } or (
+                        owner_error_code == "no_accounts"
+                        and session.account.status
+                        in {
+                            AccountStatus.RATE_LIMITED,
+                            AccountStatus.QUOTA_EXCEEDED,
+                        }
+                    )
+                    switch_text = _prepare_websocket_request_state_for_account_switch(request_state)
+                    if (
+                        not owner_quota_unavailable
+                        or switch_text is None
+                        or request_state.file_required_preferred_account
+                    ):
+                        raise
+
+                    # The hard owner cannot accept this turn and the retained
+                    # body is a proven self-contained replay. Rebind the durable
+                    # lineage before swapping sockets, clear account-local turn
+                    # state in _reconnect_http_bridge_session, and never retry
+                    # this path after downstream-visible output.
+                    selection_affinity = replace(
+                        original_session_affinity,
+                        key=None,
+                        kind=None,
+                        reallocate_sticky=True,
+                        codex_session_source=None,
+                    )
+                    request_state.preferred_account_id = None
+                    request_state.excluded_account_ids.add(owner_account_id)
+                    request_state.affinity_policy = replace(
+                        request_state.affinity_policy,
+                        key=None,
+                        kind=None,
+                        reallocate_sticky=True,
+                    )
+                    request_text = switch_text
+                    _log_http_bridge_event(
+                        "retry_precreated_owner_quota_failover",
+                        session.key,
+                        account_id=owner_account_id,
+                        model=session.request_model,
+                        pending_count=1,
+                        detail=f"owner_error_code={owner_error_code}",
+                        cache_key_family=session.key.affinity_kind,
+                        model_class=(_extract_model_class(session.request_model) if session.request_model else None),
+                    )
+                    await self._release_request_state_account_response_create_lease(request_state)
+                    await _call_with_supported_optional_kwargs(
+                        self._reconnect_http_bridge_session,
+                        session,
+                        optional_kwargs={
+                            "owner_rebind_affinity": original_session_affinity,
+                            "selection_affinity": selection_affinity,
+                        },
+                        request_state=request_state,
+                    )
+                    if (
+                        original_session_affinity.codex_session_source == "session_header"
+                        and original_session_affinity.selection_key is not None
+                        and original_session_affinity.kind is not None
+                    ):
+                        async with self._repo_factory() as repos:
+                            await repos.sticky_sessions.upsert(
+                                original_session_affinity.selection_key,
+                                session.account.id,
+                                kind=original_session_affinity.kind,
+                            )
             elif require_preferred_reconnect:
                 await self._reconnect_http_bridge_session(
                     session,

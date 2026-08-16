@@ -28,15 +28,21 @@ class SettingsRepository:
         row = DashboardSettings(
             id=_SETTINGS_ID,
             sticky_threads_enabled=True,
+            model_source_sticky_enabled=True,
+            model_source_sticky_ttl_seconds=1800,
             upstream_stream_transport="default",
             prohibit_fast_mode=False,
             http_downstream_transport_policy=get_settings().http_downstream_transport_policy,
             proxy_account_response_create_limit=get_settings().proxy_account_response_create_limit,
             proxy_account_stream_limit=get_settings().proxy_account_stream_limit,
             proxy_account_stream_recovery_reserve=get_settings().proxy_account_stream_recovery_reserve,
+            overload_cooldown_seconds=600,
             upstream_proxy_routing_enabled=False,
             upstream_proxy_default_pool_id=None,
             prefer_earlier_reset_accounts=True,
+            prefer_unstarted_quota_accounts=False,
+            prefer_unstarted_quota_window="both",
+            prefer_earlier_renewal_accounts=False,
             prefer_earlier_reset_window="secondary",
             show_reset_credit_badges=True,
             auto_redeem_reset_credits_before_expiry=False,
@@ -92,15 +98,21 @@ class SettingsRepository:
         self,
         *,
         sticky_threads_enabled: bool | None = None,
+        model_source_sticky_enabled: bool | None = None,
+        model_source_sticky_ttl_seconds: int | None = None,
         upstream_stream_transport: str | None = None,
         prohibit_fast_mode: bool | None = None,
         http_downstream_transport_policy: str | None = None,
         proxy_account_response_create_limit: int | None = None,
         proxy_account_stream_limit: int | None = None,
         proxy_account_stream_recovery_reserve: int | None = None,
+        overload_cooldown_seconds: int | None = None,
         upstream_proxy_routing_enabled: bool | None = None,
         upstream_proxy_default_pool_id: str | None = None,
         prefer_earlier_reset_accounts: bool | None = None,
+        prefer_unstarted_quota_accounts: bool | None = None,
+        prefer_unstarted_quota_window: str | None = None,
+        prefer_earlier_renewal_accounts: bool | None = None,
         prefer_earlier_reset_window: str | None = None,
         show_reset_credit_badges: bool | None = None,
         auto_redeem_reset_credits_before_expiry: bool | None = None,
@@ -155,6 +167,10 @@ class SettingsRepository:
         ) or (upstream_proxy_default_pool_id or None) != settings.upstream_proxy_default_pool_id
         if sticky_threads_enabled is not None:
             settings.sticky_threads_enabled = sticky_threads_enabled
+        if model_source_sticky_enabled is not None:
+            settings.model_source_sticky_enabled = model_source_sticky_enabled
+        if model_source_sticky_ttl_seconds is not None:
+            settings.model_source_sticky_ttl_seconds = model_source_sticky_ttl_seconds
         if upstream_stream_transport is not None:
             settings.upstream_stream_transport = upstream_stream_transport
         if prohibit_fast_mode is not None:
@@ -167,11 +183,19 @@ class SettingsRepository:
             settings.proxy_account_stream_limit = proxy_account_stream_limit
         if proxy_account_stream_recovery_reserve is not None:
             settings.proxy_account_stream_recovery_reserve = proxy_account_stream_recovery_reserve
+        if overload_cooldown_seconds is not None:
+            settings.overload_cooldown_seconds = overload_cooldown_seconds
         if upstream_proxy_routing_enabled is not None:
             settings.upstream_proxy_routing_enabled = upstream_proxy_routing_enabled
         settings.upstream_proxy_default_pool_id = upstream_proxy_default_pool_id or None
         if prefer_earlier_reset_accounts is not None:
             settings.prefer_earlier_reset_accounts = prefer_earlier_reset_accounts
+        if prefer_unstarted_quota_accounts is not None:
+            settings.prefer_unstarted_quota_accounts = prefer_unstarted_quota_accounts
+        if prefer_unstarted_quota_window is not None:
+            settings.prefer_unstarted_quota_window = prefer_unstarted_quota_window
+        if prefer_earlier_renewal_accounts is not None:
+            settings.prefer_earlier_renewal_accounts = prefer_earlier_renewal_accounts
         if prefer_earlier_reset_window is not None:
             settings.prefer_earlier_reset_window = prefer_earlier_reset_window
         if show_reset_credit_badges is not None:

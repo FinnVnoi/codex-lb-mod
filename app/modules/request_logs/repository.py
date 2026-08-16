@@ -21,7 +21,7 @@ from app.core.usage.types import (
 )
 from app.core.utils.request_id import ensure_request_id
 from app.core.utils.time import utcnow
-from app.db.models import Account, ApiKey, RequestKind, RequestLog
+from app.db.models import Account, ApiKey, ModelSource, RequestKind, RequestLog
 from app.db.session import sqlite_writer_section
 
 
@@ -827,6 +827,15 @@ class RequestLogsRepository:
                 pairs.append((value, None))
         return pairs
 
+    async def get_model_source_names_by_ids(self, source_ids: list[str]) -> dict[str, str]:
+        normalized = list(dict.fromkeys(source_id for source_id in source_ids if source_id))
+        if not normalized:
+            return {}
+        result = await self._session.execute(
+            select(ModelSource.id, ModelSource.name).where(ModelSource.id.in_(normalized))
+        )
+        return {source_id: name for source_id, name in result.all()}
+
     async def get_api_key_names_by_ids(self, api_key_ids: list[str]) -> dict[str, str]:
         unique_ids = sorted({key_id for key_id in api_key_ids if key_id})
         if not unique_ids:
@@ -920,6 +929,9 @@ class RequestLogsRepository:
                     RequestLog.model.ilike(search_pattern),
                     RequestLog.reasoning_effort.ilike(search_pattern),
                     RequestLog.source.ilike(search_pattern),
+                    RequestLog.model_source_id.ilike(search_pattern),
+                    ModelSource.name.ilike(search_pattern),
+                    ModelSource.kind.ilike(search_pattern),
                     RequestLog.client_ip.ilike(search_pattern),
                     RequestLog.status.ilike(search_pattern),
                     RequestLog.error_code.ilike(search_pattern),
@@ -940,9 +952,10 @@ class RequestLogsRepository:
     def _apply_related_search_joins(self, stmt, include_related_search_joins: bool):
         if not include_related_search_joins:
             return stmt
-        return stmt.outerjoin(Account, Account.id == RequestLog.account_id).outerjoin(
-            ApiKey,
-            ApiKey.id == RequestLog.api_key_id,
+        return (
+            stmt.outerjoin(Account, Account.id == RequestLog.account_id)
+            .outerjoin(ApiKey, ApiKey.id == RequestLog.api_key_id)
+            .outerjoin(ModelSource, ModelSource.id == RequestLog.model_source_id)
         )
 
 

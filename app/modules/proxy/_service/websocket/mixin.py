@@ -2259,6 +2259,15 @@ class _WebSocketMixin:
         _ = proxy
         while True:
             try:
+                selection_kwargs: dict[str, Any] = {}
+                settings = await _facade().get_settings_cache().get()
+                if bool(getattr(settings, "prefer_unstarted_quota_accounts", False)):
+                    selection_kwargs["prefer_unstarted_quota_accounts"] = True
+                    selection_kwargs["prefer_unstarted_quota_window"] = getattr(
+                        settings, "prefer_unstarted_quota_window", "both"
+                    )
+                if bool(getattr(settings, "prefer_earlier_renewal_accounts", False)):
+                    selection_kwargs["prefer_earlier_renewal_accounts"] = True
                 selection = await proxy._select_account_with_budget_compatible(
                     deadline,
                     request_id=request_state.request_log_id or request_state.request_id,
@@ -2286,6 +2295,7 @@ class _WebSocketMixin:
                         request_state.request_usage_budget
                     ),
                     fallback_on_preferred_account_unavailable=not require_preferred_account,
+                    **selection_kwargs,
                 )
             except ProxyResponseError as exc:
                 if _facade()._is_proxy_budget_exhausted_error(exc):

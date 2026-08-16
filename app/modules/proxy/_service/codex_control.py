@@ -190,6 +190,9 @@ class _CodexControlMixin:
                 api_key=api_key,
                 affinity_policy=affinity,
                 prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                prefer_unstarted_quota_accounts=bool(getattr(settings, "prefer_unstarted_quota_accounts", False)),
+                prefer_unstarted_quota_window=getattr(settings, "prefer_unstarted_quota_window", "both"),
+                prefer_earlier_renewal_accounts=bool(getattr(settings, "prefer_earlier_renewal_accounts", False)),
                 prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                 routing_strategy=routing_strategy,
                 model=selection_model,
@@ -267,6 +270,9 @@ class _CodexControlMixin:
                     legacy_sticky_key=affinity.legacy_selection_key,
                     sticky_max_age_seconds=affinity.max_age_seconds,
                     prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                    prefer_unstarted_quota_accounts=bool(getattr(settings, "prefer_unstarted_quota_accounts", False)),
+                    prefer_unstarted_quota_window=getattr(settings, "prefer_unstarted_quota_window", "both"),
+                    prefer_earlier_renewal_accounts=bool(getattr(settings, "prefer_earlier_renewal_accounts", False)),
                     routing_strategy=routing_strategy,
                     model=selection_model,
                     exclude_account_ids=excluded_account_ids,
@@ -359,6 +365,15 @@ class _CodexControlMixin:
                                     legacy_sticky_key=affinity.legacy_selection_key,
                                     sticky_max_age_seconds=affinity.max_age_seconds,
                                     prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                                    prefer_unstarted_quota_accounts=bool(
+                                        getattr(settings, "prefer_unstarted_quota_accounts", False)
+                                    ),
+                                    prefer_unstarted_quota_window=getattr(
+                                        settings, "prefer_unstarted_quota_window", "both"
+                                    ),
+                                    prefer_earlier_renewal_accounts=bool(
+                                        getattr(settings, "prefer_earlier_renewal_accounts", False)
+                                    ),
                                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                                     routing_strategy=routing_strategy,
                                     model=selection_model,

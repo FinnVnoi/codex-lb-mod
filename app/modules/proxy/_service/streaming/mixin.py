@@ -45,6 +45,8 @@ from app.core.openai.parsing import parse_sse_event_payload
 from app.core.openai.requests import (
     ResponsesRequest,
 )
+from app.core.openai.tool_call_safety import is_downstream_side_effect_tool_call_item
+from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
@@ -298,6 +300,7 @@ from app.modules.proxy._service.support import (
     _RetryableStreamError,
     _StreamSettlement,
     _TerminalStreamError,
+    _TransientStreamError,
     _ttft_event_latency_ms,
     _WebSocketUpstreamControl,
 )
@@ -606,6 +609,7 @@ class _StreamingMixin(_StreamingRetryMixin):
             response_create_lease.release()
             await proxy._load_balancer.release_account_lease(account_response_create_lease)
             account_response_create_lease = None
+            pending_created_line: str | None = None
             first_payload = parse_sse_data_json(first)
             event = parse_sse_event_payload(first_payload)
             event_type = _event_type_from_payload(event, first_payload)
@@ -699,6 +703,60 @@ class _StreamingMixin(_StreamingRetryMixin):
                             failure_phase="upstream", failure_detail="upstream_eof_before_terminal_event"
                         )
                     settlement.account_health_error = _facade()._should_penalize_stream_error(code)
+                    # A terminal overload/capacity envelope can be the very
+                    # first upstream event on an HTTP 200 stream. Nothing has
+                    # been exposed downstream at this point, so route it into
+                    # the existing bounded same-account retry + account
+                    # failover path. Once an upstream response id exists the
+                    # helper refuses replay, preserving tool/continuation
+                    # safety.
+                    upstream_response_id = (
+                        event.response.id
+                        if event.type == "response.failed" and event.response and event.response.id
+                        else None
+                    )
+                    # A terminal overload may carry a response id even though
+                    # no output item, text delta, or tool side effect was ever
+                    # produced. For a fresh self-contained HTTP request, that
+                    # failed id is not a usable continuation anchor; replay is
+                    # safe as long as nothing has reached the downstream.
+                    replay_response_id = upstream_response_id
+                    if (
+                        code in {"overloaded_error", "server_is_overloaded"}
+                        and request_transport == _REQUEST_TRANSPORT_HTTP
+                        and payload.previous_response_id is None
+                        and not settlement.downstream_text_visible
+                        and not settlement.downstream_side_effect_visible
+                    ):
+                        replay_response_id = None
+                    if (
+                        allow_transient_retry
+                        and code == "stream_incomplete"
+                        and upstream_response_id is None
+                        and payload.previous_response_id is None
+                        and not payload.tools
+                    ):
+                        raise _TransientStreamError(
+                            code,
+                            upstream_error,
+                            preserve_on_selection_exhausted=True,
+                        )
+                    if (
+                        allow_transient_retry
+                        and code in {"overloaded_error", "server_is_overloaded"}
+                        and _facade()._should_retry_transient_stream_error(
+                            code,
+                            raw_error_message,
+                            response_id=replay_response_id,
+                        )
+                    ):
+                        if replay_response_id is None:
+                            settlement.response_id = None
+                        raise _TransientStreamError(
+                            code or "upstream_error",
+                            upstream_error,
+                            response_id=replay_response_id,
+                        )
                     if allow_retry and code == "stream_idle_timeout":
                         raise _RetryableStreamError(code, upstream_error, exclude_account=True)
                     if allow_retry and _facade()._is_security_work_authorization_required_error(code, error_message):
@@ -758,10 +816,22 @@ class _StreamingMixin(_StreamingRetryMixin):
                         latency_first_token_ms = _ttft_event_latency_ms(
                             event_type, first_payload, ttft_reasoning_deltas, attempt_started_at
                         )
-                    settlement.downstream_visible = True
-                    if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
-                        settlement.downstream_text_visible = True
-                    yield first
+                    if event_type == "response.created":
+                        # An identity-only anchor is buffered until real output
+                        # arrives. This keeps a created->overloaded HTTP stream
+                        # replay-safe without leaking the failed response id.
+                        pending_created_line = first
+                    else:
+                        settlement.downstream_visible = True
+                        if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
+                            settlement.downstream_text_visible = True
+                        if isinstance(first_payload, Mapping):
+                            item = first_payload.get("item")
+                            if isinstance(item, Mapping) and is_downstream_side_effect_tool_call_item(
+                                cast(Mapping[str, JsonValue], item)
+                            ):
+                                settlement.downstream_side_effect_visible = True
+                        yield first
             if terminal_stream_error is not None:
                 raise terminal_stream_error
             async for line in iterator:
@@ -899,6 +969,27 @@ class _StreamingMixin(_StreamingRetryMixin):
                     settlement.error = {"message": raw_error_message or "Upstream error"}
                     settlement.record_success = False
                     settlement.account_health_error = not saw_text_delta
+                if (
+                    allow_transient_retry
+                    and event_type in {"response.failed", "error"}
+                    and error_code in {"overloaded_error", "server_is_overloaded"}
+                    and request_transport == _REQUEST_TRANSPORT_HTTP
+                    and payload.previous_response_id is None
+                    and not settlement.downstream_text_visible
+                    and not settlement.downstream_side_effect_visible
+                    and not settlement.downstream_visible
+                ):
+                    pending_created_line = None
+                    settlement.response_id = None
+                    raise _TransientStreamError(
+                        error_code,
+                        settlement.error or {"message": error_message or "Upstream overloaded"},
+                        response_id=None,
+                    )
+                if pending_created_line is not None:
+                    settlement.downstream_visible = True
+                    yield pending_created_line
+                    pending_created_line = None
                 if event_type in ("response.completed", "response.incomplete"):
                     response = event.response if event is not None else None
                     usage = response.usage if response else None
@@ -940,6 +1031,12 @@ class _StreamingMixin(_StreamingRetryMixin):
                 settlement.downstream_visible = True
                 if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                     settlement.downstream_text_visible = True
+                if isinstance(event_payload, Mapping):
+                    item = event_payload.get("item")
+                    if isinstance(item, Mapping) and is_downstream_side_effect_tool_call_item(
+                        cast(Mapping[str, JsonValue], item)
+                    ):
+                        settlement.downstream_side_effect_visible = True
                 yield line
             if not terminal_event_seen:
                 status, error_code, error_message, failure_metadata = _mark_upstream_stream_incomplete(settlement)
@@ -1006,6 +1103,22 @@ class _StreamingMixin(_StreamingRetryMixin):
             raise
         except (asyncio.CancelledError, GeneratorExit):
             status, error_code, error_message, failure_metadata = _mark_downstream_stream_cancelled(settlement)
+            raise
+        except aiohttp.ClientPayloadError as exc:
+            if settlement.downstream_visible:
+                status, error_code, error_message, failure_metadata = _mark_upstream_stream_incomplete(settlement)
+                yield _facade()._build_rewritten_stream_response_failed_event(
+                    response_id=request_id,
+                    error_code=error_code,
+                    error_message=error_message,
+                )[0]
+                return
+            if payload.previous_response_id is None and not payload.tools:
+                raise _TransientStreamError(
+                    "stream_incomplete",
+                    {"message": f"Upstream response body was truncated: {exc.__class__.__name__}"},
+                    preserve_on_selection_exhausted=True,
+                ) from exc
             raise
         except Exception:
             if settlement.downstream_visible:

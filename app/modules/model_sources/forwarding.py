@@ -150,10 +150,13 @@ async def stream_chat_completion(
     stack, response = await _open_source_stream(source, "/chat/completions", payload, encryptor=encryptor)
 
     async def body() -> AsyncIterator[bytes]:
-        async with stack:
-            async for chunk in response.content.iter_chunked(4096):
-                usage_parser.feed(chunk)
-                yield chunk
+        try:
+            async with stack:
+                async for chunk in response.content.iter_chunked(4096):
+                    usage_parser.feed(chunk)
+                    yield chunk
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise _unreachable_error(exc) from exc
 
     return SourceChatStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
 
@@ -260,10 +263,13 @@ async def stream_responses(
     stack, response = await _open_source_stream(source, "/responses", payload, encryptor=encryptor)
 
     async def body() -> AsyncIterator[bytes]:
-        async with stack:
-            async for chunk in response.content.iter_chunked(4096):
-                usage_parser.feed(chunk)
-                yield chunk
+        try:
+            async with stack:
+                async for chunk in response.content.iter_chunked(4096):
+                    usage_parser.feed(chunk)
+                    yield chunk
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise _unreachable_error(exc) from exc
 
     return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=response.status)
 

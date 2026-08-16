@@ -29,6 +29,55 @@ def test_extract_id_token_claims_valid_payload():
     assert claims.chatgpt_account_id == "acc_123"
 
 
+def test_extract_id_token_claims_parses_subscription_window():
+    payload = {
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "plus",
+            "chatgpt_subscription_active_start": "2026-07-07T09:00:00Z",
+            "chatgpt_subscription_active_until": "2026-08-07T09:00:00Z",
+        },
+    }
+
+    claims = extract_id_token_claims(_encode_jwt(payload))
+
+    assert claims.auth is not None
+    assert claims.auth.chatgpt_subscription_active_start is not None
+    assert claims.auth.chatgpt_subscription_active_start.isoformat() == "2026-07-07T09:00:00+00:00"
+    assert claims.auth.chatgpt_subscription_active_until is not None
+    assert claims.auth.chatgpt_subscription_active_until.isoformat() == "2026-08-07T09:00:00+00:00"
+
+
+def test_extract_id_token_claims_accepts_epoch_subscription_timestamp():
+    payload = {
+        "https://api.openai.com/auth": {
+            "chatgpt_subscription_active_until": 1786093200000,
+        },
+    }
+
+    claims = extract_id_token_claims(_encode_jwt(payload))
+
+    assert claims.auth is not None
+    assert claims.auth.chatgpt_subscription_active_until is not None
+    assert claims.auth.chatgpt_subscription_active_until.isoformat() == "2026-08-07T09:00:00+00:00"
+
+
+def test_extract_id_token_claims_ignores_malformed_subscription_timestamp():
+    payload = {
+        "email": "still-valid@example.com",
+        "https://api.openai.com/auth": {
+            "chatgpt_plan_type": "plus",
+            "chatgpt_subscription_active_until": "not-a-timestamp",
+        },
+    }
+
+    claims = extract_id_token_claims(_encode_jwt(payload))
+
+    assert claims.email == "still-valid@example.com"
+    assert claims.auth is not None
+    assert claims.auth.chatgpt_plan_type == "plus"
+    assert claims.auth.chatgpt_subscription_active_until is None
+
+
 def test_claims_from_auth_prefers_token_account_id():
     payload = {
         "email": "user@example.com",

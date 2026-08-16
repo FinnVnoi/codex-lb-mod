@@ -6982,6 +6982,33 @@ async def test_close_http_bridge_session_fails_pending_downstream_requests() -> 
 
 
 @pytest.mark.asyncio
+async def test_close_http_bridge_session_quarantines_eventless_timeout_lineage() -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    quarantine = AsyncMock()
+    release = AsyncMock()
+    service._durable_bridge = cast(
+        Any,
+        SimpleNamespace(
+            quarantine_live_session=quarantine,
+            release_live_session=release,
+        ),
+    )
+    session = _make_bridge_session(key_value="eventless-timeout-lineage")
+    session.durable_session_id = "durable-eventless-timeout"
+    session.durable_owner_epoch = 7
+    session.quarantine_durable_on_close = True
+
+    await service._close_http_bridge_session(session)
+
+    quarantine.assert_awaited_once_with(
+        session_id="durable-eventless-timeout",
+        instance_id=proxy_service.get_settings().http_responses_session_bridge_instance_id,
+        owner_epoch=7,
+    )
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_close_http_bridge_session_releases_lease_before_pending_cleanup_wait(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -13605,9 +13632,15 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     )
     handle_stream_error = AsyncMock()
     retry_precreated = AsyncMock(return_value=True)
+    release_create_lease = AsyncMock()
     finalize = AsyncMock()
     monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
     monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(
+        service,
+        "_release_request_state_account_response_create_lease",
+        release_create_lease,
+    )
     monkeypatch.setattr(service, "_finalize_websocket_request_state", finalize)
 
     await service._process_http_bridge_upstream_text(
@@ -13629,12 +13662,233 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     )
 
     handle_stream_error.assert_awaited_once()
+    release_create_lease.assert_awaited_once_with(request_state)
     retry_precreated.assert_awaited_once_with(session)
     finalize.assert_not_awaited()
     assert request_state.event_queue is not None
     assert request_state.event_queue.empty()
     assert session.pending_requests == deque([request_state])
     assert session.queued_request_count == 1
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_replays_terminal_overload_with_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-overload-accepted",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        transport="http",
+        skip_request_log=True,
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-overload-accepted", None),
+        headers={"x-codex-session-id": "sid-overload-accepted"},
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-overload-accepted",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            codex_session_source="session_header",
+        ),
+        request_model="gpt-5.6-sol",
+        account=cast(Any, SimpleNamespace(id="acc-overloaded", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+    retry_precreated = AsyncMock(return_value=True)
+    handle_stream_error = AsyncMock()
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "response.failed",
+                "response": {
+                    "id": "resp_upstream_accepted",
+                    "status": "failed",
+                    "error": {
+                        "type": "server_error",
+                        "code": "server_is_overloaded",
+                        "message": "The AI service is temporarily overloaded.",
+                    },
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    retry_precreated.assert_awaited_once_with(session)
+    handle_stream_error.assert_awaited_once()
+    assert request_state.event_queue is not None
+    assert request_state.event_queue.empty()
+    assert request_state.precreated_replay_reason == "server_is_overloaded"
+    assert request_state.precreated_replay_account_id == "acc-overloaded"
+
+
+@pytest.mark.asyncio
+async def test_process_http_bridge_upstream_text_does_not_replay_nonterminal_overload_with_response_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-overload-accepted-error",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        transport="http",
+        skip_request_log=True,
+    )
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-overload-accepted-error", None),
+        headers={"x-codex-session-id": "sid-overload-accepted-error"},
+        affinity=proxy_service._AffinityPolicy(
+            key="sid-overload-accepted-error",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            codex_session_source="session_header",
+        ),
+        request_model="gpt-5.6-sol",
+        account=cast(Any, SimpleNamespace(id="acc-overloaded", status=AccountStatus.ACTIVE)),
+        upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+    retry_precreated = AsyncMock(return_value=True)
+    handle_stream_error = AsyncMock()
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "response_id": "resp_upstream_accepted",
+                "status": 503,
+                "error": {
+                    "type": "server_error",
+                    "code": "server_is_overloaded",
+                    "message": "The AI service is temporarily overloaded.",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    retry_precreated.assert_not_awaited()
+    event_queue = request_state.event_queue
+    assert event_queue is not None
+    event_block = await event_queue.get()
+    assert event_block is not None
+    payload = proxy_service.parse_sse_data_json(event_block)
+    assert isinstance(payload, dict)
+    assert payload["type"] == "response.failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["overloaded_error", "server_is_overloaded"])
+async def test_process_http_bridge_upstream_text_forces_alternate_account_on_precreated_overload(
+    monkeypatch: pytest.MonkeyPatch,
+    error_code: str,
+) -> None:
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    request_state = proxy_service._WebSocketRequestState(
+        request_id="req-precreated-overload",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        awaiting_response_created=True,
+        event_queue=asyncio.Queue(),
+        request_text='{"type":"response.create","model":"gpt-5.6-sol","input":"hello"}',
+        transport="http",
+        skip_request_log=True,
+        affinity_policy=proxy_service._AffinityPolicy(
+            key="sid-overload",
+            kind=proxy_service.StickySessionKind.CODEX_SESSION,
+            codex_session_source="session_header",
+        ),
+    )
+    owner = cast(Any, SimpleNamespace(id="acc-overloaded", status=AccountStatus.ACTIVE))
+    session = proxy_service._HTTPBridgeSession(
+        key=proxy_service._HTTPBridgeSessionKey("session_header", "sid-overload", None),
+        headers={"x-codex-session-id": "sid-overload"},
+        affinity=request_state.affinity_policy,
+        request_model="gpt-5.6-sol",
+        account=owner,
+        upstream=cast(UpstreamResponsesWebSocket, SimpleNamespace(close=AsyncMock())),
+        upstream_control=proxy_service._WebSocketUpstreamControl(),
+        pending_requests=deque([request_state]),
+        pending_lock=anyio.Lock(),
+        response_create_gate=asyncio.Semaphore(1),
+        queued_request_count=1,
+        last_used_at=1.0,
+        idle_ttl_seconds=120.0,
+    )
+    handle_stream_error = AsyncMock()
+    release_create_lease = AsyncMock()
+
+    async def retry_on_replacement(retry_session: proxy_service._HTTPBridgeSession) -> bool:
+        assert retry_session is session
+        assert request_state.precreated_replay_reason == error_code
+        retry_session.account = cast(Any, SimpleNamespace(id="acc-replacement", status=AccountStatus.ACTIVE))
+        return True
+
+    monkeypatch.setattr(service, "_handle_stream_error", handle_stream_error)
+    monkeypatch.setattr(
+        service,
+        "_release_request_state_account_response_create_lease",
+        release_create_lease,
+    )
+    monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_on_replacement)
+
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 503,
+                "error": {
+                    "type": "server_error",
+                    "code": error_code,
+                    "message": "The AI service is temporarily overloaded.",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+    handle_stream_error.assert_awaited_once()
+    release_create_lease.assert_awaited_once_with(request_state)
+    assert request_state.event_queue is not None
+    assert request_state.event_queue.empty()
+    assert request_state.precreated_replay_account_id == owner.id
+    assert session.account.id == "acc-replacement"
 
 
 @pytest.mark.asyncio
@@ -17274,6 +17528,8 @@ async def test_http_bridge_reader_wakes_and_retires_lone_eventless_owner_without
     upstream = _TrackingUpstream()
     session = _make_bridge_session(key_value=f"eventless-{leading_telemetry}")
     session.upstream = cast(UpstreamResponsesWebSocket, upstream)
+    session.durable_session_id = "durable-eventless-owner"
+    session.durable_owner_epoch = 11
     service._http_bridge_sessions[session.key] = session
     settings = _make_app_settings(
         sse_keepalive_interval_seconds=0.0,
@@ -17284,6 +17540,8 @@ async def test_http_bridge_reader_wakes_and_retires_lone_eventless_owner_without
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     retry_precreated = AsyncMock(return_value=False)
     monkeypatch.setattr(service, "_retry_http_bridge_precreated_request", retry_precreated)
+    quarantine_lineage = AsyncMock()
+    monkeypatch.setattr(service, "_quarantine_durable_http_bridge_session", quarantine_lineage)
     monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
     write_request_log = AsyncMock()
     monkeypatch.setattr(service, "_write_request_log", write_request_log)
@@ -17362,6 +17620,8 @@ async def test_http_bridge_reader_wakes_and_retires_lone_eventless_owner_without
     if leading_telemetry:
         assert owner.latency_first_upstream_event_ms is not None
     retry_precreated.assert_not_awaited()
+    quarantine_lineage.assert_awaited_once_with(session)
+    assert session.quarantine_durable_on_close is False
     assert write_request_log.await_count == 2
     assert {call.kwargs["error_code"] for call in write_request_log.await_args_list} == {"upstream_request_timeout"}
     fail_reader.assert_awaited_once()

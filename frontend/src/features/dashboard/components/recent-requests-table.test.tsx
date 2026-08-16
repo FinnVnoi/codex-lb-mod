@@ -22,8 +22,14 @@ const { toastSuccess, toastError } = vi.hoisted(() => ({
   toastSuccess: vi.fn(),
   toastError: vi.fn(),
 }));
-const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
-const originalIsSecureContext = Object.getOwnPropertyDescriptor(window, "isSecureContext");
+const originalClipboard = Object.getOwnPropertyDescriptor(
+  navigator,
+  "clipboard",
+);
+const originalIsSecureContext = Object.getOwnPropertyDescriptor(
+  window,
+  "isSecureContext",
+);
 
 vi.mock("sonner", () => ({
   toast: {
@@ -32,11 +38,14 @@ vi.mock("sonner", () => ({
   },
 }));
 
-vi.mock("@/features/conversation-archive/components/request-archive-panel", () => ({
-  RequestArchivePanel: ({ requestId }: { requestId: string }) => (
-    <div data-testid="request-archive-panel">Archive for {requestId}</div>
-  ),
-}));
+vi.mock(
+  "@/features/conversation-archive/components/request-archive-panel",
+  () => ({
+    RequestArchivePanel: ({ requestId }: { requestId: string }) => (
+      <div data-testid="request-archive-panel">Archive for {requestId}</div>
+    ),
+  }),
+);
 
 const PAGINATION_PROPS = {
   total: 1,
@@ -69,7 +78,8 @@ describe("RecentRequestsTable", () => {
   });
 
   it("renders rows with status badges and supports request details and copy actions", async () => {
-    const longError = "Rate limit reached while processing this request ".repeat(3);
+    const longError =
+      "Rate limit reached while processing this request ".repeat(3);
     const writeText = vi.fn().mockResolvedValue(undefined);
 
     Object.defineProperty(window, "isSecureContext", {
@@ -84,17 +94,17 @@ describe("RecentRequestsTable", () => {
     render(
       <RecentRequestsTable
         {...PAGINATION_PROPS}
-         accounts={[
-           {
-             accountId: "acc-primary",
-             email: "primary@example.com",
-             displayName: "Primary Account",
-             planType: "plus",
-             status: "active",
-             limitWarmupEnabled: false,
-             additionalQuotas: [],
-           },
-         ]}
+        accounts={[
+          {
+            accountId: "acc-primary",
+            email: "primary@example.com",
+            displayName: "Primary Account",
+            planType: "plus",
+            status: "active",
+            limitWarmupEnabled: false,
+            additionalQuotas: [],
+          },
+        ]}
         requests={[
           {
             requestedAt: ISO,
@@ -112,31 +122,31 @@ describe("RecentRequestsTable", () => {
             requestedServiceTier: "priority",
             actualServiceTier: "default",
             transport: "websocket",
-             status: "rate_limit",
-             errorCode: "rate_limit_exceeded",
-             errorMessage: longError,
+            status: "rate_limit",
+            errorCode: "rate_limit_exceeded",
+            errorMessage: longError,
             ...NULL_FAILURE_METADATA,
             ...NULL_USERAGENT_METADATA,
             upstreamTransport: "auto",
-             tokens: 1200,
-             inputTokens: 1000,
-             outputTokens: 200,
-             outputTokensRaw: null,
-             latencyFirstTokenMs: null,
+            tokens: 1200,
+            inputTokens: 1000,
+            outputTokens: 200,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
             latencyQueueMs: null,
-             cachedInputTokens: 200,
-             reasoningEffort: "high",
-             costUsd: 0.01,
-             costBreakdown: {
-               inputUsd: 0.004,
-               cachedInputUsd: 0.001,
-               outputUsd: 0.005,
-               totalUsd: 0.01,
-             },
-             latencyMs: 1000,
-           },
-         ]}
-       />,
+            cachedInputTokens: 200,
+            reasoningEffort: "high",
+            costUsd: 0.01,
+            costBreakdown: {
+              inputUsd: 0.004,
+              cachedInputUsd: 0.001,
+              outputUsd: 0.005,
+              totalUsd: 0.01,
+            },
+            latencyMs: 1000,
+          },
+        ]}
+      />,
     );
 
     expect(screen.getByText("Primary Account")).toBeInTheDocument();
@@ -153,9 +163,13 @@ describe("RecentRequestsTable", () => {
     expect(dialog).toBeInTheDocument();
     expect(within(dialog).getByText("Request Details")).toBeInTheDocument();
     expect(within(dialog).getByText("req-1")).toBeInTheDocument();
-    expect(within(dialog).getByTestId("request-archive-panel")).toHaveTextContent("Archive for archive-req-1");
+    expect(
+      within(dialog).getByTestId("request-archive-panel"),
+    ).toHaveTextContent("Archive for archive-req-1");
     expect(within(dialog).getByText("rate_limit_exceeded")).toBeInTheDocument();
-    expect(dialog.textContent).toContain("Rate limit reached while processing this request");
+    expect(dialog.textContent).toContain(
+      "Rate limit reached while processing this request",
+    );
     expect(within(dialog).getByText("1.0 s")).toBeInTheDocument();
 
     await act(async () => {
@@ -165,7 +179,9 @@ describe("RecentRequestsTable", () => {
 
     expect(writeText).toHaveBeenCalledWith("req-1");
     expect(toastSuccess).toHaveBeenCalledWith("Copied to clipboard");
-    expect(screen.getByRole("button", { name: "Copy Request ID Copied" })).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Copy Request ID Copied" }),
+    ).toBeInTheDocument();
 
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Copy Error" }));
@@ -272,12 +288,129 @@ describe("RecentRequestsTable", () => {
     expect(row).not.toBeNull();
     expect(within(row as HTMLElement).getByText("200ms")).toBeInTheDocument();
     expect(within(row as HTMLElement).getByText("--")).toBeInTheDocument();
-    expect(within(row as HTMLElement).queryByText("250.0")).not.toBeInTheDocument();
+    expect(
+      within(row as HTMLElement).queryByText("250.0"),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the desktop column width and one horizontal scroller on narrow screens", () => {
+    const { container } = render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: null,
+            planType: null,
+            apiKeyName: "Mobile Key",
+            apiKeyId: "mobile-key",
+            requestId: "req-mobile-layout",
+            conversationId: null,
+            requestKind: "normal",
+            model: "gpt-5.1",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    const table = screen.getByRole("table");
+    expect(table).toHaveClass("min-w-[1280px]", "table-auto");
+    expect(table).not.toHaveClass("table-fixed");
+    expect(
+      container.querySelectorAll('[data-slot="table-container"]'),
+    ).toHaveLength(1);
+  });
+
+  it("keeps request details scrollable inside the bounded dialog", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            requestedAt: ISO,
+            accountId: null,
+            planType: null,
+            apiKeyName: "Scrollable Key",
+            apiKeyId: "scrollable-key",
+            requestId: "req-scrollable-details",
+            conversationId: "conversation-scrollable",
+            archiveRequestId: "archive-scrollable",
+            requestKind: "normal",
+            model: "gpt-5.6-sol",
+            source: null,
+            serviceTier: null,
+            requestedServiceTier: null,
+            actualServiceTier: null,
+            transport: "http",
+            ...NULL_USERAGENT_METADATA,
+            status: "error",
+            errorCode: "upstream_error",
+            errorMessage: "A detailed error message",
+            ...NULL_FAILURE_METADATA,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
+            latencyQueueMs: null,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "View Details" }));
+    const dialog = screen.getByRole("dialog");
+    const scrollRegion = dialog.querySelector(".overflow-y-auto");
+
+    expect(dialog).toHaveClass("grid-rows-[auto_minmax(0,1fr)]");
+    expect(scrollRegion).toHaveClass(
+      "min-h-0",
+      "overflow-y-auto",
+      "overscroll-contain",
+      "touch-pan-y",
+    );
   });
 
   it("renders empty state", () => {
-    render(<RecentRequestsTable {...PAGINATION_PROPS} total={0} accounts={[]} requests={[]} />);
-    expect(screen.getByText("No request logs match the current filters.")).toBeInTheDocument();
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        total={0}
+        accounts={[]}
+        requests={[]}
+      />,
+    );
+    expect(
+      screen.getByText("No request logs match the current filters."),
+    ).toBeInTheDocument();
   });
 
   it("shows warmup marker only for warmup rows", () => {
@@ -337,9 +470,9 @@ describe("RecentRequestsTable", () => {
             actualServiceTier: null,
             transport: "http",
             ...NULL_USERAGENT_METADATA,
-             status: "ok",
-             errorCode: null,
-             errorMessage: null,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
             tokens: 1,
             inputTokens: 1,
             outputTokens: 0,
@@ -382,29 +515,31 @@ describe("RecentRequestsTable", () => {
             actualServiceTier: null,
             transport: null,
             ...NULL_USERAGENT_METADATA,
-             status: "ok",
-             errorCode: null,
-             errorMessage: null,
+            status: "ok",
+            errorCode: null,
+            errorMessage: null,
             ...NULL_FAILURE_METADATA,
-             tokens: 1,
-             inputTokens: 1,
-             outputTokens: 0,
-             outputTokensRaw: null,
-             latencyFirstTokenMs: null,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
             latencyQueueMs: null,
-             cachedInputTokens: null,
-             reasoningEffort: null,
-             costUsd: 0,
-             costBreakdown: null,
-             latencyMs: 1,
-           },
-         ]}
-       />,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
     );
 
     const row = screen.getByText("gpt-5.1").closest("tr");
     expect(row).not.toBeNull();
-    expect(within(row as HTMLElement).getAllByText("--").length).toBeGreaterThan(0);
+    expect(
+      within(row as HTMLElement).getAllByText("--").length,
+    ).toBeGreaterThan(0);
   });
 
   it("shows details action for error-code-only rows", async () => {
@@ -429,24 +564,24 @@ describe("RecentRequestsTable", () => {
             actualServiceTier: null,
             transport: "http",
             ...NULL_USERAGENT_METADATA,
-             status: "error",
-             errorCode: "upstream_error",
-             errorMessage: null,
+            status: "error",
+            errorCode: "upstream_error",
+            errorMessage: null,
             ...NULL_FAILURE_METADATA,
-             tokens: 1,
-             inputTokens: 1,
-             outputTokens: 0,
-             outputTokensRaw: null,
-             latencyFirstTokenMs: null,
+            tokens: 1,
+            inputTokens: 1,
+            outputTokens: 0,
+            outputTokensRaw: null,
+            latencyFirstTokenMs: null,
             latencyQueueMs: null,
-             cachedInputTokens: null,
-             reasoningEffort: null,
-             costUsd: 0,
-             costBreakdown: null,
-             latencyMs: 1,
-           },
-         ]}
-       />,
+            cachedInputTokens: null,
+            reasoningEffort: null,
+            costUsd: 0,
+            costBreakdown: null,
+            latencyMs: 1,
+          },
+        ]}
+      />,
     );
 
     const dialog = openRequestDetails();
@@ -503,7 +638,9 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
+    const costSection = within(dialog)
+      .getByText("Cost")
+      .closest("div.space-y-2");
 
     expect(within(dialog).getByText("Cost")).toBeInTheDocument();
     expect(costSection).toHaveTextContent("$0.01 =");
@@ -533,7 +670,8 @@ describe("RecentRequestsTable", () => {
             requestedServiceTier: null,
             actualServiceTier: null,
             transport: "http",
-            useragent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
+            useragent:
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
             useragentGroup: "Mozilla",
             clientIp: "203.0.113.7",
             status: "ok",
@@ -564,12 +702,18 @@ describe("RecentRequestsTable", () => {
 
     expect(within(dialog).getByText("User Agent")).toBeInTheDocument();
     expect(
-      within(dialog).getByText("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36"),
+      within(dialog).getByText(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
+      ),
     ).toBeInTheDocument();
     expect(within(dialog).getByText("Client IP")).toBeInTheDocument();
     expect(within(dialog).getByText("203.0.113.7")).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "Copy User Agent" })).toBeInTheDocument();
-    expect(within(dialog).getByRole("button", { name: "Copy Client IP" })).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Copy User Agent" }),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Copy Client IP" }),
+    ).toBeInTheDocument();
     expect(errorCodeIndex).toBeGreaterThanOrEqual(0);
     expect(userAgentIndex).toBeGreaterThan(errorCodeIndex);
     expect(clientIpIndex).toBeGreaterThan(userAgentIndex);
@@ -620,8 +764,12 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    const userAgentField = within(dialog).getByText("User Agent").closest("div.space-y-1");
-    const clientIpField = within(dialog).getByText("Client IP").closest("div.space-y-1");
+    const userAgentField = within(dialog)
+      .getByText("User Agent")
+      .closest("div.space-y-1");
+    const clientIpField = within(dialog)
+      .getByText("Client IP")
+      .closest("div.space-y-1");
 
     expect(userAgentField).not.toBeNull();
     expect(userAgentField).toHaveTextContent("User Agent");
@@ -629,7 +777,9 @@ describe("RecentRequestsTable", () => {
     expect(clientIpField).not.toBeNull();
     expect(clientIpField).toHaveTextContent("Client IP");
     expect(clientIpField).toHaveTextContent("—");
-    expect(within(dialog).queryByRole("button", { name: "Copy" })).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: "Copy" }),
+    ).not.toBeInTheDocument();
   });
 
   it("hides the cost section for non-ok rows", () => {
@@ -732,7 +882,9 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
+    const costSection = within(dialog)
+      .getByText("Cost")
+      .closest("div.space-y-2");
 
     expect(within(dialog).getByText("Cost")).toBeInTheDocument();
     expect(costSection).toHaveTextContent("$0.01 =");
@@ -789,7 +941,9 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    const costSection = within(dialog).getByText("Cost").closest("div.space-y-2");
+    const costSection = within(dialog)
+      .getByText("Cost")
+      .closest("div.space-y-2");
 
     expect(within(dialog).getByText("Cost")).toBeInTheDocument();
     expect(costSection).not.toHaveTextContent("=");
@@ -819,7 +973,8 @@ describe("RecentRequestsTable", () => {
             requestedServiceTier: null,
             actualServiceTier: null,
             transport: "http",
-            useragent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
+            useragent:
+              "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
             useragentGroup: "Mozilla",
             clientIp: "203.0.113.7",
             status: "ok",
@@ -850,7 +1005,9 @@ describe("RecentRequestsTable", () => {
 
     expect(within(dialog).getByText("User Agent")).toBeInTheDocument();
     expect(
-      within(dialog).getByText("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36"),
+      within(dialog).getByText(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/537.36",
+      ),
     ).toBeInTheDocument();
     expect(within(dialog).getByText("Client IP")).toBeInTheDocument();
     expect(within(dialog).getByText("203.0.113.7")).toBeInTheDocument();
@@ -904,8 +1061,12 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    const userAgentField = within(dialog).getByText("User Agent").closest("div.space-y-1");
-    const clientIpField = within(dialog).getByText("Client IP").closest("div.space-y-1");
+    const userAgentField = within(dialog)
+      .getByText("User Agent")
+      .closest("div.space-y-1");
+    const clientIpField = within(dialog)
+      .getByText("Client IP")
+      .closest("div.space-y-1");
 
     expect(userAgentField).not.toBeNull();
     expect(userAgentField).toHaveTextContent("User Agent");
@@ -1017,9 +1178,13 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    expect(within(dialog).getByText("conv_dialog_close_test")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText("conv_dialog_close_test"),
+    ).toBeInTheDocument();
 
-    const convButton = within(dialog).getByRole("button", { name: /Filter by conversation/i });
+    const convButton = within(dialog).getByRole("button", {
+      name: /Filter by conversation/i,
+    });
     fireEvent.click(convButton);
 
     expect(onConversationClick).toHaveBeenCalledWith("conv_dialog_close_test");
@@ -1082,7 +1247,8 @@ describe("RecentRequestsTable", () => {
   });
 
   it("truncates long conversation IDs with title attribute in dialog", () => {
-    const longId = "conv_this_is_a_very_very_very_very_long_conversation_id_that_would_overflow_a_half_width_column";
+    const longId =
+      "conv_this_is_a_very_very_very_very_long_conversation_id_that_would_overflow_a_half_width_column";
     render(
       <RecentRequestsTable
         {...PAGINATION_PROPS}
@@ -1128,14 +1294,17 @@ describe("RecentRequestsTable", () => {
     );
 
     const dialog = openRequestDetails();
-    const convButton = within(dialog).getByRole("button", { name: /Filter by conversation/i });
+    const convButton = within(dialog).getByRole("button", {
+      name: /Filter by conversation/i,
+    });
     expect(convButton).toHaveAttribute("title", longId);
     expect(convButton).toHaveClass("truncate");
     expect(convButton.className).toMatch(/max-w-\[200px\]/);
   });
 
   it("truncates long no-handler conversation IDs with title attribute", () => {
-    const longId = "conv_this_is_a_very_very_long_id_with_no_handler_that_would_overflow";
+    const longId =
+      "conv_this_is_a_very_very_long_id_with_no_handler_that_would_overflow";
     render(
       <RecentRequestsTable
         {...PAGINATION_PROPS}

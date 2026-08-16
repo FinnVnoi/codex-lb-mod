@@ -41,6 +41,7 @@ def _default_put_body() -> dict[str, Any]:
         ("upstreamStreamTransport", "websocket", "upstream_stream_transport"),
         ("prohibitFastMode", True, "prohibit_fast_mode"),
         ("preferEarlierResetAccounts", False, "prefer_earlier_reset_accounts"),
+        ("preferEarlierRenewalAccounts", True, "prefer_earlier_renewal_accounts"),
         ("showResetCreditBadges", False, "show_reset_credit_badges"),
         (
             "autoRedeemResetCreditsBeforeExpiry",

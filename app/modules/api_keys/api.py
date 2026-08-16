@@ -56,6 +56,7 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         source_assignment_scope_enabled=row.source_assignment_scope_enabled,
         assigned_account_ids=row.assigned_account_ids,
         assigned_source_ids=row.assigned_source_ids,
+        routing_mode=row.routing_mode,
         created_at=row.created_at,
         last_used_at=row.last_used_at,
         limits=[
@@ -146,6 +147,7 @@ async def create_api_key(
                 expires_at=payload.expires_at,
                 assigned_account_ids=payload.assigned_account_ids,
                 assigned_source_ids=payload.assigned_source_ids,
+                routing_mode=payload.routing_mode,
                 limits=limit_inputs,
             )
         )
@@ -163,6 +165,7 @@ async def create_api_key(
     )
 
 
+@router.get("", response_model=list[ApiKeyResponse], include_in_schema=False)
 @router.get("/", response_model=list[ApiKeyResponse])
 async def list_api_keys(
     context: ApiKeysContext = Depends(get_api_keys_context),
@@ -211,6 +214,8 @@ async def update_api_key(
         assigned_account_ids_set="assigned_account_ids" in fields,
         assigned_source_ids=payload.assigned_source_ids,
         assigned_source_ids_set="assigned_source_ids" in fields,
+        routing_mode=payload.routing_mode,
+        routing_mode_set="routing_mode" in fields,
         limits=limit_inputs,
         limits_set=limits_set,
         reset_usage=bool(payload.reset_usage),

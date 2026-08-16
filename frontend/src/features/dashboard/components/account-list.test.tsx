@@ -47,6 +47,33 @@ describe("AccountList", () => {
     expect(screen.getByText("On")).toBeInTheDocument();
   });
 
+  it("renders subscription renewal after warm-up and supports renewal sorting", async () => {
+    const user = userEvent.setup();
+    render(
+      <AccountList
+        accounts={[
+          createAccountSummary({
+            accountId: "acc-later",
+            displayName: "Later Account",
+            subscriptionActiveUntil: "2099-02-01T12:00:00.000Z",
+          }),
+          createAccountSummary({
+            accountId: "acc-sooner",
+            displayName: "Sooner Account",
+            subscriptionActiveUntil: "2099-01-11T12:00:00.000Z",
+          }),
+        ]}
+      />,
+    );
+
+    expect(screen.getByRole("button", { name: "Renewal" })).toBeInTheDocument();
+    expect(screen.getByText((text) => text.startsWith("01/11/2099 · "))).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Renewal" }));
+
+    expect(rowNames()).toEqual(["Sooner Account", "Later Account"]);
+  });
+
   it("renders primary idle warm-up attempts as 5h", () => {
     const attemptedAt = new Date("2026-06-03T12:00:00Z").toISOString();
     const account = createAccountSummary({

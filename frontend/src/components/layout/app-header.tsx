@@ -29,6 +29,7 @@ const CORE_NAV_ITEMS = [
 
 const ADVANCED_NAV_ITEMS = [
   { to: "/automations", labelKey: "nav.automations" },
+  { to: "/providers", labelKey: "nav.openaiCompatibleProviders" },
 ] as const;
 
 export type AppHeaderProps = {

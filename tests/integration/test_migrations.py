@@ -1195,3 +1195,97 @@ async def test_request_log_conversation_id_migration_upgrade_and_downgrade(tmp_p
         assert "conversation_id" not in columns
     finally:
         await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prefer_earlier_renewal_settings_migration_upgrade_and_downgrade(tmp_path):
+    from alembic import command
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'prefer-earlier-renewal.sqlite'}"
+    parent_revision = "20260731_010000_add_api_key_routing_mode"
+    renewal_revision = "20260808_000000_add_prefer_earlier_renewal_accounts"
+
+    async def _dashboard_columns(engine) -> set[str]:
+        async with engine.connect() as conn:
+            rows = await conn.execute(text("PRAGMA table_info('dashboard_settings')"))
+            return {row[1] for row in rows}
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        assert "prefer_earlier_renewal_accounts" not in await _dashboard_columns(engine)
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, renewal_revision, bootstrap_legacy=False))
+        assert "prefer_earlier_renewal_accounts" in await _dashboard_columns(engine)
+        async with engine.connect() as conn:
+            values = (
+                (await conn.execute(text("SELECT prefer_earlier_renewal_accounts FROM dashboard_settings")))
+                .scalars()
+                .all()
+            )
+            assert values
+            assert all(value in (False, 0) for value in values)
+
+        config = _build_alembic_config(db_url)
+        await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        assert "prefer_earlier_renewal_accounts" not in await _dashboard_columns(engine)
+
+        result = await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+        assert result.current_revision == _HEAD_REVISION
+        assert "prefer_earlier_renewal_accounts" in await _dashboard_columns(engine)
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_prefer_unstarted_quota_settings_migration_upgrade_and_downgrade(tmp_path):
+    from alembic import command
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'prefer-unstarted-quota.sqlite'}"
+    parent_revision = "20260808_000000_add_prefer_earlier_renewal_accounts"
+    preference_revision = "20260809_000000_add_prefer_unstarted_quota_accounts"
+
+    async def _dashboard_columns(engine) -> set[str]:
+        async with engine.connect() as conn:
+            rows = await conn.execute(text("PRAGMA table_info('dashboard_settings')"))
+            return {row[1] for row in rows}
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        columns = await _dashboard_columns(engine)
+        assert "prefer_unstarted_quota_accounts" not in columns
+        assert "prefer_unstarted_quota_window" not in columns
+
+        await to_thread.run_sync(lambda: run_upgrade(db_url, preference_revision, bootstrap_legacy=False))
+        columns = await _dashboard_columns(engine)
+        assert "prefer_unstarted_quota_accounts" in columns
+        assert "prefer_unstarted_quota_window" in columns
+        async with engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        "SELECT prefer_unstarted_quota_accounts, prefer_unstarted_quota_window FROM dashboard_settings"
+                    )
+                )
+            ).all()
+            assert rows
+            assert all(enabled in (False, 0) and window == "both" for enabled, window in rows)
+
+        config = _build_alembic_config(db_url)
+        await to_thread.run_sync(lambda: command.downgrade(config, parent_revision))
+        columns = await _dashboard_columns(engine)
+        assert "prefer_unstarted_quota_accounts" not in columns
+        assert "prefer_unstarted_quota_window" not in columns
+
+        result = await to_thread.run_sync(lambda: run_upgrade(db_url, "head", bootstrap_legacy=False))
+        assert result.current_revision == _HEAD_REVISION
+        columns = await _dashboard_columns(engine)
+        assert "prefer_unstarted_quota_accounts" in columns
+        assert "prefer_unstarted_quota_window" in columns
+    finally:
+        await engine.dispose()

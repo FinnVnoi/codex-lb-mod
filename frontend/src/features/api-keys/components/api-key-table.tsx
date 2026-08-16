@@ -115,6 +115,7 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
           <TableHead className="w-[20%] min-w-[12rem] pl-4 text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.name")}</TableHead>
           <TableHead className="w-[10%] min-w-[8rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.prefix")}</TableHead>
           <TableHead className="w-[9%] min-w-[6.5rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.models")}</TableHead>
+          <TableHead className="w-[9%] min-w-[7.5rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.routing")}</TableHead>
           <TableHead className="w-[9%] min-w-[6.5rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.traffic")}</TableHead>
           <TableHead className="w-[26%] min-w-[17rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.usage")}</TableHead>
           <TableHead className="w-[14%] min-w-[12rem] text-[11px] uppercase tracking-wider text-muted-foreground/80">{t("apiKeys.table.limit")}</TableHead>
@@ -127,12 +128,14 @@ export function ApiKeyTable({ keys, busy, onEdit, onDelete, onRegenerate }: ApiK
         {keys.map((apiKey) => {
           const models = apiKey.allowedModels?.join(", ") || t("common.options.all");
           const trafficClass = apiKey.trafficClass === "opportunistic" ? t("common.traffic.opportunistic") : t("common.traffic.foreground");
+          const routingMode = t(`apiKeys.routing.${apiKey.routingMode === "account_first" ? "accountFirst" : apiKey.routingMode === "provider_first" ? "providerFirst" : "balanced"}`);
 
           return (
             <TableRow key={apiKey.id}>
               <TableCell className="pl-4 font-medium truncate">{apiKey.name}</TableCell>
               <TableCell className="truncate font-mono text-xs">{apiKey.keyPrefix}</TableCell>
               <TableCell className="truncate">{models}</TableCell>
+              <TableCell><Badge variant="outline">{routingMode}</Badge></TableCell>
               <TableCell className="truncate text-xs tabular-nums">{trafficClass}</TableCell>
               <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getUsageValue(apiKey, t)}</TableCell>
               <TableCell className="text-xs tabular-nums leading-tight whitespace-normal">{getLimitValue(apiKey, t)}</TableCell>

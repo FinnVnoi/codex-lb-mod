@@ -3190,6 +3190,31 @@ async def _stream_responses_with_session(
             response_failed_event(routed_error_code, response_error_message, response_id=get_request_id()),
         )
         return
+    except aiohttp.ClientPayloadError as exc:
+        error_code = "stream_incomplete"
+        error_message = str(exc) or "Upstream response body was truncated"
+        response_error_message = error_message
+        failure_phase = "upstream"
+        failure_detail = "upstream_body_truncated"
+        failure_exception_type = type(exc).__name__
+        retryable_same_contract = False
+        if raise_for_status and get_request_id() is None:
+            raise ProxyResponseError(
+                502,
+                openai_error("stream_incomplete", str(exc) or "Upstream response body was truncated"),
+                failure_phase=failure_phase,
+                retryable_same_contract=False,
+                failure_detail=failure_detail,
+                failure_exception_type=failure_exception_type,
+            ) from exc
+        yield format_sse_event(
+            response_failed_event(
+                "stream_incomplete",
+                str(exc) or "Upstream response body was truncated",
+                response_id=get_request_id(),
+            ),
+        )
+        return
     except aiohttp.ClientError as exc:
         error_code = process_network_error_code(
             exc,

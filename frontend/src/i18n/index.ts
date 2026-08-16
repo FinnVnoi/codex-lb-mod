@@ -3,18 +3,16 @@ import LanguageDetector from "i18next-browser-languagedetector";
 import { initReactI18next } from "react-i18next";
 
 import en from "./locales/en.json";
-import ko from "./locales/ko.json";
-import zhCN from "./locales/zh-CN.json";
+import vi from "./locales/vi.json";
 
-export const SUPPORTED_LANGUAGES = ["en", "zh-CN", "ko"] as const;
+export const SUPPORTED_LANGUAGES = ["en", "vi"] as const;
 export type SupportedLanguage = (typeof SUPPORTED_LANGUAGES)[number];
 
 export const LANGUAGE_STORAGE_KEY = "codex-lb-language";
 
 const resources = {
   en: { translation: en },
-  "zh-CN": { translation: zhCN },
-  ko: { translation: ko },
+  vi: { translation: vi },
 } as const;
 
 export function normalizeSupportedLanguage(lng: string | null | undefined): SupportedLanguage {
@@ -26,14 +24,11 @@ export function normalizeSupportedLanguage(lng: string | null | undefined): Supp
     return exactMatch;
   }
   const baseLanguage = lng.split(/[-_]/, 1)[0]?.toLowerCase();
-  if (baseLanguage === "zh") {
-    return "zh-CN";
+  if (baseLanguage === "vi" || baseLanguage === "zh" || baseLanguage === "ko") {
+    return "vi";
   }
   if (baseLanguage === "en") {
     return "en";
-  }
-  if (baseLanguage === "ko") {
-    return "ko";
   }
   return "en";
 }

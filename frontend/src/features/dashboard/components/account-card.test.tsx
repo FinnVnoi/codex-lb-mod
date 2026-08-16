@@ -113,6 +113,20 @@ describe("AccountCard", () => {
     expect(screen.getByText("959.00")).toBeInTheDocument();
   });
 
+  it("renders subscription renewal beside credits", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T12:00:00.000Z"));
+    const account = createAccountSummary({
+      creditsBalance: 959,
+      subscriptionActiveUntil: "2026-01-11T12:00:00.000Z",
+    });
+
+    render(<AccountCard account={account} />);
+
+    expect(screen.getByText("Renewal 01/11/2026 · 10d")).toBeInTheDocument();
+    vi.useRealTimers();
+  });
+
   it("renders re-auth status and action for re-auth required accounts", () => {
     const account = createAccountSummary({ status: "reauth_required" });
 

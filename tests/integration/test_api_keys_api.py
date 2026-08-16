@@ -167,6 +167,10 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert rows[0]["assignedAccountIds"] == []
     assert len(rows[0]["limits"]) == 1
 
+    listed_without_trailing_slash = await async_client.get("/api/api-keys")
+    assert listed_without_trailing_slash.status_code == 200
+    assert listed_without_trailing_slash.json() == rows
+
     updated = await async_client.patch(
         f"/api/api-keys/{key_id}",
         json={

@@ -24,6 +24,7 @@ from app.core.balancer import (
     ResetPreferenceWindow,
     RoutingStrategy,
     TrafficClass,
+    UnstartedQuotaPreferenceWindow,
 )
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
@@ -1002,6 +1003,9 @@ class ProxyService(
                 api_key=api_key,
                 affinity_policy=affinity,
                 prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                prefer_unstarted_quota_accounts=bool(getattr(settings, "prefer_unstarted_quota_accounts", False)),
+                prefer_unstarted_quota_window=getattr(settings, "prefer_unstarted_quota_window", "both"),
+                prefer_earlier_renewal_accounts=bool(getattr(settings, "prefer_earlier_renewal_accounts", False)),
                 prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                 routing_strategy=routing_strategy,
                 model=selection_model,
@@ -1078,6 +1082,9 @@ class ProxyService(
                     legacy_sticky_key=affinity.legacy_selection_key,
                     sticky_max_age_seconds=affinity.max_age_seconds,
                     prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                    prefer_unstarted_quota_accounts=bool(getattr(settings, "prefer_unstarted_quota_accounts", False)),
+                    prefer_unstarted_quota_window=getattr(settings, "prefer_unstarted_quota_window", "both"),
+                    prefer_earlier_renewal_accounts=bool(getattr(settings, "prefer_earlier_renewal_accounts", False)),
                     routing_strategy=routing_strategy,
                     model=selection_model,
                     exclude_account_ids=excluded_account_ids,
@@ -1165,6 +1172,15 @@ class ProxyService(
                                     api_key=api_key,
                                     affinity_policy=affinity,
                                     prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                                    prefer_unstarted_quota_accounts=bool(
+                                        getattr(settings, "prefer_unstarted_quota_accounts", False)
+                                    ),
+                                    prefer_unstarted_quota_window=getattr(
+                                        settings, "prefer_unstarted_quota_window", "both"
+                                    ),
+                                    prefer_earlier_renewal_accounts=bool(
+                                        getattr(settings, "prefer_earlier_renewal_accounts", False)
+                                    ),
                                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                                     routing_strategy=routing_strategy,
                                     model=selection_model,
@@ -1419,6 +1435,16 @@ class ProxyService(
             if scoped_account_ids is not None and selected_account_id not in scoped_account_ids:
                 return None
             scoped_account_ids = {selected_account_id}
+        selection_kwargs: dict[str, Any] = {}
+        if settings.prefer_earlier_reset_accounts:
+            selection_kwargs["prefer_earlier_reset_accounts"] = True
+        if bool(getattr(settings, "prefer_unstarted_quota_accounts", False)):
+            selection_kwargs["prefer_unstarted_quota_accounts"] = True
+            selection_kwargs["prefer_unstarted_quota_window"] = getattr(
+                settings, "prefer_unstarted_quota_window", "both"
+            )
+        if bool(getattr(settings, "prefer_earlier_renewal_accounts", False)):
+            selection_kwargs["prefer_earlier_renewal_accounts"] = True
         selection = await self._load_balancer.select_account(
             sticky_key=affinity.selection_key,
             sticky_kind=affinity.kind,
@@ -1433,6 +1459,7 @@ class ProxyService(
             secondary_budget_threshold_pct=_sticky_reallocation_secondary_budget_threshold_pct(settings),
             traffic_class=traffic_class,
             concurrency_caps=effective_account_concurrency_caps(settings),
+            **selection_kwargs,
         )
         if selection.account is None:
             return None
@@ -1684,6 +1711,9 @@ class ProxyService(
         sticky_max_age_seconds: int | None = None,
         prefer_earlier_reset_accounts: bool = False,
         prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
+        prefer_unstarted_quota_accounts: bool = False,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
+        prefer_earlier_renewal_accounts: bool = False,
         routing_strategy: RoutingStrategy = "capacity_weighted",
         model: str | None = None,
         service_tier: str | None = None,
@@ -1829,6 +1859,9 @@ class ProxyService(
                         legacy_sticky_key=preferred_sticky_inputs[5],
                         prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
+                        prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                        prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                        prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                         routing_strategy=routing_strategy,
                         relative_availability_power=_relative_availability_power(settings),
                         relative_availability_top_k=_relative_availability_top_k(settings),
@@ -1889,6 +1922,9 @@ class ProxyService(
                     sticky_max_age_seconds=sticky_max_age_seconds,
                     prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     relative_availability_power=_relative_availability_power(settings),
                     relative_availability_top_k=_relative_availability_top_k(settings),
@@ -2004,6 +2040,9 @@ class ProxyService(
             model=model,
             account_ids=scoped_account_ids,
             prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+            prefer_unstarted_quota_accounts=bool(getattr(settings, "prefer_unstarted_quota_accounts", False)),
+            prefer_unstarted_quota_window=getattr(settings, "prefer_unstarted_quota_window", "both"),
+            prefer_earlier_renewal_accounts=bool(getattr(settings, "prefer_earlier_renewal_accounts", False)),
             prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
             routing_strategy=_routing_strategy(settings),
             budget_threshold_pct=_sticky_reallocation_primary_budget_threshold_pct(settings),

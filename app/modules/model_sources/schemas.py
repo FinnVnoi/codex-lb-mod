@@ -9,6 +9,7 @@ from app.modules.shared.schemas import DashboardModel
 
 class ModelSourceModelInput(DashboardModel):
     model: str = Field(min_length=1, max_length=255)
+    upstream_model: str | None = Field(default=None, max_length=255)
     display_name: str | None = Field(default=None, max_length=255)
     context_window: int | None = Field(default=None, ge=1)
     max_output_tokens: int | None = Field(default=None, ge=1)
@@ -39,6 +40,7 @@ class ModelSourceCreateRequest(DashboardModel):
     supports_audio_transcriptions: bool = False
     timeout_seconds: int | None = Field(default=None, ge=1)
     max_concurrency: int | None = Field(default=None, ge=1)
+    routing_policy: str = Field(default="normal", pattern=r"^(normal|burn_first|preserve|fallback_only)$")
     models: list[ModelSourceModelInput] = Field(default_factory=list)
 
 
@@ -52,6 +54,7 @@ class ModelSourceUpdateRequest(DashboardModel):
     supports_audio_transcriptions: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=1)
     max_concurrency: int | None = Field(default=None, ge=1)
+    routing_policy: str | None = Field(default=None, pattern=r"^(normal|burn_first|preserve|fallback_only)$")
     models: list[ModelSourceModelInput] | None = None
 
 
@@ -67,6 +70,7 @@ class ModelSourceResponse(DashboardModel):
     supports_audio_transcriptions: bool
     timeout_seconds: int | None
     max_concurrency: int | None
+    routing_policy: str
     created_at: datetime
     updated_at: datetime
     models: list[ModelSourceModelResponse] = Field(default_factory=list)

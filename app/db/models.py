@@ -607,6 +607,12 @@ class DashboardSettings(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=False)
     sticky_threads_enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true(), nullable=False)
+    model_source_sticky_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    model_source_sticky_ttl_seconds: Mapped[int] = mapped_column(
+        Integer, default=1800, server_default="1800", nullable=False
+    )
     upstream_stream_transport: Mapped[str] = mapped_column(
         String,
         default="default",
@@ -637,8 +643,21 @@ class DashboardSettings(Base):
         Integer,
         nullable=True,
     )
+    overload_cooldown_seconds: Mapped[int] = mapped_column(Integer, default=600, server_default="600", nullable=False)
     prefer_earlier_reset_accounts: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
+    )
+    prefer_unstarted_quota_accounts: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
+    )
+    prefer_unstarted_quota_window: Mapped[str] = mapped_column(
+        String,
+        default="both",
+        server_default=text("'both'"),
+        nullable=False,
+    )
+    prefer_earlier_renewal_accounts: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default=false(), nullable=False
     )
     prefer_earlier_reset_window: Mapped[str] = mapped_column(
         String,
@@ -940,6 +959,12 @@ class ApiKey(Base):
         server_default=false(),
         nullable=False,
     )
+    routing_mode: Mapped[str] = mapped_column(
+        String,
+        default="balanced",
+        server_default=text("'balanced'"),
+        nullable=False,
+    )
     usage_sections: Mapped[str | None] = mapped_column(
         Text,
         nullable=False,
@@ -1030,6 +1055,9 @@ class ModelSource(Base):
     )
     timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_concurrency: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    routing_policy: Mapped[str] = mapped_column(
+        String, default="normal", server_default=text("'normal'"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,
@@ -1064,6 +1092,7 @@ class ModelSourceModel(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     source_id: Mapped[str] = mapped_column(String, ForeignKey("model_sources.id", ondelete="CASCADE"), nullable=False)
     model: Mapped[str] = mapped_column(String, nullable=False)
+    upstream_model: Mapped[str | None] = mapped_column(String, nullable=True)
     display_name: Mapped[str | None] = mapped_column(String, nullable=True)
     context_window: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
