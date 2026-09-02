@@ -13667,6 +13667,8 @@ async def test_process_http_bridge_upstream_text_retries_precreated_usage_limit(
     finalize.assert_not_awaited()
     assert request_state.event_queue is not None
     assert request_state.event_queue.empty()
+    assert session.upstream_control.reconnect_requested is True
+    assert session.upstream_control.retire_after_drain is True
     assert session.pending_requests == deque([request_state])
     assert session.queued_request_count == 1
 

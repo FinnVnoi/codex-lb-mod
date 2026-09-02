@@ -347,7 +347,9 @@ class _StreamingRetryMixin:
             prompt_cache_key_set=_prompt_cache_key_from_request_model(payload) is not None,
         )
         routing_strategy = _facade()._routing_strategy(settings)
-        max_attempts = _facade()._STREAM_MAX_ACCOUNT_ATTEMPTS
+        max_attempts = _facade()._account_branch_max_attempts(
+            _facade()._routing_engine_policy_from_settings(settings)
+        )
         settled = False
         any_attempt_logged = False
         upstream_transport_metric_status: str | None = None

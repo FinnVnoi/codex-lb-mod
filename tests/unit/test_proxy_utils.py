@@ -26,7 +26,7 @@ from aiohttp.client_exceptions import ClientConnectorCertificateError
 from aiohttp.client_reqrep import ConnectionKey, RequestInfo
 from fastapi import WebSocket
 from starlette.requests import Request
-from starlette.responses import StreamingResponse
+from starlette.responses import JSONResponse, StreamingResponse
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
@@ -93,6 +93,75 @@ from app.modules.request_logs.repository import PreviousResponseOwnerRecord, Req
 from app.modules.usage.repository import AdditionalUsageRepository, UsageRepository
 
 pytestmark = pytest.mark.unit
+
+
+def test_insufficient_balance_qualifies_for_model_source_auto_pause() -> None:
+    assert "insufficient_balance" in proxy_api._SOURCE_AUTO_PAUSE_ERROR_CODES
+    normalized_code = "INSUFFICIENT_BALANCE".strip().lower()
+    assert normalized_code in proxy_api._SOURCE_AUTO_PAUSE_ERROR_CODES
+
+
+def test_wrapped_api_key_validation_failure_qualifies_for_model_source_auto_pause() -> None:
+    assert proxy_api._is_model_source_auto_pause_failure(
+        error_code="INTERNAL_ERROR",
+        error_message="  Failed   to validate API key  ",
+        upstream_status_code=500,
+    )
+
+
+def test_generic_internal_error_does_not_qualify_for_model_source_auto_pause() -> None:
+    assert not proxy_api._is_model_source_auto_pause_failure(
+        error_code="INTERNAL_ERROR",
+        error_message="Temporary upstream failure",
+        upstream_status_code=500,
+    )
+
+
+def test_balanced_native_routing_bypasses_known_exhausted_account_pool() -> None:
+    assert proxy_api._route_to_provider_for_native_model(
+        SimpleNamespace(id="key", routing_mode="balanced"),
+        model="gpt-5.6-sol",
+        account_pool_available=False,
+    )
+
+
+def test_account_can_reenter_rotation_only_after_reset() -> None:
+    now = 1_700_000_000
+    exhausted = SimpleNamespace(status=AccountStatus.RATE_LIMITED, reset_at=now + 60)
+    elapsed = SimpleNamespace(status=AccountStatus.RATE_LIMITED, reset_at=now)
+
+    assert not proxy_api._account_can_reenter_rotation(exhausted, now_epoch=now)
+    assert proxy_api._account_can_reenter_rotation(elapsed, now_epoch=now)
+
+
+@pytest.mark.asyncio
+async def test_source_account_first_fallback_probes_200_stream_error_before_provider() -> None:
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    hits: list[str] = []
+
+    async def account_fallback() -> StreamingResponse:
+        async def body() -> AsyncIterator[str]:
+            hits.append("account")
+            yield (
+                'data: {"type":"response.failed","response":{"error":'
+                '{"code":"no_accounts","message":"No available accounts"}}}\n\n'
+            )
+
+        return StreamingResponse(body(), status_code=200, media_type="text/event-stream")
+
+    async def provider_fallback() -> JSONResponse:
+        hits.append("provider")
+        return JSONResponse({"object": "response", "output": []}, status_code=200)
+
+    response = await proxy_api._source_account_first_fallback(
+        request,
+        account_fallback=account_fallback,
+        provider_fallback=provider_fallback,
+    )
+
+    assert response.status_code == 200
+    assert hits == ["account", "provider"]
 
 
 @pytest.fixture(autouse=True)
@@ -38087,15 +38156,122 @@ def test_provider_sticky_never_promotes_fallback_only():
     assert [source.id for source in ordered] == ["normal", "fallback"]
 
 
-def test_provider_candidates_keep_fallback_only_after_regular_attempt_limit():
+def test_provider_candidates_repeat_regular_providers_in_121_order():
     import app.modules.proxy.api as proxy_api
 
-    regular = [MagicMock(id=f"regular-{index}", routing_policy="normal") for index in range(4)]
+    one = MagicMock(id="one", routing_policy="normal")
+    two = MagicMock(id="two", routing_policy="normal")
+    fallback_one = MagicMock(id="fallback-one", routing_policy="fallback_only")
+    fallback_two = MagicMock(id="fallback-two", routing_policy="fallback_only")
+
+    candidates = proxy_api._source_provider_candidates([one, two, fallback_one, fallback_two])
+
+    assert [source.id for source in candidates] == [
+        "one",
+        "two",
+        "one",
+        "fallback-one",
+        "fallback-two",
+    ]
+
+
+def test_provider_candidates_repeat_single_regular_provider_three_times():
+    import app.modules.proxy.api as proxy_api
+
+    one = MagicMock(id="one", routing_policy="normal")
     fallback = MagicMock(id="fallback", routing_policy="fallback_only")
 
-    candidates = proxy_api._source_provider_candidates([*regular, fallback])
+    candidates = proxy_api._source_provider_candidates([one, fallback])
 
-    assert [source.id for source in candidates] == ["regular-0", "regular-1", "regular-2", "fallback"]
+    assert [source.id for source in candidates] == ["one", "one", "one", "fallback"]
+
+
+def test_provider_candidates_use_configured_regular_attempt_slots():
+    import app.modules.proxy.api as proxy_api
+
+    one = MagicMock(id="one", routing_policy="normal")
+    two = MagicMock(id="two", routing_policy="normal")
+    fallback = MagicMock(id="fallback", routing_policy="fallback_only")
+    policy = proxy_api._RoutingEnginePolicy(provider_max_attempts=5)
+
+    candidates = proxy_api._source_provider_candidates_for_policy([one, two, fallback], policy)
+
+    assert [source.id for source in candidates] == ["one", "two", "one", "two", "one", "fallback"]
+
+
+def test_provider_policy_account_after_first_failure_splits_remaining_candidates():
+    import app.modules.proxy.api as proxy_api
+
+    one = MagicMock(id="one", routing_policy="normal")
+    two = MagicMock(id="two", routing_policy="normal")
+    fallback = MagicMock(id="fallback", routing_policy="fallback_only")
+    policy = proxy_api._RoutingEnginePolicy(
+        provider_failure_policy="account_after_first_failure",
+        provider_max_attempts=2,
+    )
+    candidates = proxy_api._source_provider_candidates_for_policy([one, two, fallback], policy)
+
+    assert [source.id for source in proxy_api._source_provider_primary_candidates(candidates, policy)] == ["one"]
+    assert [source.id for source in proxy_api._source_provider_fallback_candidates(candidates, policy)] == [
+        "two",
+        "fallback",
+    ]
+
+
+def test_provider_policy_providers_before_accounts_defers_fallback_only_sources():
+    import app.modules.proxy.api as proxy_api
+
+    one = MagicMock(id="one", routing_policy="normal")
+    two = MagicMock(id="two", routing_policy="normal")
+    fallback = MagicMock(id="fallback", routing_policy="fallback_only")
+    policy = proxy_api._RoutingEnginePolicy(
+        provider_failure_policy="providers_before_accounts",
+        provider_max_attempts=2,
+    )
+    candidates = proxy_api._source_provider_candidates_for_policy([one, two, fallback], policy)
+
+    assert [source.id for source in proxy_api._source_provider_primary_candidates(candidates, policy)] == [
+        "one",
+        "two",
+    ]
+    assert [source.id for source in proxy_api._source_provider_fallback_candidates(candidates, policy)] == [
+        "fallback",
+    ]
+
+
+def test_routing_policy_clamps_attempts_and_global_override_wins():
+    import app.modules.proxy.api as proxy_api
+
+    settings = SimpleNamespace(
+        global_api_routing_override="account_first",
+        provider_failure_policy="provider_only",
+        account_failure_policy="account_only",
+        provider_max_attempts=99,
+        account_max_attempts=0,
+    )
+
+    policy = proxy_api._routing_engine_policy_from_settings(settings)
+
+    assert policy.provider_max_attempts == 10
+    assert policy.account_max_attempts == 1
+    assert proxy_api._account_branch_max_attempts(policy) == 1
+    assert not proxy_api._account_branch_allows_provider_fallback(policy)
+    assert not proxy_api._route_to_provider_for_native_model(
+        SimpleNamespace(id="key", routing_mode="provider_first"),
+        model="gpt-5",
+        routing_policy=policy,
+    )
+
+
+def test_provider_candidates_use_all_fallbacks_without_regular_provider():
+    import app.modules.proxy.api as proxy_api
+
+    fallback_one = MagicMock(id="fallback-one", routing_policy="fallback_only")
+    fallback_two = MagicMock(id="fallback-two", routing_policy="fallback_only")
+
+    candidates = proxy_api._source_provider_candidates([fallback_one, fallback_two])
+
+    assert [source.id for source in candidates] == ["fallback-one", "fallback-two"]
 
 
 def test_provider_sticky_owner_beats_burn_order_until_failover():

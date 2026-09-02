@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from sqlalchemy import delete, select
+from datetime import UTC, datetime
+
+from sqlalchemy import case, delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute, selectinload
 
@@ -22,6 +24,7 @@ class ModelSourcesRepository:
             select(ModelSource)
             .options(selectinload(ModelSource.models))
             .where(ModelSource.is_enabled.is_(True))
+            .where(ModelSource.paused_at.is_(None))
             .order_by(ModelSource.name)
         )
         return list(result.scalars().unique().all())
@@ -46,6 +49,7 @@ class ModelSourcesRepository:
             .join(ModelSourceModel, ModelSourceModel.source_id == ModelSource.id)
             .where(ModelSource.kind == "openai_compatible")
             .where(ModelSource.is_enabled.is_(True))
+            .where(ModelSource.paused_at.is_(None))
             .where(capability_column.is_(True))
             .where(ModelSourceModel.model == model)
             .where(ModelSourceModel.is_enabled.is_(True))
@@ -199,3 +203,45 @@ class ModelSourcesRepository:
 
     async def rollback(self) -> None:
         await self._session.rollback()
+
+    async def record_auto_pause_result(
+        self,
+        source_id: str,
+        *,
+        qualifying_failure: bool,
+        success: bool,
+        enabled: bool,
+        threshold: int,
+        reason: str | None,
+    ) -> None:
+        """Persist consecutive credential/rate-limit failures for one provider."""
+        if success:
+            await self._session.execute(
+                update(ModelSource)
+                .where(ModelSource.id == source_id)
+                .values(consecutive_auto_pause_failures=0)
+            )
+            await self._session.commit()
+            return
+        if not enabled or not qualifying_failure:
+            return
+        threshold = max(1, threshold)
+        next_count = ModelSource.consecutive_auto_pause_failures + 1
+        should_pause = next_count >= threshold
+        await self._session.execute(
+            update(ModelSource)
+            .where(ModelSource.id == source_id, ModelSource.paused_at.is_(None))
+            .values(
+                consecutive_auto_pause_failures=next_count,
+                paused_at=case(
+                    (should_pause, datetime.now(UTC).replace(tzinfo=None)),
+                    else_=ModelSource.paused_at,
+                ),
+                pause_reason=case(
+                    (should_pause, reason or "provider_auth_or_rate_limit_failure"),
+                    else_=ModelSource.pause_reason,
+                ),
+                health_status=case((should_pause, "paused"), else_=ModelSource.health_status),
+            )
+        )
+        await self._session.commit()

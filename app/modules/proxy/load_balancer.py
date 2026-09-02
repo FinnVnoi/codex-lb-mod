@@ -2096,7 +2096,12 @@ def _state_from_account(
                 primary_entry=primary_entry,
                 long_window_entry=effective_secondary_entry,
             )
-            if early_freshness_entry is not None and early_freshness_entry.recorded_at is not None:
+            if (
+                early_freshness_entry is not None
+                and early_freshness_entry.recorded_at is not None
+                and early_freshness_entry.used_percent is not None
+                and float(early_freshness_entry.used_percent) < 100.0
+            ):
                 recorded_epoch = early_freshness_entry.recorded_at.replace(tzinfo=timezone.utc).timestamp()
                 if recorded_epoch > effective_blocked_at:
                     rate_limited_cooldown_deadline = None
@@ -2214,7 +2219,12 @@ def _state_from_account(
             )
         else:
             freshness_entry = None
-        if freshness_entry and freshness_entry.recorded_at is not None:
+        if (
+            freshness_entry is not None
+            and freshness_entry.recorded_at is not None
+            and freshness_entry.used_percent is not None
+            and float(freshness_entry.used_percent) < 100.0
+        ):
             recorded_epoch = freshness_entry.recorded_at.replace(tzinfo=timezone.utc).timestamp()
             if recorded_epoch > effective_blocked_at:
                 effective_runtime_reset = None

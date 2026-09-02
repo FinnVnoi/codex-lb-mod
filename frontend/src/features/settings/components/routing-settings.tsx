@@ -976,7 +976,7 @@ export function RoutingSettings({
               <Select
                 value={settings.preferUnstartedQuotaWindow}
                 onValueChange={(value) =>
-                  save({ preferUnstartedQuotaWindow: value as "primary" | "secondary" | "both" })
+                  save({ preferUnstartedQuotaWindow: value as "primary" | "secondary" | "both" | "any" })
                 }
               >
                 <SelectTrigger
@@ -987,6 +987,7 @@ export function RoutingSettings({
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent align="end">
+                  <SelectItem value="any">{t("settings.routing.quotaWindows.any")}</SelectItem>
                   <SelectItem value="both">{t("settings.routing.quotaWindows.both")}</SelectItem>
                   <SelectItem value="secondary">{t("settings.routing.quotaWindows.weekly")}</SelectItem>
                   <SelectItem value="primary">{t("settings.routing.quotaWindows.fiveHour")}</SelectItem>

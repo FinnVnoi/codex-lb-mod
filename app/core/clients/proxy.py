@@ -66,6 +66,7 @@ from app.core.openai.parsing import (
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
+    strip_invalid_native_input_item_ids,
     validate_compact_input_wire_budget,
 )
 from app.core.resilience.circuit_breaker import (
@@ -2704,6 +2705,7 @@ async def _stream_responses_with_session(
     retryable_same_contract: bool | None = None
     client_session = session
     payload_dict = dict(payload.to_payload())
+    strip_invalid_native_input_item_ids(payload_dict)
     apply_codex_installation_metadata(payload_dict, codex_installation_id)
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
@@ -3580,6 +3582,7 @@ class _CompactCommandTransport:
         compact_timeout_seconds = _effective_compact_total_timeout(settings.upstream_compact_timeout_seconds)
         effective_connect_timeout = _effective_compact_connect_timeout(settings.upstream_connect_timeout_seconds)
         payload_dict = dict(self.payload.to_payload())
+        strip_invalid_native_input_item_ids(payload_dict)
         if settings.image_inline_fetch_enabled:
             payload_dict = await _inline_input_image_urls(
                 payload_dict,

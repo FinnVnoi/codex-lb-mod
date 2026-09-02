@@ -277,9 +277,46 @@ class V1UsageResponse(BaseModel):
     total_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
+    expires_at: datetime | None = None
     limits: list[V1UsageLimitResponse]
     upstream_limits: list[V1UsageLimitResponse] = []
     account_pool_usage: AccountPoolUsageResponse | None = None
+
+
+class V1UsageActivityTotals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_count: int
+    total_tokens: int
+    cached_input_tokens: int
+    total_cost_usd: float
+
+
+class V1UsageActivityRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    requested_at: datetime
+    model: str
+    status: str
+    error_code: str | None = None
+    total_tokens: int
+    cached_input_tokens: int
+    cost_usd: float
+
+
+class V1UsageActivityResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window: str
+    page: int
+    page_size: int
+    total_pages: int
+    max_rows: int
+    latest_id: int | None = None
+    removed_ids: list[int] = []
+    totals: V1UsageActivityTotals
+    requests: list[V1UsageActivityRow]
 
 
 class V1BulkUsageError(BaseModel):
@@ -295,6 +332,7 @@ class V1BulkUsageItem(BaseModel):
     index: int
     masked_key: str
     key_prefix: str | None = None
+    expires_at: datetime | None = None
     ok: bool
     status_code: int
     usage: V1UsageResponse | None = None

@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import BigInteger, Integer, cast, delete, func, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -309,6 +310,12 @@ class ApiKeysRepository:
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
         source_assignment_scope_enabled: bool | _Unset = _UNSET,
         expires_at: datetime | None | _Unset = _UNSET,
+        auto_extend_expiry: bool | _Unset = _UNSET,
+        auto_extend_expiry_type: str | None | _Unset = _UNSET,
+        auto_extend_expiry_threshold: int | None | _Unset = _UNSET,
+        quota_shop_enabled: bool | _Unset = _UNSET,
+        quota_shop_max_windows: int | _Unset = _UNSET,
+        quota_shop_options: str | _Unset = _UNSET,
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
@@ -356,6 +363,24 @@ class ApiKeysRepository:
         if expires_at is not _UNSET:
             assert expires_at is None or isinstance(expires_at, datetime)
             row.expires_at = expires_at
+        if auto_extend_expiry is not _UNSET:
+            assert isinstance(auto_extend_expiry, bool)
+            row.auto_extend_expiry = auto_extend_expiry
+        if auto_extend_expiry_type is not _UNSET:
+            assert auto_extend_expiry_type is None or isinstance(auto_extend_expiry_type, str)
+            row.auto_extend_expiry_type = auto_extend_expiry_type
+        if auto_extend_expiry_threshold is not _UNSET:
+            assert auto_extend_expiry_threshold is None or isinstance(auto_extend_expiry_threshold, int)
+            row.auto_extend_expiry_threshold = auto_extend_expiry_threshold
+        if quota_shop_enabled is not _UNSET:
+            assert isinstance(quota_shop_enabled, bool)
+            row.quota_shop_enabled = quota_shop_enabled
+        if quota_shop_max_windows is not _UNSET:
+            assert isinstance(quota_shop_max_windows, int) and quota_shop_max_windows >= 1
+            row.quota_shop_max_windows = quota_shop_max_windows
+        if quota_shop_options is not _UNSET:
+            assert isinstance(quota_shop_options, str)
+            row.quota_shop_options = quota_shop_options
         if is_active is not _UNSET:
             assert isinstance(is_active, bool)
             row.is_active = is_active
@@ -500,6 +525,55 @@ class ApiKeysRepository:
         )
         await self._session.commit()
         return result.scalar_one_or_none() is not None
+
+
+    async def process_auto_extend_expiry(self, *, now: datetime) -> int:
+        """Process the last completed local calendar day, exactly once."""
+        # Keep this import local to avoid api_keys.service -> repository ->
+        # automations.service -> proxy.request_policy -> api_keys.service.
+        from app.modules.automations.service import _resolve_server_timezone_name
+
+        tz = ZoneInfo(_resolve_server_timezone_name())
+        aware_now = now.replace(tzinfo=timezone.utc)
+        local_today = aware_now.astimezone(tz).date()
+        day = local_today - timedelta(days=1)
+        start_local = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        end_local = start_local + timedelta(days=1)
+        start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        end = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+        rows = (
+            await self._session.execute(
+                select(ApiKey).where(
+                    ApiKey.expires_at.is_not(None),
+                    ApiKey.auto_extend_expiry.is_(True),
+                )
+            )
+        ).scalars().all()
+        count = 0
+        for row in rows:
+            if row.auto_extend_expiry_last_processed_date == day:
+                continue
+            if row.auto_extend_expiry_type not in {"total_tokens", "cost_usd"}:
+                row.auto_extend_expiry_last_processed_date = day
+                continue
+            value = await self.get_limit_usage_value(
+                row.id,
+                limit_type=LimitType(row.auto_extend_expiry_type),
+                since=start,
+                until=end,
+                model_filter=None,
+            )
+            if (
+                row.auto_extend_expiry_threshold is not None
+                and row.expires_at is not None
+                and row.expires_at >= now
+                and value >= row.auto_extend_expiry_threshold
+            ):
+                row.expires_at = row.expires_at + timedelta(days=1)
+                count += 1
+            row.auto_extend_expiry_last_processed_date = day
+        await self._session.commit()
+        return count
 
     async def reset_expired_limits(self, *, now: datetime) -> int:
         reset_count = 0

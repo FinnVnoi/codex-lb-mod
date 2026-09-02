@@ -17,6 +17,8 @@ from app.core.utils.json_guards import is_json_mapping
 from app.db.models import ModelSource
 
 _DEFAULT_SOURCE_TIMEOUT_SECONDS = 600
+_OPAQUE_ESTIMATION_KEYS = frozenset({"encrypted_content", "file_data", "audio_data", "b64_json"})
+_OPAQUE_VALUE_ESTIMATED_CHARS = 4_096
 
 
 class ModelSourceForwardingError(Exception):
@@ -98,6 +100,7 @@ class SourceResponsesStream:
 @dataclass(slots=True)
 class SourceUsageHolder:
     usage: SourceUsage | None = None
+    estimated_usage: SourceUsage | None = None
     timings: SourceTimings | None = None
 
 
@@ -121,7 +124,7 @@ async def forward_chat_completion(
                     raise ModelSourceForwardingError(
                         status_code=response.status,
                         payload=_redact_source_error_payload(
-                            _error_payload(data),
+                            await _response_error_payload(response, data),
                             source,
                             encryptor=encryptor,
                         ),
@@ -146,7 +149,12 @@ async def stream_chat_completion(
     encryptor: TokenEncryptor | None = None,
 ) -> SourceChatStream:
     usage_holder = SourceUsageHolder()
-    usage_parser = SourceStreamUsageParser(usage_holder, response_shape="chat")
+    usage_parser = SourceStreamUsageParser(
+        usage_holder,
+        response_shape="chat",
+        request_payload=payload,
+        max_estimated_input_tokens=_source_model_context_window(source, payload),
+    )
     stack, response = await _open_source_stream(source, "/chat/completions", payload, encryptor=encryptor)
 
     async def body() -> AsyncIterator[bytes]:
@@ -155,6 +163,7 @@ async def stream_chat_completion(
                 async for chunk in response.content.iter_chunked(4096):
                     usage_parser.feed(chunk)
                     yield chunk
+                usage_parser.finish()
         except (aiohttp.ClientError, TimeoutError) as exc:
             raise _unreachable_error(exc) from exc
 
@@ -181,7 +190,7 @@ async def forward_responses(
                     raise ModelSourceForwardingError(
                         status_code=response.status,
                         payload=_redact_source_error_payload(
-                            _error_payload(data),
+                            await _response_error_payload(response, data),
                             source,
                             encryptor=encryptor,
                         ),
@@ -259,7 +268,12 @@ async def stream_responses(
     encryptor: TokenEncryptor | None = None,
 ) -> SourceResponsesStream:
     usage_holder = SourceUsageHolder()
-    usage_parser = SourceStreamUsageParser(usage_holder, response_shape="responses")
+    usage_parser = SourceStreamUsageParser(
+        usage_holder,
+        response_shape="responses",
+        request_payload=payload,
+        max_estimated_input_tokens=_source_model_context_window(source, payload),
+    )
     stack, response = await _open_source_stream(source, "/responses", payload, encryptor=encryptor)
 
     async def body() -> AsyncIterator[bytes]:
@@ -268,6 +282,7 @@ async def stream_responses(
                 async for chunk in response.content.iter_chunked(4096):
                     usage_parser.feed(chunk)
                     yield chunk
+                usage_parser.finish()
         except (aiohttp.ClientError, TimeoutError) as exc:
             raise _unreachable_error(exc) from exc
 
@@ -307,7 +322,7 @@ async def _open_source_stream(
             raise ModelSourceForwardingError(
                 status_code=response.status,
                 payload=_redact_source_error_payload(
-                    _error_payload(data),
+                    await _response_error_payload(response, data),
                     source,
                     encryptor=encryptor,
                 ),
@@ -434,10 +449,43 @@ def _invalid_upstream_response_error(response_status: int) -> ModelSourceForward
     )
 
 
+async def _response_error_payload(
+    response: aiohttp.ClientResponse,
+    data: Mapping[str, JsonValue] | None,
+) -> dict[str, JsonValue]:
+    if data is not None:
+        return _error_payload(data)
+    # ClientResponse.json() caches the body even when decoding fails. Preserve
+    # a useful text diagnostic instead of replacing every non-JSON response
+    # with the generic model_source_error message.
+    return _error_payload_from_body(await response.read(), response.headers.get("Content-Type"))
+
+
 def _error_payload(data: Mapping[str, JsonValue] | None) -> dict[str, JsonValue]:
     error = data.get("error") if data is not None else None
     if is_json_mapping(error):
         return {"error": dict(error)}
+
+    # Some compatible gateways use a flat envelope, for example
+    # {"code":"INVALID_API_KEY","message":"Invalid API key"}.
+    flat_message = _first_nonempty_string(
+        data.get("message") if data is not None else None,
+        data.get("detail") if data is not None else None,
+        error,
+    )
+    flat_code = _first_nonempty_string(
+        data.get("code") if data is not None else None,
+        data.get("error_code") if data is not None else None,
+    )
+    flat_type = _first_nonempty_string(data.get("type") if data is not None else None)
+    if flat_message or flat_code:
+        return {
+            "error": {
+                "message": flat_message or "OpenAI-compatible model source returned an error",
+                "type": flat_type or "upstream_error",
+                "code": flat_code or "model_source_error",
+            }
+        }
     return {
         "error": {
             "message": "OpenAI-compatible model source returned an error",
@@ -445,6 +493,13 @@ def _error_payload(data: Mapping[str, JsonValue] | None) -> dict[str, JsonValue]
             "code": "model_source_error",
         }
     }
+
+
+def _first_nonempty_string(*values: JsonValue | None) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()[:1000]
+    return None
 
 
 def _error_payload_from_body(body: bytes, content_type: str | None) -> dict[str, JsonValue]:
@@ -641,9 +696,19 @@ class SourceStreamUsageParser:
     # parser must not buffer the whole stream in memory.
     _MAX_BUFFER_CHARS = 1_048_576
 
-    def __init__(self, usage_holder: SourceUsageHolder, *, response_shape: str) -> None:
+    def __init__(
+        self,
+        usage_holder: SourceUsageHolder,
+        *,
+        response_shape: str,
+        request_payload: Mapping[str, JsonValue] | None = None,
+        max_estimated_input_tokens: int | None = None,
+    ) -> None:
         self._usage_holder = usage_holder
         self._response_shape = response_shape
+        self._request_payload = request_payload
+        self._max_estimated_input_tokens = max_estimated_input_tokens
+        self._output_chars = 0
         self._buffer = ""
 
     def feed(self, chunk: bytes) -> None:
@@ -656,6 +721,21 @@ class SourceStreamUsageParser:
             self._capture_frame(frame)
         if len(self._buffer) > self._MAX_BUFFER_CHARS:
             self._buffer = self._buffer[-self._MAX_BUFFER_CHARS :]
+
+    def finish(self) -> None:
+        """Capture a final SSE frame even when EOF is not preceded by a blank line."""
+        frame, self._buffer = self._buffer, ""
+        if frame.strip():
+            self._capture_frame(frame)
+        if self._usage_holder.usage is None and self._request_payload is not None:
+            input_chars = _stream_request_input_chars(self._request_payload)
+            estimated_input_tokens = max(1, _estimate_tokens_from_chars(input_chars))
+            if self._max_estimated_input_tokens is not None:
+                estimated_input_tokens = min(estimated_input_tokens, self._max_estimated_input_tokens)
+            self._usage_holder.estimated_usage = SourceUsage(
+                input_tokens=estimated_input_tokens,
+                output_tokens=max(1, _estimate_tokens_from_chars(self._output_chars)),
+            )
 
     def _capture_frame(self, frame: str) -> None:
         for line in frame.splitlines():
@@ -677,10 +757,75 @@ class SourceStreamUsageParser:
             else:
                 usage = _usage_from_chat_payload(parsed)
                 timings = _timings_from_payload(parsed)
+            self._output_chars += _stream_output_chars(parsed, response_shape=self._response_shape)
             if usage is not None:
                 self._usage_holder.usage = usage
             if timings is not None:
                 self._usage_holder.timings = timings
+
+
+def _estimate_tokens_from_chars(chars: int) -> int:
+    return (max(0, chars) + 3) // 4
+
+
+def _json_text_chars(value: JsonValue, *, key: str | None = None) -> int:
+    if key in _OPAQUE_ESTIMATION_KEYS:
+        return _OPAQUE_VALUE_ESTIMATED_CHARS if isinstance(value, str) and value else 0
+    if isinstance(value, str):
+        if value.startswith("data:") and ";base64," in value[:256]:
+            return _OPAQUE_VALUE_ESTIMATED_CHARS
+        return len(value)
+    if isinstance(value, list):
+        return sum(_json_text_chars(item) for item in value)
+    if isinstance(value, Mapping):
+        return sum(_json_text_chars(item, key=item_key) for item_key, item in value.items())
+    return 0
+
+
+def _stream_request_input_chars(payload: Mapping[str, JsonValue]) -> int:
+    excluded = {"model", "stream", "stream_options", "max_tokens", "max_completion_tokens", "max_output_tokens"}
+    return sum(_json_text_chars(value, key=key) for key, value in payload.items() if key not in excluded)
+
+
+def _source_model_context_window(source: ModelSource, payload: Mapping[str, JsonValue]) -> int | None:
+    model = payload.get("model")
+    if not isinstance(model, str):
+        return None
+    entry = next((candidate for candidate in source.models if candidate.model == model and candidate.is_enabled), None)
+    if entry is None or entry.context_window is None or entry.context_window <= 0:
+        return None
+    return int(entry.context_window)
+
+
+def _stream_output_chars(payload: Mapping[str, JsonValue], *, response_shape: str) -> int:
+    if response_shape == "responses":
+        event_type = payload.get("type")
+        if event_type in {"response.output_text.delta", "response.refusal.delta"}:
+            delta = payload.get("delta")
+            return len(delta) if isinstance(delta, str) else 0
+        if event_type in {"response.function_call_arguments.delta", "response.custom_tool_call_input.delta"}:
+            delta = payload.get("delta")
+            return len(delta) if isinstance(delta, str) else 0
+        return 0
+
+    choices = payload.get("choices")
+    if not isinstance(choices, list):
+        return 0
+    total = 0
+    for choice in choices:
+        if not is_json_mapping(choice):
+            continue
+        delta = choice.get("delta")
+        if not is_json_mapping(delta):
+            continue
+        for key in ("content", "refusal", "reasoning_content"):
+            value = delta.get(key)
+            if isinstance(value, str):
+                total += len(value)
+        tool_calls = delta.get("tool_calls")
+        if isinstance(tool_calls, list):
+            total += _json_text_chars(tool_calls)
+    return total
 
 
 def _usage_from_responses_event(payload: Mapping[str, JsonValue]) -> SourceUsage | None:

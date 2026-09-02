@@ -49,6 +49,7 @@ describe("ModelSourceSchema", () => {
 
     expect(parsed.id).toBe("src_vllm");
     expect(parsed.supportsAudioTranscriptions).toBe(true);
+    expect(parsed.estimateMissingStreamUsage).toBe(true);
     expect(parsed.models[0].model).toBe("local-coder");
   });
 });

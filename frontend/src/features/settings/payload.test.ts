@@ -225,6 +225,38 @@ describe("buildSettingsUpdateRequest", () => {
     expect(payload.showResetCreditExpiryBadge).toBe(false);
   });
 
+  it("includes traffic routing and failover settings", () => {
+    const settings = DashboardSettingsSchema.parse({
+      stickyThreadsEnabled: true,
+      upstreamStreamTransport: "default",
+      preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
+      routingStrategy: "round_robin",
+      openaiCacheAffinityMaxAgeSeconds: 300,
+      dashboardSessionTtlSeconds: 43200,
+      importWithoutOverwrite: true,
+      totpRequiredOnLogin: true,
+      totpConfigured: false,
+      apiKeyAuthEnabled: true,
+      globalApiRoutingOverride: "provider_first",
+      providerFailurePolicy: "providers_before_accounts",
+      accountFailurePolicy: "provider_after_first_failure",
+      providerMaxAttempts: 4,
+      accountMaxAttempts: 5,
+    });
+
+    const payload = buildSettingsUpdateRequest(settings, {
+      globalApiRoutingOverride: "account_first",
+      providerMaxAttempts: 2,
+    });
+
+    expect(payload.globalApiRoutingOverride).toBe("account_first");
+    expect(payload.providerFailurePolicy).toBe("providers_before_accounts");
+    expect(payload.accountFailurePolicy).toBe("provider_after_first_failure");
+    expect(payload.providerMaxAttempts).toBe(2);
+    expect(payload.accountMaxAttempts).toBe(5);
+  });
+
   it("does not materialize inherited account capacity limits on unrelated updates", () => {
     const settings = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,

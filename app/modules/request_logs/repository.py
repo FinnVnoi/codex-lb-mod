@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import cast as typing_cast
 
 import anyio
-from sqlalchemy import Integer, String, and_, case, cast, func, literal_column, or_, select
+from sqlalchemy import Integer, String, and_, case, cast, func, literal_column, or_, select, update
 from sqlalchemy import exc as sa_exc
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import InstrumentedAttribute
 from sqlalchemy.sql.elements import ColumnElement
@@ -21,7 +23,7 @@ from app.core.usage.types import (
 )
 from app.core.utils.request_id import ensure_request_id
 from app.core.utils.time import utcnow
-from app.db.models import Account, ApiKey, ModelSource, RequestKind, RequestLog
+from app.db.models import Account, ApiKey, ApiKeyLogicalRequest, ModelSource, RequestKind, RequestLog
 from app.db.session import sqlite_writer_section
 
 
@@ -551,6 +553,63 @@ class RequestLogsRepository:
             )
             self._session.add(log)
             try:
+                await self._session.flush()
+                if api_key_id is not None and request_kind not in (RequestKind.WARMUP.value, "limit_warmup"):
+                    bind = self._session.get_bind()
+                    insert_fn = pg_insert if bind is not None and bind.dialect.name == "postgresql" else sqlite_insert
+                    attempt_status = "success" if status in ("ok", "success") else ("cancelled" if status == "cancelled" else "error")
+                    logical_stmt = insert_fn(ApiKeyLogicalRequest).values(
+                        api_key_id=api_key_id, logical_id=resolved_archive_request_id, requested_at=log.requested_at,
+                        conversation_id=resolved_conversation_id, useragent_group=resolved_useragent_group,
+                        model=model, status=attempt_status, error_code=None if attempt_status == "success" else error_code,
+                        input_tokens=int(input_tokens or 0), output_tokens=int(output_tokens if output_tokens is not None else reasoning_tokens or 0),
+                        cached_input_tokens=int(cached_input_tokens or 0), total_cost_usd=float(log.cost_usd or 0.0),
+                    )
+                    excluded = logical_stmt.excluded
+                    success_wins = (ApiKeyLogicalRequest.status == "success") | (excluded.status == "success")
+                    logical_result = await self._session.execute(logical_stmt.on_conflict_do_update(
+                        index_elements=[ApiKeyLogicalRequest.api_key_id, ApiKeyLogicalRequest.logical_id],
+                        set_={
+                            "requested_at": func.max(ApiKeyLogicalRequest.requested_at, excluded.requested_at),
+                            "model": case((excluded.status == "success", excluded.model), (ApiKeyLogicalRequest.status == "success", ApiKeyLogicalRequest.model), else_=excluded.model),
+                            "status": case((success_wins, "success"), else_=excluded.status),
+                            "error_code": case((success_wins, None), else_=excluded.error_code),
+                            "input_tokens": ApiKeyLogicalRequest.input_tokens + excluded.input_tokens,
+                            "output_tokens": ApiKeyLogicalRequest.output_tokens + excluded.output_tokens,
+                            "cached_input_tokens": ApiKeyLogicalRequest.cached_input_tokens + excluded.cached_input_tokens,
+                            "total_cost_usd": ApiKeyLogicalRequest.total_cost_usd + excluded.total_cost_usd,
+                            "conversation_id": func.coalesce(ApiKeyLogicalRequest.conversation_id, excluded.conversation_id),
+                            "useragent_group": func.coalesce(ApiKeyLogicalRequest.useragent_group, excluded.useragent_group),
+                        },
+                    ).returning(ApiKeyLogicalRequest.id))
+                    logical_row_id = logical_result.scalar_one()
+                    if (
+                        attempt_status == "success"
+                        and resolved_conversation_id is not None
+                        and int(input_tokens or 0) + int(output_tokens or 0) > 0
+                    ):
+                        retryable_codes = ("insufficient_quota", "rate_limit_exceeded", "model_source_unavailable", "overloaded")
+                        previous = (await self._session.execute(
+                            select(ApiKeyLogicalRequest)
+                            .where(
+                                ApiKeyLogicalRequest.api_key_id == api_key_id,
+                                ApiKeyLogicalRequest.id != logical_row_id,
+                                ApiKeyLogicalRequest.superseded_by_id.is_(None),
+                                ApiKeyLogicalRequest.status == "error",
+                                ApiKeyLogicalRequest.error_code.in_(retryable_codes),
+                                ApiKeyLogicalRequest.conversation_id == resolved_conversation_id,
+                                ApiKeyLogicalRequest.model == model,
+                                ApiKeyLogicalRequest.input_tokens == 0,
+                                ApiKeyLogicalRequest.output_tokens == 0,
+                                ApiKeyLogicalRequest.total_cost_usd == 0.0,
+                                ApiKeyLogicalRequest.requested_at <= log.requested_at,
+                                ApiKeyLogicalRequest.requested_at >= log.requested_at - timedelta(seconds=30),
+                            )
+                            .order_by(ApiKeyLogicalRequest.requested_at.desc())
+                            .limit(1)
+                        )).scalar_one_or_none()
+                        if previous is not None:
+                            previous.superseded_by_id = logical_row_id
                 await self._session.commit()
                 # No refresh: every column is set explicitly before insert and
                 # expire_on_commit=False, so the round trip was pure overhead
@@ -561,6 +620,22 @@ class RequestLogsRepository:
             except BaseException:
                 await _safe_rollback(self._session)
                 raise
+
+    async def suppress_recovered_fallback_errors(self, request_id: str) -> int:
+        """Hide account-attempt noise once the same logical request succeeds on a provider."""
+        resolved_request_id = ensure_request_id(request_id)
+        result = await self._session.execute(
+            update(RequestLog)
+            .where(
+                RequestLog.request_id == resolved_request_id,
+                RequestLog.status == "error",
+                RequestLog.error_code.in_(("hard_affinity_saturated", "no_accounts", "no_available_accounts")),
+                RequestLog.deleted_at.is_(None),
+            )
+            .values(deleted_at=utcnow())
+        )
+        await self._session.commit()
+        return int(result.rowcount or 0)
 
     async def update_model_for_request(self, request_id: str, model: str) -> int:
         """Override the ``model`` field of any logs matching ``request_id``.

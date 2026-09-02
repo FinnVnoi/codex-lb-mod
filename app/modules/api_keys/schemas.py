@@ -24,6 +24,12 @@ class LimitRuleResponse(DashboardModel):
     reset_at: datetime
 
 
+class QuotaShopOption(DashboardModel):
+    limit_type: str
+    limit_window: str
+    model_filter: str | None = None
+
+
 class ApiKeyCreateRequest(DashboardModel):
     name: str = Field(min_length=1, max_length=128)
     allowed_models: list[str] | None = None
@@ -39,6 +45,12 @@ class ApiKeyCreateRequest(DashboardModel):
     usage_sections: str | None = None
     weekly_token_limit: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
+    auto_extend_expiry: bool = False
+    auto_extend_expiry_type: str | None = Field(default=None, pattern=r"^(total_tokens|cost_usd)$")
+    auto_extend_expiry_threshold: int | None = Field(default=None, ge=1)
+    quota_shop_enabled: bool = False
+    quota_shop_max_windows: int = Field(default=1, ge=1)
+    quota_shop_options: list[QuotaShopOption] | None = None
     assigned_account_ids: list[str] | None = None
     assigned_source_ids: list[str] | None = None
     limits: list[LimitRuleCreate] | None = None
@@ -61,6 +73,12 @@ class ApiKeyUpdateRequest(DashboardModel):
     usage_sections: str | None = None
     weekly_token_limit: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
+    auto_extend_expiry: bool | None = None
+    auto_extend_expiry_type: str | None = Field(default=None, pattern=r"^(total_tokens|cost_usd)$")
+    auto_extend_expiry_threshold: int | None = Field(default=None, ge=1)
+    quota_shop_enabled: bool | None = None
+    quota_shop_max_windows: int | None = Field(default=None, ge=1)
+    quota_shop_options: list[QuotaShopOption] | None = None
     is_active: bool | None = None
     assigned_account_ids: list[str] | None = None
     assigned_source_ids: list[str] | None = None
@@ -88,6 +106,12 @@ class ApiKeyResponse(DashboardModel):
     transport_policy_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     expires_at: datetime | None
+    auto_extend_expiry: bool = False
+    auto_extend_expiry_type: str | None = None
+    auto_extend_expiry_threshold: int | None = None
+    quota_shop_enabled: bool = False
+    quota_shop_max_windows: int = 1
+    quota_shop_options: list[QuotaShopOption] = Field(default_factory=list)
     is_active: bool
     account_assignment_scope_enabled: bool = False
     source_assignment_scope_enabled: bool = False

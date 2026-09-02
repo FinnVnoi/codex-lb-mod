@@ -39,6 +39,7 @@ export function ModelSourceCreateDialog({ open, busy, onOpenChange, onSubmit }: 
       supportsChatCompletions: true,
       supportsResponses: false,
       supportsAudioTranscriptions: false,
+      estimateMissingStreamUsage: true,
       routingPolicy: "normal",
       models: [{ ...emptyModelFormValue }],
     },
@@ -52,6 +53,7 @@ export function ModelSourceCreateDialog({ open, busy, onOpenChange, onSubmit }: 
       supportsChatCompletions: values.supportsChatCompletions,
       supportsResponses: values.supportsResponses,
       supportsAudioTranscriptions: values.supportsAudioTranscriptions,
+      estimateMissingStreamUsage: values.estimateMissingStreamUsage,
       routingPolicy: values.routingPolicy,
       models: modelInputsFromForm(values),
     };
@@ -68,7 +70,7 @@ export function ModelSourceCreateDialog({ open, busy, onOpenChange, onSubmit }: 
         </DialogHeader>
         <Form {...form}>
           <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-4">
-            <ModelSourceFormFields control={form.control} apiKeyLabel={t("modelSources.fields.upstreamApiKey")} />
+            <ModelSourceFormFields control={form.control} setValue={form.setValue} apiKeyLabel={t("modelSources.fields.upstreamApiKey")} />
             <DialogFooter>
               <Button type="submit" disabled={busy || form.formState.isSubmitting}>
                 {t("common.actions.create")}

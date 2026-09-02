@@ -38,6 +38,7 @@ class ModelSourceCreateRequest(DashboardModel):
     supports_chat_completions: bool = True
     supports_responses: bool = False
     supports_audio_transcriptions: bool = False
+    estimate_missing_stream_usage: bool = True
     timeout_seconds: int | None = Field(default=None, ge=1)
     max_concurrency: int | None = Field(default=None, ge=1)
     routing_policy: str = Field(default="normal", pattern=r"^(normal|burn_first|preserve|fallback_only)$")
@@ -52,6 +53,7 @@ class ModelSourceUpdateRequest(DashboardModel):
     supports_chat_completions: bool | None = None
     supports_responses: bool | None = None
     supports_audio_transcriptions: bool | None = None
+    estimate_missing_stream_usage: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=1)
     max_concurrency: int | None = Field(default=None, ge=1)
     routing_policy: str | None = Field(default=None, pattern=r"^(normal|burn_first|preserve|fallback_only)$")
@@ -65,15 +67,35 @@ class ModelSourceResponse(DashboardModel):
     base_url: str
     is_enabled: bool
     health_status: str
+    paused_at: datetime | None
+    pause_reason: str | None
+    consecutive_auto_pause_failures: int
     supports_chat_completions: bool
     supports_responses: bool
     supports_audio_transcriptions: bool
+    estimate_missing_stream_usage: bool
     timeout_seconds: int | None
     max_concurrency: int | None
     routing_policy: str
     created_at: datetime
     updated_at: datetime
     models: list[ModelSourceModelResponse] = Field(default_factory=list)
+
+
+class ModelSourceProbeRequest(DashboardModel):
+    source_id: str | None = None
+    base_url: str = Field(min_length=1, max_length=2048)
+    api_key: str | None = None
+    model: str = Field(min_length=1, max_length=255)
+    upstream_model: str | None = Field(default=None, max_length=255)
+    use_responses: bool = False
+
+
+class ModelSourceProbeResponse(DashboardModel):
+    ok: bool
+    status_code: int | None = None
+    model: str
+    message: str
 
 
 class ModelSourcesResponse(DashboardModel):

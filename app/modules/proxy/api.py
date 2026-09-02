@@ -6,7 +6,7 @@ import logging
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from json import JSONDecodeError
 from typing import Any, Final, Literal, cast
@@ -210,6 +210,7 @@ from app.modules.proxy.images_observability import (
     IMAGE_ROUTE_STREAM_STATE,
     record_images_route_observability,
 )
+from app.modules.proxy.replay_safety import responses_payload_is_account_neutral_fresh_replay
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_api_key_enforcement_to_chat_payload,
@@ -244,6 +245,9 @@ from app.modules.proxy.schemas import (
     V1ResetCreditEntry,
     V1ResetCreditRedeemRequest,
     V1ResetCreditRedeemResponse,
+    V1UsageActivityResponse,
+    V1UsageActivityRow,
+    V1UsageActivityTotals,
     V1UsageLimitResponse,
     V1UsageResponse,
     WarmupFailedAccount,
@@ -258,6 +262,7 @@ from app.modules.proxy.types import (
     RateLimitStatusPayloadData,
     RateLimitWindowSnapshotData,
 )
+from app.modules.proxy.usage_activity import UsageWindow, get_logical_usage
 from app.modules.rate_limit_reset_credits.api import serialize_reset_credit_redeem
 from app.modules.rate_limit_reset_credits.redeem_coordination import RedeemClaimTimeoutError
 from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
@@ -299,6 +304,7 @@ _PUBLIC_RESPONSE_STREAM_TERMINAL_TYPES = frozenset(
 _PUBLIC_RESPONSES_PRE_CREATED_BUFFER_LIMIT = 64
 _SOURCE_LIMITED_STREAM_BUFFER_BYTES = 16 * 1024 * 1024
 _SOURCE_MAX_PROVIDER_ATTEMPTS = 3
+_ACCOUNT_MAX_ATTEMPTS_DEFAULT = 3
 _ACCOUNT_BRANCH_MODEL_PREFIXES = ("gpt-5", "codex-")
 _SOURCE_FALLBACK_ERROR_CODES = frozenset(
     {
@@ -324,6 +330,16 @@ _SOURCE_MODEL_UNAVAILABLE_ERROR_CODES = frozenset(
         "unknown_model",
     }
 )
+_SOURCE_PROVIDER_INCOMPATIBLE_ERROR_MESSAGES = frozenset(
+    {
+        # Some OpenAI-compatible Responses providers intermittently reject a
+        # valid Codex conversation-history shape with this generic validator
+        # message. The request already passed Codex-LB's stricter local
+        # validation, so treat this upstream 400 as a provider compatibility
+        # failure and allow another provider/account route to handle it.
+        "input must be a string or array",
+    }
+)
 _SOURCE_MODEL_UNAVAILABLE_MESSAGE_FRAGMENTS = (
     "does not exist",
     "invalid model",
@@ -337,6 +353,83 @@ _SOURCE_MODEL_UNAVAILABLE_MESSAGE_FRAGMENTS = (
     "unknown model",
     "unsupported model",
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _RoutingEnginePolicy:
+    global_api_routing_override: str = "normal"
+    provider_failure_policy: str = "account_after_first_failure"
+    account_failure_policy: str = "accounts_before_providers"
+    provider_max_attempts: int = _SOURCE_MAX_PROVIDER_ATTEMPTS
+    account_max_attempts: int = _ACCOUNT_MAX_ATTEMPTS_DEFAULT
+
+
+def _bounded_routing_attempts(value: object, *, default: int) -> int:
+    try:
+        attempts = int(cast(Any, value))
+    except (TypeError, ValueError):
+        attempts = default
+    return max(1, min(10, attempts))
+
+
+def _routing_engine_policy_from_settings(settings: object | None) -> _RoutingEnginePolicy:
+    provider_policy = str(
+        getattr(settings, "provider_failure_policy", "account_after_first_failure")
+    )
+    if provider_policy not in {"account_after_first_failure", "providers_before_accounts", "provider_only"}:
+        provider_policy = "account_after_first_failure"
+    account_policy = str(getattr(settings, "account_failure_policy", "accounts_before_providers"))
+    if account_policy not in {"accounts_before_providers", "provider_after_first_failure", "account_only"}:
+        account_policy = "accounts_before_providers"
+    global_override = str(
+        getattr(settings, "global_api_routing_override", "normal")
+    )
+    if global_override not in {"normal", "provider_first", "account_first"}:
+        global_override = "normal"
+    return _RoutingEnginePolicy(
+        global_api_routing_override=global_override,
+        provider_failure_policy=provider_policy,
+        account_failure_policy=account_policy,
+        provider_max_attempts=_bounded_routing_attempts(
+            getattr(settings, "provider_max_attempts", _SOURCE_MAX_PROVIDER_ATTEMPTS),
+            default=_SOURCE_MAX_PROVIDER_ATTEMPTS,
+        ),
+        account_max_attempts=_bounded_routing_attempts(
+            getattr(settings, "account_max_attempts", _ACCOUNT_MAX_ATTEMPTS_DEFAULT),
+            default=_ACCOUNT_MAX_ATTEMPTS_DEFAULT,
+        ),
+    )
+
+
+async def _current_routing_engine_policy() -> _RoutingEnginePolicy:
+    return _routing_engine_policy_from_settings(await get_settings_cache().get())
+
+
+def _account_branch_max_attempts(policy: _RoutingEnginePolicy) -> int:
+    # ``provider_after_first_failure`` is only safe before visible output; the
+    # account service still enforces stateful continuity pins and will fail
+    # closed where another account cannot own the request.
+    if policy.account_failure_policy == "provider_after_first_failure":
+        return 1
+    return policy.account_max_attempts
+
+
+def _account_branch_allows_provider_fallback(policy: _RoutingEnginePolicy) -> bool:
+    return not _routing_forces_provider(policy) and policy.account_failure_policy != "account_only"
+
+
+def _routing_forces_provider(policy: _RoutingEnginePolicy) -> bool:
+    return policy.global_api_routing_override == "provider_first"
+
+
+def _routing_forces_account(policy: _RoutingEnginePolicy) -> bool:
+    return policy.global_api_routing_override == "account_first"
+
+
+def _provider_branch_allowed(policy: _RoutingEnginePolicy) -> bool:
+    if _routing_forces_provider(policy):
+        return True
+    return not _routing_forces_account(policy) and policy.account_failure_policy != "account_only"
 
 
 class _V1ResetCreditFreshCredentials:
@@ -905,7 +998,12 @@ async def responses(
         error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
     sources: list[ModelSource] = []
-    if compact_trigger_input is None and not extract_input_file_ids(responses_payload.input):
+    routing_policy = await _current_routing_engine_policy()
+    if (
+        _provider_branch_allowed(routing_policy)
+        and compact_trigger_input is None
+        and not extract_input_file_ids(responses_payload.input)
+    ):
         source_selection = await _select_responses_model_source(
             responses_payload.model,
             api_key,
@@ -973,6 +1071,7 @@ async def responses(
         enforce_openai_sdk_contract=openai_sdk_request,
         native_codex_heartbeat=native_codex_heartbeat,
     )
+    account_response = await _probe_account_response_before_provider_fallback(request, account_response)
     if _account_response_allows_provider_fallback(account_response):
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
         provider_response = await _account_responses_provider_fallback_response(
@@ -1065,9 +1164,14 @@ async def v1_responses(
     # File-referencing Responses requests pin to the subscription account that
     # registered the upload; that account-scoped invariant applies to /v1
     # streams too, so such requests must not be source-routed.
+    routing_policy = await _current_routing_engine_policy()
     source_selection = (
         None
-        if extract_input_file_ids(responses_payload.input)
+        if (
+            _routing_forces_account(routing_policy)
+            or not _provider_branch_allowed(routing_policy)
+            or extract_input_file_ids(responses_payload.input)
+        )
         else await _select_responses_model_source(
             responses_payload.model,
             api_key,
@@ -1149,6 +1253,7 @@ async def v1_responses(
             prefer_http_bridge=True,
             prohibit_fast_mode=prohibit_fast_mode,
         )
+    account_response = await _probe_account_response_before_provider_fallback(request, account_response)
     if _account_response_allows_provider_fallback(account_response):
         provider_response = await _account_responses_provider_fallback_response(
             request,
@@ -1299,6 +1404,37 @@ async def v1_usage(
     return await _build_v1_usage_response_for_api_key(api_key)
 
 
+@v1_router.get("/usage/activity", response_model=V1UsageActivityResponse)
+async def v1_usage_activity(
+    window: UsageWindow = "lt",
+    page: int = 1,
+    include_logs: bool = True,
+    after_id: int | None = None,
+    api_key: ApiKeyData = Security(validate_usage_api_key),
+) -> V1UsageActivityResponse:
+    page = max(1, page)
+    async with get_background_session() as session:
+        totals, rows, total_pages, log_count, latest_id, removed_ids = await get_logical_usage(
+            session,
+            api_key_id=api_key.id,
+            window=window,
+            include_logs=include_logs,
+            after_id=after_id,
+            now=datetime.now(timezone.utc).replace(tzinfo=None),
+        )
+    return V1UsageActivityResponse(
+        window=window,
+        page=1,
+        page_size=10,
+        total_pages=total_pages,
+        max_rows=log_count,
+        latest_id=latest_id,
+        removed_ids=removed_ids,
+        totals=V1UsageActivityTotals(**asdict(totals)),
+        requests=[V1UsageActivityRow(**asdict(row)) for row in rows],
+    )
+
+
 @usage_router.post("/v1/usage/bulk", response_model=V1BulkUsageResponse)
 async def v1_usage_bulk(
     request: Request,
@@ -1345,6 +1481,7 @@ async def _build_v1_usage_response_for_api_key(api_key: ApiKeyData) -> V1UsageRe
         total_tokens=usage.total_tokens,
         cached_input_tokens=usage.cached_input_tokens,
         total_cost_usd=usage.total_cost_usd,
+        expires_at=api_key.expires_at,
         limits=own_limits or upstream_limits,
         upstream_limits=upstream_limits,
         account_pool_usage=account_pool_usage,
@@ -1742,6 +1879,7 @@ async def _build_bulk_usage_item(index: int, key: str) -> V1BulkUsageItem:
         index=index,
         masked_key=masked_key,
         key_prefix=api_key.key_prefix,
+        expires_at=api_key.expires_at,
         ok=True,
         status_code=200,
         usage=usage,
@@ -3719,7 +3857,7 @@ async def v1_anthropic_messages(
 ) -> Response:
     """Anthropic Messages-compatible adapter backed by the Responses proxy."""
 
-    rate_limit_headers = await context.service.rate_limit_headers()
+    rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
     effective_model = _effective_model_for_api_key(api_key, payload.model)
     validate_model_access(api_key, effective_model)
     try:
@@ -3949,6 +4087,7 @@ async def v1_chat_completions(
     if prohibit_fast_mode and _is_fast_mode_model_alias(effective_model):
         effective_model = responses_payload.model
     validate_model_access(api_key, responses_payload.model)
+    routing_policy = await _current_routing_engine_policy()
     source_selection = (
         await _select_chat_model_source(
             responses_payload.model,
@@ -3958,7 +4097,11 @@ async def v1_chat_completions(
             request=request,
             payload=responses_payload,
         )
-        if not responses_shaped_payload and payload.messages is not None
+        if (
+            _provider_branch_allowed(routing_policy)
+            and not responses_shaped_payload
+            and payload.messages is not None
+        )
         else None
     )
     sources = source_selection[0] if source_selection is not None else []
@@ -4307,12 +4450,12 @@ def _model_can_use_account_branch(model: str) -> bool:
 
 
 def _responses_request_allows_safe_branch_fallback(payload: ResponsesRequest) -> bool:
-    # Tool definitions alone do not make a request stateful. Source responses
-    # are buffered before any downstream byte is emitted whenever account
-    # fallback is available, so switching branches before visible output
-    # cannot duplicate a tool call. Keep blocking only server-owned response
-    # continuations, whose state is pinned to the original upstream.
-    return payload.previous_response_id is None and payload.conversation is None
+    # A provider/account switch is a fresh replay. Only self-contained,
+    # account-neutral input may cross that boundary; response-owned IDs,
+    # reasoning state, files, and pending tool calls stay with their owner.
+    if payload.previous_response_id is not None or payload.conversation is not None:
+        return False
+    return responses_payload_is_account_neutral_fresh_replay(payload.to_payload())
 
 
 def _route_to_provider_for_native_model(
@@ -4320,12 +4463,27 @@ def _route_to_provider_for_native_model(
     *,
     model: str,
     request: Request | None = None,
+    routing_policy: _RoutingEnginePolicy | None = None,
+    account_pool_available: bool | None = None,
 ) -> bool:
+    if routing_policy is None:
+        routing_policy = _RoutingEnginePolicy()
+    override = routing_policy.global_api_routing_override
+    if override == "provider_first":
+        return True
+    if override == "account_first":
+        return False
     mode = _api_key_routing_mode(api_key)
     if mode == "provider_first":
         return True
     if mode == "account_first":
         return False
+    # Balanced routing must not spend every other turn on an account branch
+    # that is known to have no selectable capacity. Account rows retain their
+    # reset timestamps, so this acts as a pool-level circuit breaker: providers
+    # carry traffic until at least one account reaches its reset.
+    if account_pool_available is False:
+        return True
     # Balanced alternates the preferred route per API key + model. Cache the
     # decision on the inbound request so chat/responses normalization, fallback
     # probes, or repeated selector calls cannot advance the cursor twice.
@@ -4346,6 +4504,29 @@ def _route_to_provider_for_native_model(
     return decision
 
 
+def _account_can_reenter_rotation(account: Account, *, now_epoch: int) -> bool:
+    if account.status == AccountStatus.ACTIVE:
+        return True
+    return (
+        account.status in {AccountStatus.RATE_LIMITED, AccountStatus.QUOTA_EXCEEDED}
+        and account.reset_at is not None
+        and int(account.reset_at) <= now_epoch
+    )
+
+
+async def _account_pool_has_available_route(
+    repository: AccountsRepository,
+    api_key: ApiKeyData | None,
+) -> bool:
+    if api_key is not None and api_key.account_assignment_scope_enabled:
+        assigned_ids = [account_id for account_id in api_key.assigned_account_ids if account_id]
+        accounts = await repository.list_accounts_by_ids(assigned_ids)
+    else:
+        accounts = await repository.list_accounts()
+    now_epoch = int(time.time())
+    return any(_account_can_reenter_rotation(account, now_epoch=now_epoch) for account in accounts)
+
+
 async def _select_chat_model_source(
     model: str,
     api_key: ApiKeyData | None,
@@ -4363,8 +4544,14 @@ async def _select_chat_model_source(
         return None
     deduped_candidates = list(dict.fromkeys(candidates))
     registry_models = get_model_registry().get_models_with_fallback()
+    request_settings = await get_settings_cache().get()
+    routing_policy = _routing_engine_policy_from_settings(request_settings)
     async with get_background_session() as session:
         repository = ModelSourcesRepository(session)
+        accounts_repository = AccountsRepository(session)
+        account_pool_available: bool | None = None
+        if _api_key_routing_mode(api_key) == "balanced" and not _routing_forces_account(routing_policy):
+            account_pool_available = await _account_pool_has_available_route(accounts_repository, api_key)
         for candidate in deduped_candidates:
             if exact_allowed_models is not None and candidate not in exact_allowed_models:
                 continue
@@ -4372,7 +4559,13 @@ async def _select_chat_model_source(
             if (
                 subscription_model is not None
                 and not allow_native_provider_fallback
-                and not _route_to_provider_for_native_model(api_key, model=candidate, request=request)
+                and not _route_to_provider_for_native_model(
+                    api_key,
+                    model=candidate,
+                    request=request,
+                    routing_policy=routing_policy,
+                    account_pool_available=account_pool_available,
+                )
             ):
                 continue
             sources = await repository.find_chat_sources_for_model(
@@ -4389,7 +4582,6 @@ async def _select_chat_model_source(
         # their attributes after this session boundary.
         detach_session_objects(session)
         sources = _source_burn_order(sources)
-        request_settings = await get_settings_cache().get()
         if not request_settings.model_source_sticky_enabled:
             _SOURCE_STICKY.clear()
         sticky_key = (
@@ -4424,8 +4616,14 @@ async def _select_responses_model_source(
         return None
     deduped_candidates = list(dict.fromkeys(candidates))
     registry_models = get_model_registry().get_models_with_fallback()
+    request_settings = await get_settings_cache().get()
+    routing_policy = _routing_engine_policy_from_settings(request_settings)
     async with get_background_session() as session:
         repository = ModelSourcesRepository(session)
+        accounts_repository = AccountsRepository(session)
+        account_pool_available: bool | None = None
+        if _api_key_routing_mode(api_key) == "balanced" and not _routing_forces_account(routing_policy):
+            account_pool_available = await _account_pool_has_available_route(accounts_repository, api_key)
         for candidate in deduped_candidates:
             if exact_allowed_models is not None and candidate not in exact_allowed_models:
                 continue
@@ -4433,7 +4631,13 @@ async def _select_responses_model_source(
             if (
                 subscription_model is not None
                 and not allow_native_provider_fallback
-                and not _route_to_provider_for_native_model(api_key, model=candidate, request=request)
+                and not _route_to_provider_for_native_model(
+                    api_key,
+                    model=candidate,
+                    request=request,
+                    routing_policy=routing_policy,
+                    account_pool_available=account_pool_available,
+                )
             ):
                 continue
             sources = await repository.find_responses_sources_for_model(
@@ -4450,7 +4654,6 @@ async def _select_responses_model_source(
         # their attributes after this session boundary.
         detach_session_objects(session)
         sources = _source_burn_order(sources)
-        request_settings = await get_settings_cache().get()
         if not request_settings.model_source_sticky_enabled:
             _SOURCE_STICKY.clear()
         sticky_key = (
@@ -4651,8 +4854,22 @@ async def _source_responses_response(
     api_key: ApiKeyData | None,
     rate_limit_headers: Mapping[str, str],
     account_fallback: Callable[[], Awaitable[Response]] | None = None,
+    sources_are_ordered: bool = False,
+    post_account_sources: list[ModelSource] | None = None,
 ) -> Response:
-    candidates = _source_provider_candidates(sources)
+    routing_policy = await _current_routing_engine_policy()
+    candidates = sources if sources_are_ordered else _source_provider_candidates_for_policy(sources, routing_policy)
+    primary_candidates = (
+        candidates
+        if sources_are_ordered
+        else _source_provider_primary_candidates(candidates, routing_policy)
+    )
+    if post_account_sources is None:
+        post_account_sources = (
+            []
+            if sources_are_ordered
+            else _source_provider_fallback_candidates(candidates, routing_policy)
+        )
     reservation = await _enforce_request_limits(
         api_key,
         request_model=payload.model,
@@ -4673,7 +4890,20 @@ async def _source_responses_response(
         return source_payload
 
     def provider_fallback_after(attempt: int) -> Callable[[], Awaitable[Response]] | None:
-        remaining_sources = candidates[attempt + 1 :]
+        remaining_primary = primary_candidates[attempt + 1 :]
+        remaining_post_account = list(post_account_sources or [])
+        if remaining_primary:
+            remaining_sources = remaining_primary
+            nested_account_fallback = (
+                account_fallback
+                if routing_policy.provider_failure_policy != "provider_only"
+                else None
+            )
+            nested_post_account_sources = remaining_post_account
+        else:
+            remaining_sources = remaining_post_account
+            nested_account_fallback = None
+            nested_post_account_sources = []
         if not remaining_sources:
             return None
 
@@ -4684,13 +4914,65 @@ async def _source_responses_response(
                 sources=remaining_sources,
                 api_key=api_key,
                 rate_limit_headers=rate_limit_headers,
-                account_fallback=None,
+                account_fallback=nested_account_fallback,
+                sources_are_ordered=True,
+                post_account_sources=nested_post_account_sources,
             )
 
+        # A successful-but-empty account response historically advanced to a
+        # different provider, but did not replay the same provider. Repeated
+        # slots for one provider remain available for retryable account errors.
+        fallback.allow_after_empty_account_success = any(
+            remaining.id != primary_candidates[attempt].id for remaining in remaining_sources
+        )
         return fallback
 
+    def should_try_account_after(attempt: int) -> bool:
+        return _source_should_try_account_after_provider_failure(
+            routing_policy,
+            providers_exhausted=attempt + 1 >= len(primary_candidates),
+        )
+
+    if not primary_candidates and post_account_sources:
+        await _release_reservation(reservation)
+
+        async def post_account_fallback() -> Response:
+            return await _source_responses_response(
+                request,
+                payload,
+                sources=list(post_account_sources or []),
+                api_key=api_key,
+                rate_limit_headers=rate_limit_headers,
+                account_fallback=None,
+                sources_are_ordered=True,
+                post_account_sources=[],
+            )
+
+        if (
+            account_fallback is not None
+            and _source_should_try_account_after_provider_failure(routing_policy, providers_exhausted=True)
+        ):
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=post_account_fallback,
+            )
+        return await post_account_fallback()
+
+    if (
+        not primary_candidates
+        and account_fallback is not None
+        and _source_should_try_account_after_provider_failure(routing_policy, providers_exhausted=True)
+    ):
+        await _release_reservation(reservation)
+        return await _source_account_first_fallback(
+            request,
+            account_fallback=account_fallback,
+            provider_fallback=None,
+        )
+
     if payload.stream:
-        for attempt, source in enumerate(candidates):
+        for attempt, source in enumerate(primary_candidates):
             source_payload = build_source_payload(source)
             request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
             try:
@@ -4713,7 +4995,11 @@ async def _source_responses_response(
                 )
                 provider_fallback = provider_fallback_after(attempt)
                 await _release_reservation(reservation)
-                if account_fallback is not None and _source_error_allows_account_fallback(exc):
+                if (
+                    account_fallback is not None
+                    and should_try_account_after(attempt)
+                    and _source_error_allows_account_fallback(exc)
+                ):
                     return await _source_account_first_fallback(
                         request,
                         account_fallback=account_fallback,
@@ -4742,8 +5028,9 @@ async def _source_responses_response(
                 stream=stream.body,
                 usage_holder=stream.usage_holder,
                 rate_limit_headers=rate_limit_headers,
-                account_fallback=account_fallback,
+                account_fallback=account_fallback if should_try_account_after(attempt) else None,
                 provider_fallback=provider_fallback,
+                validate_chat_visible_output=False,
             )
         body = _source_chat_stream_with_settlement(
             stream.body,
@@ -4764,7 +5051,7 @@ async def _source_responses_response(
             },
         )
 
-    for attempt, source in enumerate(candidates):
+    for attempt, source in enumerate(primary_candidates):
         source_payload = build_source_payload(source)
         request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
         try:
@@ -4786,7 +5073,11 @@ async def _source_responses_response(
             )
             provider_fallback = provider_fallback_after(attempt)
             await _release_reservation(reservation)
-            if account_fallback is not None and _source_error_allows_account_fallback(exc):
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+                and _source_error_allows_account_fallback(exc)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
@@ -4796,7 +5087,7 @@ async def _source_responses_response(
                 request.state.model_source_fallback = True
                 return await provider_fallback()
             return _logged_error_json_response(request, exc.status_code, exc.payload, headers=rate_limit_headers)
-        if _source_completion_is_zero_token(result.usage) and attempt + 1 < len(candidates):
+        if _source_completion_is_zero_token(result.usage) and attempt + 1 < len(primary_candidates):
             await _log_source_chat_completion(
                 request,
                 source=source,
@@ -4810,15 +5101,19 @@ async def _source_responses_response(
             )
             await _release_reservation(reservation)
             provider_fallback = provider_fallback_after(attempt)
-            if account_fallback is not None:
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
                     provider_fallback=provider_fallback,
                 )
-            request.state.model_source_fallback = True
-            return await provider_fallback()
-        if result.usage is None and _reservation_requires_usage(reservation) and attempt + 1 < len(candidates):
+            if provider_fallback is not None:
+                request.state.model_source_fallback = True
+                return await provider_fallback()
+        if result.usage is None and _reservation_requires_usage(reservation) and attempt + 1 < len(primary_candidates):
             await _log_source_chat_completion(
                 request,
                 source=source,
@@ -4831,14 +5126,18 @@ async def _source_responses_response(
             )
             await _release_reservation(reservation)
             provider_fallback = provider_fallback_after(attempt)
-            if account_fallback is not None:
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
                     provider_fallback=provider_fallback,
                 )
-            request.state.model_source_fallback = True
-            return await provider_fallback()
+            if provider_fallback is not None:
+                request.state.model_source_fallback = True
+                return await provider_fallback()
         break
     else:  # Defensive: selectors never call this helper with an empty list.
         await _release_reservation(reservation)
@@ -4862,7 +5161,10 @@ async def _source_responses_response(
             error_message="source response reported zero total tokens",
             upstream_status_code=result.upstream_status_code,
         )
-        if account_fallback is not None:
+        if (
+            account_fallback is not None
+            and _source_should_try_account_after_provider_failure(routing_policy, providers_exhausted=True)
+        ):
             request.state.model_source_fallback = True
             return await account_fallback()
         return _logged_error_json_response(
@@ -5129,6 +5431,10 @@ async def _account_chat_provider_fallback_response(
     rate_limit_headers: Mapping[str, str],
     account_reservation: ApiKeyUsageReservationData | None = None,
 ) -> Response | None:
+    routing_policy = await _current_routing_engine_policy()
+    if not _account_branch_allows_provider_fallback(routing_policy):
+        return None
+    request.state.model_source_account_to_provider_fallback = True
     selection = await _select_chat_model_source(
         model,
         api_key,
@@ -5167,6 +5473,10 @@ async def _account_responses_provider_fallback_response(
     api_key: ApiKeyData | None,
     rate_limit_headers: Mapping[str, str],
 ) -> Response | None:
+    routing_policy = await _current_routing_engine_policy()
+    if not _account_branch_allows_provider_fallback(routing_policy):
+        return None
+    request.state.model_source_account_to_provider_fallback = True
     if not _responses_request_allows_safe_branch_fallback(payload):
         return None
     selection = await _select_responses_model_source(
@@ -5204,8 +5514,22 @@ async def _source_chat_completion_response(
     reservation: ApiKeyUsageReservationData | None,
     rate_limit_headers: Mapping[str, str],
     account_fallback: Callable[[], Awaitable[Response]] | None = None,
+    sources_are_ordered: bool = False,
+    post_account_sources: list[ModelSource] | None = None,
 ) -> Response:
-    candidates = _source_provider_candidates(sources)
+    routing_policy = await _current_routing_engine_policy()
+    candidates = sources if sources_are_ordered else _source_provider_candidates_for_policy(sources, routing_policy)
+    primary_candidates = (
+        candidates
+        if sources_are_ordered
+        else _source_provider_primary_candidates(candidates, routing_policy)
+    )
+    if post_account_sources is None:
+        post_account_sources = (
+            []
+            if sources_are_ordered
+            else _source_provider_fallback_candidates(candidates, routing_policy)
+        )
 
     def build_source_payload(source: ModelSource) -> dict[str, JsonValue]:
         source_payload = payload.model_dump(mode="json", exclude_none=True)
@@ -5219,7 +5543,20 @@ async def _source_chat_completion_response(
         return source_payload
 
     def provider_fallback_after(attempt: int) -> Callable[[], Awaitable[Response]] | None:
-        remaining_sources = candidates[attempt + 1 :]
+        remaining_primary = primary_candidates[attempt + 1 :]
+        remaining_post_account = list(post_account_sources or [])
+        if remaining_primary:
+            remaining_sources = remaining_primary
+            nested_account_fallback = (
+                account_fallback
+                if routing_policy.provider_failure_policy != "provider_only"
+                else None
+            )
+            nested_post_account_sources = remaining_post_account
+        else:
+            remaining_sources = remaining_post_account
+            nested_account_fallback = None
+            nested_post_account_sources = []
         if not remaining_sources:
             return None
 
@@ -5237,13 +5574,69 @@ async def _source_chat_completion_response(
                 api_key=api_key,
                 reservation=fallback_reservation,
                 rate_limit_headers=rate_limit_headers,
-                account_fallback=None,
+                account_fallback=nested_account_fallback,
+                sources_are_ordered=True,
+                post_account_sources=nested_post_account_sources,
             )
 
+        fallback.allow_after_empty_account_success = any(
+            remaining.id != primary_candidates[attempt].id for remaining in remaining_sources
+        )
         return fallback
 
+    def should_try_account_after(attempt: int) -> bool:
+        return _source_should_try_account_after_provider_failure(
+            routing_policy,
+            providers_exhausted=attempt + 1 >= len(primary_candidates),
+        )
+
+    if not primary_candidates and post_account_sources:
+        await _release_reservation(reservation)
+
+        async def post_account_fallback() -> Response:
+            fallback_reservation = await _enforce_request_limits(
+                api_key,
+                request_model=model,
+                request_service_tier=None,
+            )
+            return await _source_chat_completion_response(
+                request,
+                payload,
+                sources=list(post_account_sources or []),
+                model=model,
+                api_key=api_key,
+                reservation=fallback_reservation,
+                rate_limit_headers=rate_limit_headers,
+                account_fallback=None,
+                sources_are_ordered=True,
+                post_account_sources=[],
+            )
+
+        if (
+            account_fallback is not None
+            and _source_should_try_account_after_provider_failure(routing_policy, providers_exhausted=True)
+        ):
+            return await _source_account_first_fallback(
+                request,
+                account_fallback=account_fallback,
+                provider_fallback=post_account_fallback,
+            )
+        return await post_account_fallback()
+
+    if (
+        not primary_candidates
+        and account_fallback is not None
+        and _source_should_try_account_after_provider_failure(routing_policy, providers_exhausted=True)
+    ):
+        await _release_reservation(reservation)
+        return await _source_account_first_fallback(
+            request,
+            account_fallback=account_fallback,
+            provider_fallback=None,
+        )
+
     if payload.stream:
-        for attempt, source in enumerate(candidates):
+        for attempt, source in enumerate(primary_candidates):
             source_payload = build_source_payload(source)
             request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
             stream_options = source_payload.get("stream_options")
@@ -5271,7 +5664,11 @@ async def _source_chat_completion_response(
                 )
                 provider_fallback = provider_fallback_after(attempt)
                 await _release_reservation(reservation)
-                if account_fallback is not None and _source_error_allows_account_fallback(exc):
+                if (
+                    account_fallback is not None
+                    and should_try_account_after(attempt)
+                    and _source_error_allows_account_fallback(exc)
+                ):
                     return await _source_account_first_fallback(
                         request,
                         account_fallback=account_fallback,
@@ -5300,7 +5697,7 @@ async def _source_chat_completion_response(
                 stream=stream.body,
                 usage_holder=stream.usage_holder,
                 rate_limit_headers=rate_limit_headers,
-                account_fallback=account_fallback,
+                account_fallback=account_fallback if should_try_account_after(attempt) else None,
                 provider_fallback=provider_fallback,
             )
         body = _source_chat_stream_with_settlement(
@@ -5318,7 +5715,7 @@ async def _source_chat_completion_response(
             headers={"Cache-Control": "no-cache", **rate_limit_headers},
         )
 
-    for attempt, source in enumerate(candidates):
+    for attempt, source in enumerate(primary_candidates):
         source_payload = build_source_payload(source)
         request.state.oaic_reasoning_effort = _source_payload_reasoning_effort(source_payload)
         try:
@@ -5340,7 +5737,11 @@ async def _source_chat_completion_response(
             )
             provider_fallback = provider_fallback_after(attempt)
             await _release_reservation(reservation)
-            if account_fallback is not None and _source_error_allows_account_fallback(exc):
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+                and _source_error_allows_account_fallback(exc)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
@@ -5368,7 +5769,10 @@ async def _source_chat_completion_response(
             )
             await _release_reservation(reservation)
             provider_fallback = provider_fallback_after(attempt)
-            if account_fallback is not None:
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
@@ -5383,7 +5787,7 @@ async def _source_chat_completion_response(
                 _empty_assistant_response_error(),
                 headers=rate_limit_headers,
             )
-        if _source_completion_is_zero_token(result.usage) and attempt + 1 < len(candidates):
+        if _source_completion_is_zero_token(result.usage) and attempt + 1 < len(primary_candidates):
             await _log_source_chat_completion(
                 request,
                 source=source,
@@ -5397,15 +5801,19 @@ async def _source_chat_completion_response(
             )
             await _release_reservation(reservation)
             provider_fallback = provider_fallback_after(attempt)
-            if account_fallback is not None:
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
                     provider_fallback=provider_fallback,
                 )
-            request.state.model_source_fallback = True
-            return await provider_fallback()
-        if result.usage is None and _reservation_requires_usage(reservation) and attempt + 1 < len(candidates):
+            if provider_fallback is not None:
+                request.state.model_source_fallback = True
+                return await provider_fallback()
+        if result.usage is None and _reservation_requires_usage(reservation) and attempt + 1 < len(primary_candidates):
             await _log_source_chat_completion(
                 request,
                 source=source,
@@ -5418,14 +5826,18 @@ async def _source_chat_completion_response(
             )
             await _release_reservation(reservation)
             provider_fallback = provider_fallback_after(attempt)
-            if account_fallback is not None:
+            if (
+                account_fallback is not None
+                and should_try_account_after(attempt)
+            ):
                 return await _source_account_first_fallback(
                     request,
                     account_fallback=account_fallback,
                     provider_fallback=provider_fallback,
                 )
-            request.state.model_source_fallback = True
-            return await provider_fallback()
+            if provider_fallback is not None:
+                request.state.model_source_fallback = True
+                return await provider_fallback()
         break
     else:  # Defensive: selectors never call this helper with an empty list.
         await _release_reservation(reservation)
@@ -5449,7 +5861,10 @@ async def _source_chat_completion_response(
             error_message="source response reported zero total tokens",
             upstream_status_code=result.upstream_status_code,
         )
-        if account_fallback is not None:
+        if (
+            account_fallback is not None
+            and _source_should_try_account_after_provider_failure(routing_policy, providers_exhausted=True)
+        ):
             request.state.model_source_fallback = True
             return await account_fallback()
         return _logged_error_json_response(
@@ -5525,6 +5940,7 @@ async def _buffered_limited_source_chat_stream_response(
     rate_limit_headers: Mapping[str, str],
     account_fallback: Callable[[], Awaitable[Response]] | None = None,
     provider_fallback: Callable[[], Awaitable[Response]] | None = None,
+    validate_chat_visible_output: bool = True,
 ) -> Response:
     chunks: list[bytes] = []
     total_bytes = 0
@@ -5613,7 +6029,10 @@ async def _buffered_limited_source_chat_stream_response(
             return await provider_fallback()
         return _logged_error_json_response(request, 502, error, headers=rate_limit_headers)
 
-    if not _chat_completion_sse_bytes_has_assistant_visible_output(chunks):
+    # Responses API streams use response.output_text.delta and related event
+    # shapes, not Chat Completions choices[].delta. Until that path has a
+    # dedicated semantic-empty validator, preserve its pre-check behavior.
+    if validate_chat_visible_output and not _chat_completion_sse_bytes_has_assistant_visible_output(chunks):
         _forget_sticky_source(
             _source_sticky_key(api_key, model=model, request=request),
             source,
@@ -5675,6 +6094,20 @@ async def _buffered_limited_source_chat_stream_response(
                 error_type="server_error",
             ),
             headers=rate_limit_headers,
+        )
+
+    if (
+        usage_holder.usage is None
+        and source.estimate_missing_stream_usage
+        and usage_holder.estimated_usage is not None
+    ):
+        usage_holder.usage = usage_holder.estimated_usage
+        logger.info(
+            "model_source_usage_estimated source_id=%s model=%s input_tokens=%s output_tokens=%s",
+            source.id,
+            model,
+            usage_holder.usage.input_tokens,
+            usage_holder.usage.output_tokens,
         )
 
     if usage_holder.usage is None:
@@ -7614,7 +8047,9 @@ async def _enforce_request_limits(
                 request_usage_budget=request_usage_budget,
             )
         except ApiKeyRateLimitExceededError as exc:
-            message = f"{exc}. Usage resets at {exc.reset_at.isoformat()}Z."
+            message = str(exc)
+            if not exc.is_lifetime:
+                message = f"{message} Thời gian reset: {exc.reset_at.isoformat()}Z."
             raise ProxyRateLimitError(message) from exc
         except ApiKeyInvalidError as exc:
             raise ProxyAuthError(str(exc)) from exc
@@ -7782,16 +8217,75 @@ def _source_completion_is_zero_token(usage: SourceUsage | None) -> bool:
 
 
 def _source_provider_candidates(sources: list[ModelSource]) -> list[ModelSource]:
-    """Try regular providers first, then one final fallback-only provider."""
+    return _source_provider_candidates_for_policy(sources, _RoutingEnginePolicy())
+
+
+def _source_provider_candidates_for_policy(
+    sources: list[ModelSource],
+    policy: _RoutingEnginePolicy,
+) -> list[ModelSource]:
+    """Cycle configurable regular-provider slots, then every fallback-only provider."""
     regular_sources = [source for source in sources if not _source_is_last_resort(source)]
     last_resort_sources = [source for source in sources if _source_is_last_resort(source)]
-    return [*regular_sources[:_SOURCE_MAX_PROVIDER_ATTEMPTS], *last_resort_sources[:1]]
+    if not regular_sources:
+        return last_resort_sources
+    regular_slots = [regular_sources[index % len(regular_sources)] for index in range(policy.provider_max_attempts)]
+    return [*regular_slots, *last_resort_sources]
+
+
+def _source_provider_primary_candidates(
+    candidates: list[ModelSource],
+    policy: _RoutingEnginePolicy,
+) -> list[ModelSource]:
+    if policy.provider_failure_policy == "provider_only":
+        return candidates
+    regular_candidates = [source for source in candidates if not _source_is_last_resort(source)]
+    if policy.provider_failure_policy == "account_after_first_failure":
+        return regular_candidates[:1]
+    # ``providers_before_accounts`` exhausts only regular provider slots. Sources
+    # explicitly marked fallback-only are last-resort routes after the account
+    # branch, not part of the "providers before accounts" phase.
+    return regular_candidates
+
+
+def _source_provider_fallback_candidates(
+    candidates: list[ModelSource],
+    policy: _RoutingEnginePolicy,
+) -> list[ModelSource]:
+    if policy.provider_failure_policy == "provider_only":
+        return []
+    if policy.provider_failure_policy == "account_after_first_failure":
+        primary = _source_provider_primary_candidates(candidates, policy)
+        primary_id = primary[0].id if primary else None
+        skipped_primary = False
+        remaining: list[ModelSource] = []
+        for source in candidates:
+            if not skipped_primary and primary_id is not None and source.id == primary_id:
+                skipped_primary = True
+                continue
+            remaining.append(source)
+        return remaining
+    return [source for source in candidates if _source_is_last_resort(source)]
+
+
+def _source_should_try_account_after_provider_failure(
+    policy: _RoutingEnginePolicy,
+    providers_exhausted: bool = False,
+) -> bool:
+    if _routing_forces_account(policy) or policy.provider_failure_policy == "provider_only":
+        return False
+    if policy.provider_failure_policy == "providers_before_accounts":
+        return providers_exhausted
+    return True
 
 
 def _source_error_allows_provider_fallback(exc: ModelSourceForwardingError) -> bool:
     """Retry failures owned by a provider, not generic client payload errors."""
     code = (_source_error_code(exc.payload) or "").strip().lower()
     message = (_source_error_message(exc.payload) or "").strip().lower()
+    normalized_message = message.split(" (id:", 1)[0].strip()
+    if normalized_message in _SOURCE_PROVIDER_INCOMPATIBLE_ERROR_MESSAGES:
+        return True
     if code in _SOURCE_FALLBACK_ERROR_CODES or code in _SOURCE_MODEL_UNAVAILABLE_ERROR_CODES:
         return True
     if exc.status_code in {401, 403, 408, 409, 405, 415, 425, 429} or exc.status_code >= 500:
@@ -7874,13 +8368,119 @@ async def _source_account_first_fallback(
     account_fallback: Callable[[], Awaitable[Response]],
     provider_fallback: Callable[[], Awaitable[Response]] | None,
 ) -> Response:
-    """Try the account pool once (internally up to 3 accounts), then providers."""
+    """Try the account pool once, then provider fallback when policy permits."""
     request.state.model_source_fallback = True
     response = await account_fallback()
+    if provider_fallback is not None:
+        response = await _probe_account_response_before_provider_fallback(request, response)
+    # A successful account response completes the provider→account branch even
+    # when it contains no assistant-visible output. Only retryable account
+    # errors should resume the remaining provider candidates; otherwise the new
+    # repeated provider slots would turn a valid legacy account fallback into
+    # another provider replay.
     if provider_fallback is not None and _account_response_allows_provider_fallback(response):
-        request.state.model_source_fallback = True
-        return await provider_fallback()
+        allow_after_success = bool(getattr(provider_fallback, "allow_after_empty_account_success", True))
+        if response.status_code >= 400 or allow_after_success:
+            request.state.model_source_fallback = True
+            return await provider_fallback()
     return response
+
+
+async def _probe_account_response_before_provider_fallback(request: Request, response: Response) -> Response:
+    """Expose retryable account SSE startup failures as an HTTP error response.
+
+    Account routing returns ``StreamingResponse(status=200)`` before selection
+    retries have necessarily completed. Quota exhaustion can therefore arrive
+    as a later startup ``response.failed`` event. Buffer the short startup
+    sequence so account-first routing can still switch to a provider before
+    any bytes are committed downstream.
+    """
+    if not isinstance(response, StreamingResponse) or response.status_code >= 400:
+        return response
+    body_iterator = getattr(response, "body_iterator", None)
+    if body_iterator is None:
+        return response
+    probed_stream, startup_error = await _probe_chat_stream_startup_error(body_iterator)
+    if startup_error is None:
+        response.body_iterator = probed_stream
+        return response
+    return _stream_startup_error_response(
+        request,
+        startup_error,
+        headers=dict(response.headers),
+    )
+
+
+_SOURCE_AUTO_PAUSE_ERROR_CODES = frozenset(
+    {
+        "rate_limit_exceeded",
+        "usage_limit_reached",
+        "insufficient_quota",
+        "insufficient_balance",
+        "invalid_api_key",
+        "authentication_error",
+        "token_expired",
+        "api_key_expired",
+    }
+)
+_SOURCE_AUTO_PAUSE_ERROR_MESSAGES = frozenset(
+    {
+        # Some OpenAI-compatible providers wrap credential rejection in a
+        # generic HTTP 500 / INTERNAL_ERROR envelope. Treat the provider's
+        # exact validation failure as authentication failure instead of a
+        # transient 5xx, otherwise the dead source is retried indefinitely.
+        "failed to validate api key",
+    }
+)
+
+
+def _is_model_source_auto_pause_failure(
+    *,
+    error_code: str | None,
+    error_message: str | None,
+    upstream_status_code: int | None,
+) -> bool:
+    normalized_code = (error_code or "").strip().lower()
+    normalized_message = " ".join((error_message or "").strip().lower().split())
+    return (
+        upstream_status_code in {401, 429}
+        or normalized_code in _SOURCE_AUTO_PAUSE_ERROR_CODES
+        or normalized_message in _SOURCE_AUTO_PAUSE_ERROR_MESSAGES
+    )
+
+
+async def _record_model_source_auto_pause_result(
+    source: ModelSource,
+    *,
+    status: str,
+    error_code: str | None,
+    error_message: str | None,
+    upstream_status_code: int | None,
+) -> None:
+    settings = await get_settings_cache().get()
+    normalized_code = (error_code or "").strip().lower()
+    normalized_message = " ".join((error_message or "").strip().lower().split())
+    qualifying_failure = _is_model_source_auto_pause_failure(
+        error_code=error_code,
+        error_message=error_message,
+        upstream_status_code=upstream_status_code,
+    )
+    try:
+        async with get_background_session() as session:
+            await ModelSourcesRepository(session).record_auto_pause_result(
+                source.id,
+                qualifying_failure=qualifying_failure,
+                success=status == "success",
+                enabled=bool(getattr(settings, "model_source_auto_pause_enabled", True)),
+                threshold=int(getattr(settings, "model_source_auto_pause_threshold", 3)),
+                reason=(
+                    "invalid_api_key"
+                    if normalized_message in _SOURCE_AUTO_PAUSE_ERROR_MESSAGES
+                    else normalized_code or (f"http_{upstream_status_code}" if upstream_status_code else None)
+                ),
+            )
+    except Exception:
+        logger.warning("failed to update model source auto-pause state source_id=%s", source.id, exc_info=True)
 
 
 async def _log_source_chat_completion(
@@ -7898,6 +8498,19 @@ async def _log_source_chat_completion(
     upstream_status_code: int | None = None,
 ) -> None:
     conversation_id = _request_log_client_fields(request.headers)[2]
+    await _record_model_source_auto_pause_result(
+        source,
+        status=status,
+        error_code=error_code,
+        error_message=error_message,
+        upstream_status_code=upstream_status_code,
+    )
+    if status == "success" and bool(getattr(request.state, "model_source_fallback", False)):
+        try:
+            async with get_background_session() as session:
+                await RequestLogsRepository(session).suppress_recovered_fallback_errors(ensure_request_id())
+        except Exception:
+            logger.warning("failed to suppress recovered account fallback error", exc_info=True)
     try:
         async with get_background_session() as session:
             await RequestLogsRepository(session).add_log(

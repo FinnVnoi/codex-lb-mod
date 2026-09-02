@@ -3,10 +3,15 @@ import { useTranslation } from "react-i18next";
 
 import { ModelSourcesSettings } from "@/features/model-sources/components/model-sources-settings";
 import { useAuthStore } from "@/features/auth/hooks/use-auth";
+import { TrafficRoutingSettings } from "@/features/settings/components/traffic-routing-settings";
+import { useSettings } from "@/features/settings/hooks/use-settings";
 
 export function ModelSourcesPage() {
   const { t } = useTranslation();
   const canWrite = useAuthStore((state) => state.canWrite);
+  const { settingsQuery, updateSettingsMutation } = useSettings();
+  const settings = settingsQuery.data;
+  const controlsDisabled = !canWrite || updateSettingsMutation.isPending || settingsQuery.isFetching;
 
   return (
     <div className="animate-fade-in-up space-y-6">
@@ -22,7 +27,16 @@ export function ModelSourcesPage() {
           {t("settings.page.readOnlyNotice")}
         </div>
       ) : null}
-      <ModelSourcesSettings disabled={!canWrite} />
+      {settings ? (
+        <TrafficRoutingSettings
+          settings={settings}
+          busy={controlsDisabled}
+          onSave={async (payload) => {
+            await updateSettingsMutation.mutateAsync(payload);
+          }}
+        />
+      ) : null}
+      <ModelSourcesSettings disabled={!canWrite} settings={settings} />
     </div>
   );
 }

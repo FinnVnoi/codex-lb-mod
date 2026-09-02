@@ -50,6 +50,7 @@ function ModelSourceEditForm({ source, busy, onSubmit, onClose }: ModelSourceEdi
       supportsChatCompletions: values.supportsChatCompletions,
       supportsResponses: values.supportsResponses,
       supportsAudioTranscriptions: values.supportsAudioTranscriptions,
+      estimateMissingStreamUsage: values.estimateMissingStreamUsage,
       routingPolicy: values.routingPolicy,
       models: modelInputsFromForm(values, source.models),
     };
@@ -68,8 +69,10 @@ function ModelSourceEditForm({ source, busy, onSubmit, onClose }: ModelSourceEdi
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-4">
         <ModelSourceFormFields
           control={form.control}
+          setValue={form.setValue}
           apiKeyLabel={t("modelSources.fields.upstreamApiKey")}
           apiKeyPlaceholder={t("modelSources.editDialog.keepCurrentKey")}
+          sourceId={source.id}
         />
         <DialogFooter>
           <Button type="submit" disabled={busy || form.formState.isSubmitting}>

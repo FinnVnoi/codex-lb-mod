@@ -5,7 +5,7 @@ from datetime import timedelta
 import pytest
 
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, ApiKeyLimit, LimitType, LimitWindow, UsageHistory
+from app.db.models import Account, AccountStatus, ApiKeyLimit, ApiKeyLogicalRequest, LimitType, LimitWindow, UsageHistory
 from app.db.session import SessionLocal
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
@@ -290,6 +290,7 @@ async def test_v1_usage_returns_zero_usage_for_key_without_logs(async_client):
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
+        "expires_at": None,
         "limits": [],
         "upstream_limits": [],
         "account_pool_usage": {
@@ -314,6 +315,7 @@ async def test_v1_usage_omits_disabled_account_pool_usage_section(async_client):
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
+        "expires_at": None,
         "limits": [],
         "upstream_limits": [],
         "account_pool_usage": None,
@@ -855,3 +857,74 @@ async def test_v1_usage_bulk_accepts_json_payload(async_client):
     assert payload["total"] == 1
     assert payload["ok"] == 1
     assert payload["data"][0]["ok"] is True
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_collapses_fallback_attempts(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-fallback")
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add_all([
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="logical-1", requested_at=now - timedelta(minutes=1), model="gpt-b", status="success", error_code=None, input_tokens=30, output_tokens=4, cached_input_tokens=6, total_cost_usd=.03),
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="logical-2", requested_at=now, model="gpt-c", status="error", error_code="no_accounts", input_tokens=5, output_tokens=0, cached_input_tokens=0, total_cost_usd=.005),
+        ])
+        await session.commit()
+
+    response = await async_client.get("/v1/usage/activity?window=1d&page=1", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"] == {"request_count": 2, "total_tokens": 39, "cached_input_tokens": 6, "total_cost_usd": pytest.approx(.035)}
+    assert payload["requests"][0]["status"] == "error"
+    assert payload["requests"][0]["error_code"] == "no_accounts"
+    assert payload["requests"][1]["status"] == "success"
+    assert payload["requests"][1]["error_code"] is None
+    assert payload["requests"][1]["model"] == "gpt-b"
+    assert payload["requests"][1]["total_tokens"] == 34
+
+@pytest.mark.asyncio
+async def test_request_log_writer_upserts_one_logical_request():
+    now = utcnow()
+    key_id, _ = await _create_api_key(name="activity-writer")
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        await repo.add_log(None, "attempt-1", "gpt-a", 10, 1, 1, "error", "retryable", requested_at=now, cached_input_tokens=2, api_key_id=key_id, archive_request_id="logical-write", cost_usd=.01)
+        await repo.add_log(None, "attempt-2", "gpt-b", 20, 3, 1, "ok", None, requested_at=now + timedelta(seconds=1), cached_input_tokens=4, api_key_id=key_id, archive_request_id="logical-write", cost_usd=.02)
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+        row = (await session.execute(select(ApiKeyLogicalRequest).where(ApiKeyLogicalRequest.api_key_id == key_id))).scalar_one()
+        assert row.status == "success"
+        assert row.error_code is None
+        assert row.model == "gpt-b"
+        assert (row.input_tokens, row.output_tokens, row.cached_input_tokens) == (30, 4, 6)
+        assert row.total_cost_usd == pytest.approx(.03)
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_after_id_returns_only_new_logs(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-cursor")
+    now = utcnow()
+    async with SessionLocal() as session:
+        old = ApiKeyLogicalRequest(api_key_id=key_id, logical_id="cursor-old", requested_at=now, model="old", status="success", input_tokens=1, output_tokens=1, cached_input_tokens=0, total_cost_usd=.01)
+        session.add(old); await session.commit(); await session.refresh(old); cursor = old.id
+        session.add(ApiKeyLogicalRequest(api_key_id=key_id, logical_id="cursor-new", requested_at=now + timedelta(seconds=1), model="new", status="success", input_tokens=2, output_tokens=1, cached_input_tokens=0, total_cost_usd=.02)); await session.commit()
+    response = await async_client.get(f"/v1/usage/activity?window=lt&include_logs=true&after_id={cursor}", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert [row["model"] for row in payload["requests"]] == ["new"]
+    assert payload["max_rows"] == 2
+    assert payload["latest_id"] > cursor
+    assert payload["totals"]["request_count"] == 2
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_hides_superseded_client_retry(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-client-retry")
+    now = utcnow()
+    async with SessionLocal() as session:
+        failed = ApiKeyLogicalRequest(api_key_id=key_id, logical_id="retry-failed", conversation_id="conv-1", requested_at=now, model="gpt-x", status="error", error_code="insufficient_quota", input_tokens=0, output_tokens=0, cached_input_tokens=0, total_cost_usd=0)
+        session.add(failed); await session.flush()
+        success = ApiKeyLogicalRequest(api_key_id=key_id, logical_id="retry-success", conversation_id="conv-1", requested_at=now + timedelta(seconds=9), model="gpt-x", status="success", input_tokens=10, output_tokens=2, cached_input_tokens=1, total_cost_usd=.02)
+        session.add(success); await session.flush(); failed.superseded_by_id = success.id; await session.commit(); failed_id = failed.id
+    response = await async_client.get("/v1/usage/activity?window=lt&include_logs=true&after_id=0", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"]["request_count"] == 1
+    assert [row["status"] for row in payload["requests"]] == ["success"]
+    assert failed_id in payload["removed_ids"]

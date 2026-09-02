@@ -253,7 +253,7 @@ def test_select_account_renewal_preference_deprioritizes_missing_date():
     assert result.account.account_id == "known"
 
 
-def test_select_account_renewal_preference_falls_back_when_no_upcoming_date():
+def test_select_account_renewal_preference_burns_elapsed_entitlement_before_unknown():
     now = time.time()
     states = [
         AccountState("unknown", AccountStatus.ACTIVE, used_percent=10.0, renewal_at=None),
@@ -268,7 +268,35 @@ def test_select_account_renewal_preference_falls_back_when_no_upcoming_date():
     )
 
     assert result.account is not None
-    assert result.account.account_id == "unknown"
+    assert result.account.account_id == "elapsed"
+
+
+def test_select_account_renewal_preference_burns_elapsed_entitlement_before_active_plus():
+    now = time.time()
+    states = [
+        AccountState(
+            "expired-grace-period",
+            AccountStatus.ACTIVE,
+            used_percent=90.0,
+            renewal_at=now - 24 * 3600,
+        ),
+        AccountState(
+            "plus-active",
+            AccountStatus.ACTIVE,
+            used_percent=1.0,
+            renewal_at=now + 20 * 24 * 3600,
+        ),
+    ]
+
+    result = select_account(
+        states,
+        now=now,
+        prefer_earlier_renewal=True,
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is not None
+    assert result.account.account_id == "expired-grace-period"
 
 
 def test_round_robin_distributes_across_all_unstarted_accounts_before_renewal() -> None:
@@ -2022,6 +2050,45 @@ def _epoch_to_naive_utc(epoch: float) -> datetime:
     from datetime import timezone
 
     return datetime.fromtimestamp(epoch, timezone.utc).replace(tzinfo=None)
+
+
+def test_state_from_account_keeps_post_block_exhausted_usage_rate_limited(monkeypatch):
+    now = 1_700_000_000.0
+    blocked_at = now - 30
+    reset_at = int(now + 2 * 3600)
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+    account = _make_test_account(
+        status=AccountStatus.RATE_LIMITED,
+        reset_at=reset_at,
+        blocked_at=int(blocked_at),
+    )
+    runtime = RuntimeState(
+        reset_at=float(reset_at),
+        cooldown_until=now - 1,
+        blocked_at=blocked_at,
+    )
+
+    state = _state_from_account(
+        account=account,
+        primary_entry=_make_test_usage(
+            window="primary",
+            used_percent=100.0,
+            reset_at=reset_at,
+            recorded_at=_epoch_to_naive_utc(now - 5),
+        ),
+        secondary_entry=_make_test_usage(
+            window="secondary",
+            used_percent=16.0,
+            reset_at=int(now + 7 * 24 * 3600),
+            recorded_at=_epoch_to_naive_utc(now - 5),
+        ),
+        runtime=runtime,
+    )
+
+    assert state.status == AccountStatus.RATE_LIMITED
+    assert state.reset_at == reset_at
+    assert state.blocked_at == blocked_at
 
 
 def test_state_from_account_keeps_active_account_selectable_when_primary_usage_snapshot_is_exhausted(
@@ -5871,6 +5938,62 @@ def test_prefer_unstarted_quota_both_requires_every_applicable_window_idle() -> 
     )
 
     assert result.account is both_idle
+
+
+def test_prefer_unstarted_quota_any_accepts_either_idle_window() -> None:
+    primary_idle = AccountState(
+        account_id="primary-idle",
+        status=AccountStatus.ACTIVE,
+        used_percent=80.0,
+        secondary_used_percent=80.0,
+        primary_countdown_started=False,
+        secondary_countdown_started=True,
+    )
+    both_started = AccountState(
+        account_id="both-started",
+        status=AccountStatus.ACTIVE,
+        used_percent=1.0,
+        secondary_used_percent=1.0,
+        primary_countdown_started=True,
+        secondary_countdown_started=True,
+    )
+
+    result = select_account(
+        [both_started, primary_idle],
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="any",
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is primary_idle
+
+
+def test_prefer_unstarted_quota_any_supports_single_applicable_window() -> None:
+    weekly_only_idle = AccountState(
+        account_id="weekly-only-idle",
+        status=AccountStatus.ACTIVE,
+        used_percent=None,
+        secondary_used_percent=80.0,
+        primary_countdown_started=None,
+        secondary_countdown_started=False,
+    )
+    weekly_started = AccountState(
+        account_id="weekly-started",
+        status=AccountStatus.ACTIVE,
+        used_percent=None,
+        secondary_used_percent=1.0,
+        primary_countdown_started=None,
+        secondary_countdown_started=True,
+    )
+
+    result = select_account(
+        [weekly_started, weekly_only_idle],
+        prefer_unstarted_quota=True,
+        prefer_unstarted_quota_window="any",
+        routing_strategy="usage_weighted",
+    )
+
+    assert result.account is weekly_only_idle
 
 
 def test_prefer_unstarted_quota_falls_back_when_all_countdowns_started() -> None:

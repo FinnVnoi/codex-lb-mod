@@ -838,6 +838,7 @@ _UPSTREAM_CLOSE_CODES_SKIP_SAME_ACCOUNT_RETRY = frozenset({1011})
 _MAX_TRANSIENT_SAME_ACCOUNT_RETRIES = 3
 _COMPACT_MAX_ACCOUNT_ATTEMPTS = 2
 _STREAM_MAX_ACCOUNT_ATTEMPTS = 3
+_ACCOUNT_MAX_ATTEMPTS_DEFAULT = 3
 _WEBSOCKET_MAX_ACCOUNT_ATTEMPTS = 3
 _WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES = frozenset(
     {
@@ -2289,6 +2290,37 @@ def _routing_strategy(settings: DashboardSettings) -> RoutingStrategy:
     if value == "fill_first":
         return "fill_first"
     return "capacity_weighted"
+
+
+def _bounded_routing_attempts(value: object, *, default: int) -> int:
+    try:
+        attempts = int(cast(Any, value))
+    except (TypeError, ValueError):
+        attempts = default
+    return max(1, min(10, attempts))
+
+
+def _routing_engine_policy_from_settings(settings: object | None) -> Any:
+    account_policy = str(getattr(settings, "account_failure_policy", "accounts_before_providers"))
+    if account_policy not in {"accounts_before_providers", "provider_after_first_failure", "account_only"}:
+        account_policy = "accounts_before_providers"
+    return {
+        "account_failure_policy": account_policy,
+        "account_max_attempts": _bounded_routing_attempts(
+            getattr(settings, "account_max_attempts", _ACCOUNT_MAX_ATTEMPTS_DEFAULT),
+            default=_ACCOUNT_MAX_ATTEMPTS_DEFAULT,
+        ),
+    }
+
+
+def _account_branch_max_attempts(policy: Any) -> int:
+    if isinstance(policy, dict):
+        if policy.get("account_failure_policy") == "provider_after_first_failure":
+            return 1
+        return int(policy.get("account_max_attempts", _ACCOUNT_MAX_ATTEMPTS_DEFAULT))
+    if getattr(policy, "account_failure_policy", None) == "provider_after_first_failure":
+        return 1
+    return int(getattr(policy, "account_max_attempts", _ACCOUNT_MAX_ATTEMPTS_DEFAULT))
 
 
 def _relative_availability_power(settings: DashboardSettings) -> float:

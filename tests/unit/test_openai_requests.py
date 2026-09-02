@@ -16,6 +16,7 @@ from app.core.openai.requests import (
     _input_image_file_reference,
     extract_input_file_ids,
     extract_input_image_file_references,
+    strip_invalid_native_input_item_ids,
 )
 from app.core.openai.v1_requests import V1ResponsesCompactRequest, V1ResponsesRequest
 from app.core.types import JsonValue
@@ -296,6 +297,144 @@ def test_responses_to_payload_preserves_explicit_empty_tools():
     )
 
     assert request.to_payload()["tools"] == []
+
+
+def test_native_input_item_id_sanitizer_does_not_change_generic_payload():
+    request = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "",
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "item_5020fdd5410ac8b713e6385f",
+                    "call_id": "call_keep",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {"type": "function_call_output", "call_id": "call_keep", "output": "ok"},
+                {
+                    "type": "custom_tool_call",
+                    "id": "call_aldiJLd1u1GPK1kCbXW6YEjf",
+                    "call_id": "call_custom",
+                    "name": "apply_patch",
+                    "input": "patch",
+                },
+                {
+                    "type": "function_call",
+                    "id": "fc_native_ok",
+                    "call_id": "call_native",
+                    "name": "safe",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "reasoning",
+                    "id": "item_3fbb4bb19e57337deb13d592",
+                    "summary": [],
+                    "encrypted_content": "enc",
+                },
+                {"type": "reasoning", "id": "rs_native_ok", "summary": []},
+                {"type": "message", "id": "item_message_ok", "role": "assistant", "content": []},
+            ],
+        }
+    )
+
+    generic_payload = request.to_payload()
+    generic_input = generic_payload["input"]
+
+    assert isinstance(generic_input, list)
+    assert generic_input[0]["id"] == "item_5020fdd5410ac8b713e6385f"
+    assert generic_input[2]["id"] == "call_aldiJLd1u1GPK1kCbXW6YEjf"
+
+    native_payload = dict(generic_payload)
+    strip_invalid_native_input_item_ids(native_payload)
+    native_input = native_payload["input"]
+
+    assert isinstance(native_input, list)
+    assert native_input[0]["id"] == "fc_item_5020fdd5410ac8b713e6385f"
+    assert native_input[0]["call_id"] == "call_keep"
+    assert native_input[1] == {"type": "function_call_output", "call_id": "call_keep", "output": "ok"}
+    assert native_input[2]["id"] == "ctc_call_aldiJLd1u1GPK1kCbXW6YEjf"
+    assert native_input[2]["call_id"] == "call_custom"
+    assert native_input[3]["id"] == "fc_native_ok"
+    assert native_input[4]["id"] == "rs_item_3fbb4bb19e57337deb13d592"
+    assert native_input[4]["encrypted_content"] == "enc"
+    assert native_input[5] == {"type": "reasoning", "summary": []}
+    assert native_input[6]["id"] == "msg_item_message_ok"
+
+
+def test_native_input_item_id_sanitizer_shortens_ids_and_keeps_encrypted_reasoning():
+    payload = {
+        "input": [
+            {"type": "function_call", "id": "x" * 120, "call_id": "call_1"},
+            {"type": "reasoning", "id": "y" * 120, "encrypted_content": "sealed"},
+        ]
+    }
+    strip_invalid_native_input_item_ids(payload)
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert len(items) == 2
+    assert isinstance(items[0], dict)
+    assert items[0]["id"].startswith("fc_")
+    assert len(items[0]["id"]) == 64
+    assert isinstance(items[1], dict)
+    assert items[1]["id"].startswith("rs_")
+    assert len(items[1]["id"]) == 64
+    assert items[1]["encrypted_content"] == "sealed"
+
+
+def test_native_input_item_id_sanitizer_preserves_item_content():
+    payload = {
+        "input": [
+            {
+                "type": "function_call",
+                "id": "item_call",
+                "call_id": "call_1",
+                "name": "lookup",
+                "arguments": "{}",
+                "content": [{"type": "output_text", "text": "invalid"}],
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "ok",
+                "content": [{"type": "input_text", "text": "invalid"}],
+            },
+            {
+                "type": "message",
+                "id": "item_message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "keep"}],
+            },
+        ]
+    }
+    strip_invalid_native_input_item_ids(payload)
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert items[0]["content"] == [{"type": "output_text", "text": "invalid"}]
+    assert items[0]["arguments"] == "{}"
+    assert items[0]["call_id"] == "call_1"
+    assert items[1]["content"] == [{"type": "input_text", "text": "invalid"}]
+    assert items[1]["output"] == "ok"
+    assert items[2]["id"] == "msg_item_message"
+    assert items[2]["content"] == [{"type": "output_text", "text": "keep"}]
+
+
+def test_native_input_item_id_sanitizer_preserves_call_id_and_avoids_collision():
+    payload = {
+        "input": [
+            {"type": "function_call", "id": "fc_same", "call_id": "call_1"},
+            {"type": "function_call", "id": "same", "call_id": "call_2"},
+        ]
+    }
+    strip_invalid_native_input_item_ids(payload)
+    items = payload["input"]
+    assert isinstance(items, list)
+    assert items[0]["id"] == "fc_same"
+    assert items[1]["id"].startswith("fc_")
+    assert items[1]["id"] != items[0]["id"]
+    assert items[0]["call_id"] == "call_1"
+    assert items[1]["call_id"] == "call_2"
 
 
 def test_responses_to_payload_preserves_reserved_namespace_tool_byte_identical():

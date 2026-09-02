@@ -27,11 +27,28 @@ const LimitWarmupWindowsSchema = z.enum([
   "secondary",
   "both",
 ]);
+const UnstartedQuotaPreferenceWindowSchema = z.enum([
+  "primary",
+  "secondary",
+  "both",
+  "any",
+]);
 const AdditionalQuotaRoutingPolicySchema = z.enum([
   "inherit",
   "normal",
   "burn_first",
   "preserve",
+]);
+const GlobalApiRoutingOverrideSchema = z.enum(["normal", "provider_first", "account_first"]);
+const ProviderFailurePolicySchema = z.enum([
+  "account_after_first_failure",
+  "providers_before_accounts",
+  "provider_only",
+]);
+const AccountFailurePolicySchema = z.enum([
+  "accounts_before_providers",
+  "provider_after_first_failure",
+  "account_only",
 ]);
 const AdditionalQuotaPolicySchema = z.object({
   quotaKey: z.string(),
@@ -65,7 +82,7 @@ export const DashboardSettingsSchema = z
     upstreamProxyDefaultPoolId: z.string().nullable().optional().default(null),
     preferEarlierResetAccounts: z.boolean(),
     preferUnstartedQuotaAccounts: z.boolean().optional().default(false),
-    preferUnstartedQuotaWindow: LimitWarmupWindowsSchema.optional().default("both"),
+    preferUnstartedQuotaWindow: UnstartedQuotaPreferenceWindowSchema.optional().default("both"),
     preferEarlierRenewalAccounts: z.boolean().optional().default(false),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional().default("secondary"),
     showResetCreditBadges: z.boolean().optional().default(true),
@@ -104,6 +121,13 @@ export const DashboardSettingsSchema = z
       .record(z.string(), AdditionalQuotaRoutingPolicySchema)
       .optional(),
     additionalQuotaPolicies: z.array(AdditionalQuotaPolicySchema).optional().default([]),
+    globalApiRoutingOverride: GlobalApiRoutingOverrideSchema.optional().default("normal"),
+    providerFailurePolicy: ProviderFailurePolicySchema.optional().default("account_after_first_failure"),
+    accountFailurePolicy: AccountFailurePolicySchema.optional().default("accounts_before_providers"),
+    providerMaxAttempts: z.number().int().min(1).max(10).optional().default(3),
+    accountMaxAttempts: z.number().int().min(1).max(10).optional().default(3),
+    modelSourceAutoPauseEnabled: z.boolean().optional().default(true),
+    modelSourceAutoPauseThreshold: z.number().int().min(1).max(10).optional().default(3),
     warmupModel: z.string().trim().min(1).optional().default("gpt-5.4-mini"),
     importWithoutOverwrite: z.boolean(),
     totpRequiredOnLogin: z.boolean(),
@@ -180,7 +204,7 @@ export const SettingsUpdateRequestSchema = z
     upstreamProxyDefaultPoolId: z.string().nullable().optional(),
     preferEarlierResetAccounts: z.boolean().optional(),
     preferUnstartedQuotaAccounts: z.boolean().optional(),
-    preferUnstartedQuotaWindow: LimitWarmupWindowsSchema.optional(),
+    preferUnstartedQuotaWindow: UnstartedQuotaPreferenceWindowSchema.optional(),
     preferEarlierRenewalAccounts: z.boolean().optional(),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional(),
     showResetCreditBadges: z.boolean().optional(),
@@ -202,6 +226,13 @@ export const SettingsUpdateRequestSchema = z
     additionalQuotaRoutingPolicies: z
       .record(z.string(), AdditionalQuotaRoutingPolicySchema)
       .optional(),
+    globalApiRoutingOverride: GlobalApiRoutingOverrideSchema.optional(),
+    providerFailurePolicy: ProviderFailurePolicySchema.optional(),
+    accountFailurePolicy: AccountFailurePolicySchema.optional(),
+    providerMaxAttempts: z.number().int().min(1).max(10).optional(),
+    accountMaxAttempts: z.number().int().min(1).max(10).optional(),
+    modelSourceAutoPauseEnabled: z.boolean().optional(),
+    modelSourceAutoPauseThreshold: z.number().int().min(1).max(10).optional(),
     warmupModel: z.string().trim().min(1).optional(),
     importWithoutOverwrite: z.boolean().optional(),
     totpRequiredOnLogin: z.boolean().optional(),

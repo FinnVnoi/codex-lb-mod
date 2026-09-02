@@ -27,6 +27,7 @@ export function createModelSourceFormSchema(t: TFunction) {
     supportsChatCompletions: z.boolean(),
     supportsResponses: z.boolean(),
     supportsAudioTranscriptions: z.boolean(),
+    estimateMissingStreamUsage: z.boolean(),
     routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]),
     models: z.array(modelFormSchema).min(1, t("modelSources.validation.modelsRequired")),
   });
@@ -39,6 +40,7 @@ export const modelSourceFormSchema = z.object({
   supportsChatCompletions: z.boolean(),
   supportsResponses: z.boolean(),
   supportsAudioTranscriptions: z.boolean(),
+  estimateMissingStreamUsage: z.boolean(),
   routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]),
   models: z.array(modelFormSchema).min(1, "At least one model is required"),
 });
@@ -140,6 +142,7 @@ export function formValuesFromSource(source: ModelSource): ModelSourceFormValues
     supportsChatCompletions: source.supportsChatCompletions,
     supportsResponses: source.supportsResponses,
     supportsAudioTranscriptions: source.supportsAudioTranscriptions,
+    estimateMissingStreamUsage: source.estimateMissingStreamUsage ?? true,
     routingPolicy: source.routingPolicy,
     models: source.models.map(modelFormValueFromSource),
   };

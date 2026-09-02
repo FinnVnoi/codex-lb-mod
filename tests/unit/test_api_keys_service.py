@@ -154,6 +154,12 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
         source_assignment_scope_enabled: bool | _Unset = _UNSET,
         expires_at: datetime | None | _Unset = _UNSET,
+        auto_extend_expiry: bool | _Unset = _UNSET,
+        auto_extend_expiry_type: str | None | _Unset = _UNSET,
+        auto_extend_expiry_threshold: int | None | _Unset = _UNSET,
+        quota_shop_enabled: bool | _Unset = _UNSET,
+        quota_shop_max_windows: int | _Unset = _UNSET,
+        quota_shop_options: str | _Unset = _UNSET,
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
@@ -177,6 +183,12 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             "account_assignment_scope_enabled": account_assignment_scope_enabled,
             "source_assignment_scope_enabled": source_assignment_scope_enabled,
             "expires_at": expires_at,
+            "auto_extend_expiry": auto_extend_expiry,
+            "auto_extend_expiry_type": auto_extend_expiry_type,
+            "auto_extend_expiry_threshold": auto_extend_expiry_threshold,
+            "quota_shop_enabled": quota_shop_enabled,
+            "quota_shop_max_windows": quota_shop_max_windows,
+            "quota_shop_options": quota_shop_options,
             "is_active": is_active,
             "key_hash": key_hash,
             "key_prefix": key_prefix,
@@ -1254,6 +1266,32 @@ async def test_create_key_with_limits() -> None:
 
 
 @pytest.mark.asyncio
+async def test_quota_shop_mode_blocks_usage_until_first_purchase() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="quota-shop-locked-key",
+            allowed_models=None,
+            expires_at=None,
+            quota_shop_enabled=True,
+            quota_shop_options=[{"limit_type": "total_tokens", "limit_window": "lifetime"}],
+            limits=[],
+        )
+    )
+
+    # Authentication and catalog access remain available so the customer can buy quota.
+    validated = await service.validate_key(created.key)
+    assert validated.id == created.id
+
+    with pytest.raises(ApiKeyRateLimitExceededError) as exc_info:
+        await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+    assert str(exc_info.value) == "API key đang ở Quota Shop Mode. Vui lòng mua quota trước khi sử dụng."
+    assert exc_info.value.is_lifetime is True
+
+
+@pytest.mark.asyncio
 async def test_validate_key_checks_expiry_and_limit() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -1402,7 +1440,30 @@ async def test_validate_key_multi_limit_all_must_pass() -> None:
 
     with pytest.raises(ApiKeyRateLimitExceededError) as exc_info:
         await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert "cost_usd" in str(exc_info.value)
+    assert str(exc_info.value) == "Đã đạt đến giới hạn. Vui lòng nạp thêm quota hoặc chờ hạn mức tự reset."
+    assert exc_info.value.is_lifetime is False
+
+
+@pytest.mark.asyncio
+async def test_enforce_lifetime_limit_exceeded_requests_top_up_without_reset_hint() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="lifetime-limit-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="lifetime", max_value=100)],
+        )
+    )
+    limit = (await repo.get_limits_by_key(created.id))[0]
+    limit.current_value = limit.max_value
+
+    with pytest.raises(ApiKeyRateLimitExceededError) as exc_info:
+        await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+    assert str(exc_info.value) == "Đã đạt đến giới hạn. Vui lòng nạp thêm quota."
+    assert exc_info.value.is_lifetime is True
 
 
 @pytest.mark.asyncio

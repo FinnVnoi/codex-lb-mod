@@ -911,6 +911,23 @@ class _HTTPBridgeUpstreamEventsMixin:
             event_type=event_type,
             payload=payload,
         )
+        explicit_account_quota_error = (
+            owner_pinned_quota_error or retry_error_code
+        ) in {
+            "rate_limit_exceeded",
+            "usage_limit_reached",
+            "insufficient_quota",
+            "usage_not_included",
+            "quota_exceeded",
+        }
+        if explicit_account_quota_error:
+            # The current request may still take one of the replay-safe recovery
+            # paths below, but this account-bound bridge must not admit a later
+            # request. Account health recovery remains owned by the balancer and
+            # usage refresh; retiring only this bridge avoids turning a cooldown
+            # into a process-global routing ban.
+            session.upstream_control.reconnect_requested = True
+            session.upstream_control.retire_after_drain = True
         if (
             auth_error_code is not None
             and not is_previous_response_not_found_event

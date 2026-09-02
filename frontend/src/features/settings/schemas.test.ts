@@ -33,6 +33,11 @@ describe("DashboardSettingsSchema", () => {
       stickyReallocationBudgetThresholdPct: 95,
       stickyReallocationPrimaryBudgetThresholdPct: 90,
       stickyReallocationSecondaryBudgetThresholdPct: 100,
+      globalApiRoutingOverride: "provider_first",
+      providerFailurePolicy: "providers_before_accounts",
+      accountFailurePolicy: "provider_after_first_failure",
+      providerMaxAttempts: 4,
+      accountMaxAttempts: 5,
       warmupModel: "gpt-5.4-mini",
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
@@ -73,6 +78,11 @@ describe("DashboardSettingsSchema", () => {
     expect(parsed.dashboardSessionTtlSeconds).toBe(43200);
     expect(parsed.stickyReallocationPrimaryBudgetThresholdPct).toBe(90);
     expect(parsed.stickyReallocationSecondaryBudgetThresholdPct).toBe(100);
+    expect(parsed.globalApiRoutingOverride).toBe("provider_first");
+    expect(parsed.providerFailurePolicy).toBe("providers_before_accounts");
+    expect(parsed.accountFailurePolicy).toBe("provider_after_first_failure");
+    expect(parsed.providerMaxAttempts).toBe(4);
+    expect(parsed.accountMaxAttempts).toBe(5);
     expect(parsed.warmupModel).toBe("gpt-5.4-mini");
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.guestAccessEnabled).toBe(true);
@@ -120,6 +130,11 @@ describe("DashboardSettingsSchema", () => {
     expect(parsed.showResetCreditBadges).toBe(true);
     expect(parsed.autoRedeemResetCreditsBeforeExpiry).toBe(false);
     expect(parsed.showResetCreditExpiryBadge).toBe(true);
+    expect(parsed.globalApiRoutingOverride).toBe("normal");
+    expect(parsed.providerFailurePolicy).toBe("account_after_first_failure");
+    expect(parsed.accountFailurePolicy).toBe("accounts_before_providers");
+    expect(parsed.providerMaxAttempts).toBe(3);
+    expect(parsed.accountMaxAttempts).toBe(3);
     expect(parsed.stickyReallocationPrimaryBudgetThresholdPct).toBe(95);
     expect(parsed.stickyReallocationSecondaryBudgetThresholdPct).toBe(95);
     expect(parsed.guestAccessEnabled).toBe(false);
@@ -196,6 +211,11 @@ describe("SettingsUpdateRequestSchema", () => {
       stickyReallocationBudgetThresholdPct: 95,
       stickyReallocationPrimaryBudgetThresholdPct: 90,
       stickyReallocationSecondaryBudgetThresholdPct: 100,
+      globalApiRoutingOverride: "account_first",
+      providerFailurePolicy: "provider_only",
+      accountFailurePolicy: "account_only",
+      providerMaxAttempts: 2,
+      accountMaxAttempts: 6,
       warmupModel: " gpt-5.4-nano ",
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
@@ -223,6 +243,11 @@ describe("SettingsUpdateRequestSchema", () => {
     expect(parsed.showResetCreditExpiryBadge).toBe(false);
     expect(parsed.upstreamProxyRoutingEnabled).toBe(true);
     expect(parsed.upstreamProxyDefaultPoolId).toBeNull();
+    expect(parsed.globalApiRoutingOverride).toBe("account_first");
+    expect(parsed.providerFailurePolicy).toBe("provider_only");
+    expect(parsed.accountFailurePolicy).toBe("account_only");
+    expect(parsed.providerMaxAttempts).toBe(2);
+    expect(parsed.accountMaxAttempts).toBe(6);
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.routingStrategy).toBe("relative_availability");
     expect(parsed.relativeAvailabilityPower).toBe(1.5);

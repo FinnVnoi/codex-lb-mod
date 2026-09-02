@@ -22,6 +22,8 @@ import type { AccountCostDonutProps } from "@/features/apis/components/account-c
 import { ApiKeyInfo } from "@/features/apis/components/api-key-info";
 import type { ApiTrendChartProps } from "@/features/apis/components/api-trend-chart";
 import type { ApiKeyUsage7DayResponse } from "@/features/apis/schemas";
+import { describeEffectiveApiRouting } from "@/features/settings/routing-policy-labels";
+import type { DashboardSettings } from "@/features/settings/schemas";
 
 const AccountCostDonut = lazy(() =>
 	import("@/features/apis/components/account-cost-donut").then((module) => ({
@@ -36,6 +38,7 @@ const ApiTrendChart = lazy(() =>
 
 export type ApiDetailProps = {
 	apiKey: ApiKey | null;
+	settings?: DashboardSettings | null;
 	trends?: {
 		cost: { t: string; v: number }[];
 		tokens: { t: string; v: number }[];
@@ -62,6 +65,7 @@ function accumulateData(
 
 export function ApiDetail({
 	apiKey,
+	settings = null,
 	trends,
 	usage7Day,
 	usage7DayLoading = false,
@@ -126,7 +130,16 @@ export function ApiDetail({
 			className="animate-fade-in-up space-y-4 rounded-xl border bg-card p-5"
 		>
 			<div className="flex items-start justify-between">
-				<h2 className="text-base font-semibold">{apiKey.name}</h2>
+				<div className="space-y-1">
+					<h2 className="text-base font-semibold">{apiKey.name}</h2>
+					{settings ? (
+						<p className="text-xs text-muted-foreground">
+							{t("apis.detail.effectiveRouting", {
+								policy: describeEffectiveApiRouting(t, settings.globalApiRoutingOverride, apiKey.routingMode),
+							})}
+						</p>
+					) : null}
+				</div>
 				<DropdownMenu>
 					<DropdownMenuTrigger asChild>
 						<Button

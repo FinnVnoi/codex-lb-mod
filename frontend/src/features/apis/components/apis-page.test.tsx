@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { createApiKey } from "@/test/mocks/factories";
+import { createDashboardSettings } from "@/test/mocks/factories";
 import { renderWithProviders } from "@/test/utils";
 
 import { ApisPage } from "./apis-page";
@@ -11,9 +12,13 @@ const hookMocks = vi.hoisted(() => ({
 	useApiKeys: vi.fn(),
 	useApiKeyTrends: vi.fn(),
 	useApiKeyUsage7Day: vi.fn(),
+	useSettings: vi.fn(),
 }));
 
 vi.mock("@/features/apis/hooks/use-apis", () => hookMocks);
+vi.mock("@/features/settings/hooks/use-settings", () => ({
+	useSettings: hookMocks.useSettings,
+}));
 
 type MutationMock = {
 	isPending: boolean;
@@ -56,6 +61,8 @@ function renderApisPage({
 	updateMutation = createMutationMock(),
 	deleteMutation = createMutationMock(),
 	regenerateMutation = createMutationMock(),
+	settingsQuery = createQueryMock(createDashboardSettings()),
+	updateSettingsMutation = createMutationMock(),
 }: {
 	apiKeys?: ReturnType<typeof createApiKey>[];
 	apiKeysQuery?: QueryMock<ReturnType<typeof createApiKey>[]>;
@@ -65,6 +72,8 @@ function renderApisPage({
 	updateMutation?: MutationMock;
 	deleteMutation?: MutationMock;
 	regenerateMutation?: MutationMock;
+	settingsQuery?: QueryMock<ReturnType<typeof createDashboardSettings>>;
+	updateSettingsMutation?: MutationMock;
 } = {}) {
 	hookMocks.useApiKeys.mockReturnValue({
 		apiKeysQuery,
@@ -75,6 +84,7 @@ function renderApisPage({
 	});
 	hookMocks.useApiKeyTrends.mockReturnValue(trendsQuery);
 	hookMocks.useApiKeyUsage7Day.mockReturnValue(usage7DayQuery);
+	hookMocks.useSettings.mockReturnValue({ settingsQuery, updateSettingsMutation });
 
 	return renderWithProviders(<ApisPage />);
 }
@@ -190,5 +200,16 @@ describe("ApisPage", () => {
 		expect(
 			within(screen.getByTestId("api-keys-overview-cost-panel")).getByText("Secondary key"),
 		).toBeInTheDocument();
+	});
+
+	it("shows global and effective API routing controls", () => {
+		renderApisPage({
+			apiKeys: [createApiKey({ routingMode: "provider_first" })],
+			settingsQuery: createQueryMock(createDashboardSettings({ globalApiRoutingOverride: "account_first" })),
+		});
+
+		expect(screen.getByTestId("api-routing-master-card")).toBeInTheDocument();
+		expect(screen.getByText("Global override: Account first")).toBeInTheDocument();
+		expect(screen.getByText("Effective routing: Global override: Account first")).toBeInTheDocument();
 	});
 });

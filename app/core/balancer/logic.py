@@ -73,7 +73,7 @@ RoutingStrategy = Literal[
 TrafficClass = Literal["foreground", "opportunistic"]
 UsageWeightedOrder = Literal["secondary_first", "primary_first"]
 ResetPreferenceWindow = Literal["primary", "secondary"]
-UnstartedQuotaPreferenceWindow = Literal["primary", "secondary", "both"]
+UnstartedQuotaPreferenceWindow = Literal["primary", "secondary", "both", "any"]
 UNKNOWN_PLAN_FALLBACK = "free"
 CAPACITY_PLAN_ALIASES = {
     "education": "edu",
@@ -736,7 +736,11 @@ def _unstarted_quota_candidates(
                 state.secondary_countdown_started,
             )
         applicable = [started for started in selected if started is not None]
-        return bool(applicable) and all(started is False for started in applicable)
+        if not applicable:
+            return False
+        if window == "any":
+            return any(started is False for started in applicable)
+        return all(started is False for started in applicable)
 
     return [state for state in available if _has_unstarted_selected_quota(state)]
 
@@ -745,20 +749,24 @@ def _prefer_earlier_renewal_candidates(
     available: list[AccountState],
     current: float,
 ) -> list[AccountState]:
-    """Keep the earliest upcoming subscription-renewal cohort.
+    """Keep the earliest known subscription-renewal cohort.
 
     Renewal preference is applied after hard eligibility, health, and account
     routing policy. The three-day cohort prevents one exact timestamp from
     monopolizing traffic while retaining a meaningful bias toward subscriptions
-    that renew soon. Accounts with missing or elapsed entitlement timestamps
-    stay eligible as a fallback when no upcoming renewal is known.
+    that renew soon or whose recorded entitlement has just elapsed. An elapsed
+    timestamp does not itself make an account ineligible: ChatGPT can continue
+    serving Codex during a post-subscription grace period, and those accounts
+    should be burned before accounts with later entitlement dates. Accounts
+    without a renewal date are used only when no dated account is available.
     """
-    upcoming = [state for state in available if state.renewal_at is not None and float(state.renewal_at) > current]
-    if not upcoming:
+    del current  # Eligibility, not this preference, decides whether an account still works.
+    dated = [state for state in available if state.renewal_at is not None]
+    if not dated:
         return available
-    earliest = min(float(state.renewal_at) for state in upcoming if state.renewal_at is not None)
+    earliest = min(float(state.renewal_at) for state in dated if state.renewal_at is not None)
     cohort_end = earliest + RENEWAL_COHORT_SECONDS
-    return [state for state in upcoming if float(state.renewal_at or 0.0) <= cohort_end]
+    return [state for state in dated if float(state.renewal_at or 0.0) <= cohort_end]
 
 
 def _oldest_due_probing_account(

@@ -385,7 +385,15 @@ def _compact_same_contract_retry_budget() -> int:
 
 
 def _compact_max_account_attempts() -> int:
-    return cast(int, _service_global("_COMPACT_MAX_ACCOUNT_ATTEMPTS"))
+    return cast(int, _service_global("_ACCOUNT_MAX_ATTEMPTS_DEFAULT"))
+
+
+def _routing_engine_policy_from_settings(settings: DashboardSettings) -> Any:
+    return _service_global("_routing_engine_policy_from_settings")(settings)
+
+
+def _account_branch_max_attempts(policy: Any) -> int:
+    return cast(int, _service_global("_account_branch_max_attempts")(policy))
 
 
 def _max_transient_same_account_retries() -> int:
@@ -842,7 +850,8 @@ class _CompactMixin:
             estimated_lease_tokens = _estimated_lease_tokens_from_request_usage_budget(
                 estimate_api_key_request_usage(payload)
             )
-            for _account_attempt in range(_compact_max_account_attempts()):
+            max_account_attempts = _account_branch_max_attempts(_routing_engine_policy_from_settings(settings))
+            for _account_attempt in range(max_account_attempts):
                 selection = await proxy._select_account_with_budget_compatible(
                     deadline,
                     request_id=request_id,
@@ -1391,7 +1400,7 @@ class _CompactMixin:
                             if (
                                 not account.security_work_authorized
                                 and account.id != preferred_account_id
-                                and _account_attempt < _compact_max_account_attempts() - 1
+                                and _account_attempt < max_account_attempts - 1
                             ):
                                 last_exc = exc
                                 excluded_account_ids.add(account.id)
@@ -1479,7 +1488,7 @@ class _CompactMixin:
                             action = failover_decision(
                                 failure_class=classified["failure_class"],
                                 downstream_visible=False,
-                                candidates_remaining=_compact_max_account_attempts() - _account_attempt - 1,
+                                candidates_remaining=max_account_attempts - _account_attempt - 1,
                             )
                         else:
                             action = "surface"

@@ -669,4 +669,11 @@ it("saves the unstarted-quota preference and scope", async () => {
     ...enabledPayload,
     preferUnstartedQuotaWindow: "primary",
   });
+
+  await user.click(screen.getByRole("combobox", { name: "Quota countdown scope" }));
+  await user.click(await screen.findByText("Either quota (OR)"));
+  expect(scopeSave).toHaveBeenCalledWith({
+    ...enabledPayload,
+    preferUnstartedQuotaWindow: "any",
+  });
 });

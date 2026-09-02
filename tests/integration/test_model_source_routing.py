@@ -45,6 +45,7 @@ async def _create_model_source(
     supports_responses: bool = False,
     supports_streaming: bool = True,
     supports_audio_transcriptions: bool = False,
+    estimate_missing_stream_usage: bool = False,
 ) -> str:
     model_entry: dict[str, object] = {
         "model": model,
@@ -75,6 +76,7 @@ async def _create_model_source(
             "supportsChatCompletions": True,
             "supportsResponses": supports_responses,
             "supportsAudioTranscriptions": supports_audio_transcriptions,
+            "estimateMissingStreamUsage": estimate_missing_stream_usage,
             "models": [model_entry],
         },
     )
@@ -1054,6 +1056,65 @@ async def test_limited_key_settles_usage_from_crlf_stream(async_client, source_u
 
 
 @pytest.mark.asyncio
+async def test_limited_key_estimates_missing_stream_usage_when_source_opted_in(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    frames = (
+        b'data: {"id":"chatcmpl_est","object":"chat.completion.chunk","choices":'
+        b'[{"index":0,"delta":{"content":"estimated output"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl_est","object":"chat.completion.chunk","choices":'
+        b'[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    async def stream_handler(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(frames)
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(stream_handler)
+    model = "source-estimated-usage-model"
+    source_id = await _create_model_source(
+        async_client,
+        name="estimated-usage",
+        model=model,
+        base_url=base_url,
+        estimate_missing_stream_usage=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "estimated-source-key",
+            "assignedSourceIds": [source_id],
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000}],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+    key_id = created.json()["id"]
+
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hello input"}], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        body = b"".join([chunk async for chunk in response.aiter_bytes()])
+        assert b"estimated output" in body
+
+    async with SessionLocal() as session:
+        limits = await ApiKeysRepository(session).get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert 2 <= limits[0].current_value < 1_000
+        log = (await session.execute(select(RequestLog).where(RequestLog.model_source_id == source_id))).scalars().one()
+        assert log.status == "success"
+        assert log.input_tokens > 0
+        assert log.output_tokens > 0
+
+
+@pytest.mark.asyncio
 async def test_source_invalid_json_2xx_maps_to_error_response(async_client, source_upstream):
     async def html_response(_request: web.Request) -> web.Response:
         return web.Response(status=200, text="<html>gateway page</html>", content_type="text/html")
@@ -2006,6 +2067,53 @@ async def test_source_chat_retries_other_provider_when_model_is_unavailable(asyn
 
 
 @pytest.mark.asyncio
+async def test_source_responses_stream_is_not_checked_as_chat_completion_sse(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    model = "gpt-5.4"
+
+    async def responses_stream(request: web.Request) -> web.StreamResponse:
+        assert request.path == "/v1/responses"
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n')
+        await response.write(
+            b'data: {"type":"response.completed","response":{"id":"resp_visible",'
+            b'"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(responses_stream)
+    source_id = await _create_model_source(
+        async_client,
+        name="responses-visible-stream-source",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "responses-visible-stream-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hi", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "response.output_text.delta" in response.text
+    assert '"delta":"hello"' in response.text
+    assert "empty_assistant_response" not in response.text
+
+
+@pytest.mark.asyncio
 async def test_source_responses_retries_other_provider_when_model_is_unavailable(async_client, source_upstream):
     hits: list[str] = []
     model = "responses-provider-fallback-model"
@@ -2054,6 +2162,76 @@ async def test_source_responses_retries_other_provider_when_model_is_unavailable
     assert response.status_code == 200
     assert response.json()["id"] == "resp_provider_fallback"
     assert hits == ["missing", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_source_responses_retries_provider_rejecting_valid_input_shape(async_client, source_upstream):
+    hits: list[str] = []
+    model = "responses-input-shape-fallback-model"
+
+    async def incompatible(_request: web.Request) -> web.Response:
+        hits.append("incompatible")
+        return web.json_response(
+            {
+                "error": {
+                    "message": "input must be a string or array (ID: provider-error-id)",
+                    "code": "invalid_request_error",
+                }
+            },
+            status=400,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(
+            {
+                "id": "resp_after_input_shape_fallback",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    incompatible_url = await source_upstream(incompatible)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(
+        async_client,
+        name="responses-input-shape-incompatible",
+        model=model,
+        base_url=incompatible_url,
+        supports_responses=True,
+    )
+    await _create_model_source(
+        async_client,
+        name="responses-input-shape-healthy",
+        model=model,
+        base_url=healthy_url,
+        supports_responses=True,
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": model, "input": [{"role": "user", "content": "hi"}], "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_after_input_shape_fallback"
+    # Model-source selection is round-robin, so retry the route until the
+    # incompatible source is selected first. The regression is that such a
+    # request still reaches the healthy source instead of exposing the 400.
+    for _ in range(4):
+        if "incompatible" in hits:
+            break
+        response = await async_client.post(
+            "/v1/responses",
+            json={"model": model, "input": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+        assert response.status_code == 200
+        assert response.json()["id"] == "resp_after_input_shape_fallback"
+    assert "incompatible" in hits
+    incompatible_index = hits.index("incompatible")
+    assert hits[incompatible_index + 1] == "healthy"
 
 
 @pytest.mark.asyncio
@@ -2214,6 +2392,88 @@ async def test_source_chat_with_tools_prefers_account_before_next_provider(async
     assert response.status_code == 200
     assert response.json()["id"] == "chatcmpl_sanitized"
     assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+async def test_providers_before_accounts_defers_fallback_only_until_account_fails(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    settings = await async_client.put(
+        "/api/settings",
+        json={
+            "providerFailurePolicy": "providers_before_accounts",
+            "providerMaxAttempts": 2,
+        },
+    )
+    assert settings.status_code == 200
+
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_regular_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    async def fallback_only_provider(_request: web.Request) -> web.Response:
+        hits.append("fallback")
+        return web.json_response(_chat_completion_body(model))
+
+    regular_url = await source_upstream(failed_regular_provider)
+    fallback_url = await source_upstream(fallback_only_provider)
+    regular_id = await _create_model_source(
+        async_client,
+        name="providers-before-account-regular",
+        model=model,
+        base_url=regular_url,
+    )
+    fallback_id = await _create_model_source(
+        async_client,
+        name="providers-before-account-fallback",
+        model=model,
+        base_url=fallback_url,
+    )
+    updated = await async_client.patch(
+        f"/api/model-sources/{fallback_id}",
+        json={"routingPolicy": "fallback_only"},
+    )
+    assert updated.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "providers-before-account-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [regular_id, fallback_id],
+        },
+    )
+    key = created.json()["key"]
+
+    account_calls = 0
+
+    async def fake_collect(*_args, **_kwargs):
+        nonlocal account_calls
+        account_calls += 1
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            status_code=503,
+        )
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert account_calls == 1
+    assert hits == ["provider", "provider", "account", "fallback"]
 
 
 @pytest.mark.asyncio
@@ -2661,7 +2921,77 @@ async def test_account_first_responses_account_quota_falls_back_to_provider(
 
     assert response.status_code == 200
     assert response.json()["id"] == "resp_account_quota_to_provider"
-    assert hits == ["provider"]
+    # One configured provider fills all three configured provider attempt slots.
+    assert hits == ["provider", "provider", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_account_first_codex_stream_quota_event_falls_back_to_provider(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(request: web.Request) -> web.StreamResponse:
+        hits.append("provider")
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            (
+                'data: {"type":"response.completed","response":{"id":"resp_provider_after_quota",'
+                f'"object":"response","model":"{model}","output":[],"usage":{{"input_tokens":2,'
+                '"output_tokens":1,"total_tokens":3}}}}\n\n'
+            ).encode()
+        )
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-stream-quota-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-stream-quota-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def failed_account_response(*_args, **_kwargs):
+        from fastapi.responses import StreamingResponse
+
+        async def body():
+            yield 'data: {"type":"response.created","response":{"id":"resp_account_quota"}}\n\n'
+            yield (
+                'data: {"type":"response.failed","response":{"id":"resp_account_quota",'
+                '"error":{"message":"The usage limit has been reached",'
+                '"type":"rate_limit_error","code":"usage_limit_reached"}}}\n\n'
+            )
+
+        return StreamingResponse(body(), media_type="text/event-stream")
+
+    monkeypatch.setattr("app.modules.proxy.api._stream_responses", failed_account_response)
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}", "User-Agent": "codex-tui/0.151.0"},
+        json={"model": model, "input": "hi", "stream": True},
+    ) as response:
+        body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    assert response.status_code == 200
+    assert b"resp_provider_after_quota" in body
+    assert b"usage_limit_reached" not in body
+    assert hits == ["provider", "provider", "provider"]
 
 
 @pytest.mark.asyncio
@@ -2721,7 +3051,7 @@ async def test_account_first_responses_no_accounts_falls_back_to_provider(async_
 
     assert response.status_code == 200
     assert response.json()["id"] == "resp_account_to_provider"
-    assert hits == ["provider"]
+    assert hits == ["provider", "provider", "provider"]
 
 
 @pytest.mark.asyncio
@@ -2846,7 +3176,7 @@ async def test_account_first_streaming_chat_no_accounts_falls_back_before_client
     assert response.status_code == 200
     assert b'"content":"ok"' in body
     assert b"no_accounts" not in body
-    assert hits == ["provider"]
+    assert hits == ["provider", "provider", "provider"]
 
 
 @pytest.mark.asyncio

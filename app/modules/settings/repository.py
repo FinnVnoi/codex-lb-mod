@@ -30,6 +30,13 @@ class SettingsRepository:
             sticky_threads_enabled=True,
             model_source_sticky_enabled=True,
             model_source_sticky_ttl_seconds=1800,
+            global_api_routing_override="normal",
+            provider_failure_policy="account_after_first_failure",
+            account_failure_policy="accounts_before_providers",
+            provider_max_attempts=3,
+            account_max_attempts=3,
+            model_source_auto_pause_enabled=True,
+            model_source_auto_pause_threshold=3,
             upstream_stream_transport="default",
             prohibit_fast_mode=False,
             http_downstream_transport_policy=get_settings().http_downstream_transport_policy,
@@ -100,6 +107,13 @@ class SettingsRepository:
         sticky_threads_enabled: bool | None = None,
         model_source_sticky_enabled: bool | None = None,
         model_source_sticky_ttl_seconds: int | None = None,
+        global_api_routing_override: str | None = None,
+        provider_failure_policy: str | None = None,
+        account_failure_policy: str | None = None,
+        provider_max_attempts: int | None = None,
+        account_max_attempts: int | None = None,
+        model_source_auto_pause_enabled: bool | None = None,
+        model_source_auto_pause_threshold: int | None = None,
         upstream_stream_transport: str | None = None,
         prohibit_fast_mode: bool | None = None,
         http_downstream_transport_policy: str | None = None,
@@ -171,6 +185,20 @@ class SettingsRepository:
             settings.model_source_sticky_enabled = model_source_sticky_enabled
         if model_source_sticky_ttl_seconds is not None:
             settings.model_source_sticky_ttl_seconds = model_source_sticky_ttl_seconds
+        if global_api_routing_override is not None:
+            settings.global_api_routing_override = global_api_routing_override
+        if provider_failure_policy is not None:
+            settings.provider_failure_policy = provider_failure_policy
+        if account_failure_policy is not None:
+            settings.account_failure_policy = account_failure_policy
+        if provider_max_attempts is not None:
+            settings.provider_max_attempts = provider_max_attempts
+        if account_max_attempts is not None:
+            settings.account_max_attempts = account_max_attempts
+        if model_source_auto_pause_enabled is not None:
+            settings.model_source_auto_pause_enabled = model_source_auto_pause_enabled
+        if model_source_auto_pause_threshold is not None:
+            settings.model_source_auto_pause_threshold = model_source_auto_pause_threshold
         if upstream_stream_transport is not None:
             settings.upstream_stream_transport = upstream_stream_transport
         if prohibit_fast_mode is not None:

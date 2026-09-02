@@ -13,9 +13,10 @@ from sqlalchemy import text
 TEST_DB_DIR = Path(tempfile.mkdtemp(prefix="codex-lb-tests-"))
 TEST_DB_PATH = TEST_DB_DIR / "codex-lb.db"
 
-os.environ["CODEX_LB_DATABASE_URL"] = os.environ.get(
-    "CODEX_LB_TEST_DATABASE_URL", f"sqlite+aiosqlite:///{TEST_DB_PATH}"
-)
+# Always isolate tests unless an explicit non-production test URL is supplied.
+_test_database_url = os.environ.get("CODEX_LB_TEST_DATABASE_URL") or f"sqlite+aiosqlite:///{TEST_DB_PATH}"
+assert "/root/.codex-lb/store.db" not in _test_database_url, "refusing to run tests against live DB"
+os.environ["CODEX_LB_DATABASE_URL"] = _test_database_url
 os.environ["CODEX_LB_UPSTREAM_BASE_URL"] = "https://example.invalid/backend-api"
 os.environ["CODEX_LB_USAGE_REFRESH_ENABLED"] = "false"
 os.environ["CODEX_LB_MODEL_REGISTRY_ENABLED"] = "false"

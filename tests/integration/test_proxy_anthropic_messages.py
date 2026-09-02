@@ -40,6 +40,31 @@ async def _import_account(async_client, account_id: str = "acc_anthropic_message
 
 
 @pytest.mark.asyncio
+async def test_v1_anthropic_messages_hides_upstream_quota_headers_for_api_key(
+    async_client,
+    monkeypatch,
+):
+    import app.modules.proxy.api as proxy_api
+
+    api_key = object()
+
+    async def hidden(_api_key: object) -> bool:
+        assert _api_key is api_key
+        return True
+
+    class Service:
+        async def rate_limit_headers(self) -> dict[str, str]:
+            raise AssertionError("hidden API-key clients must not read upstream quota headers")
+
+    context = type("Context", (), {"service": Service()})()
+    monkeypatch.setattr(proxy_api, "_hide_upstream_quota_for_api_key_clients", hidden)
+
+    headers = await proxy_api._rate_limit_headers_for_request(context, api_key)
+
+    assert headers == {}
+
+
+@pytest.mark.asyncio
 async def test_v1_anthropic_messages_non_stream(async_client, monkeypatch):
     await _import_account(async_client)
     observed = {}
@@ -96,6 +121,37 @@ async def test_v1_anthropic_messages_non_stream(async_client, monkeypatch):
             "parameters": {"type": "object", "properties": {"q": {"type": "string"}}},
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_v1_anthropic_messages_ignores_stop_sequences(async_client, monkeypatch):
+    await _import_account(async_client, "acc_anthropic_stop_sequences")
+    observed = {}
+
+    async def fake_stream(payload, headers, access_token, account_id, base_url=None, raise_for_status=False):
+        del headers, access_token, account_id, base_url, raise_for_status
+        observed["payload"] = payload.model_dump(mode="json", exclude_none=True)
+        yield 'data: {"type":"response.output_text.delta","delta":"ok"}\n\n'
+        yield (
+            'data: {"type":"response.completed","response":{"id":"resp_anthropic_stop",'
+            '"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}\n\n'
+        )
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/messages",
+        json={
+            "model": "gpt-5.2",
+            "max_tokens": 64,
+            "stop_sequences": ["END"],
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["content"] == [{"type": "text", "text": "ok"}]
+    assert "stop" not in observed["payload"]
 
 
 @pytest.mark.asyncio

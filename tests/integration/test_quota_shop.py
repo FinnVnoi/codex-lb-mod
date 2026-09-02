@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from app.core.utils.time import utcnow
-from app.db.models import ApiKeyLimit, ApiKeyQuotaPurchase
+from app.db.models import ApiKeyLimit, ApiKeyQuotaPurchase, LimitType, LimitWindow
 from app.db.session import SessionLocal
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
@@ -14,27 +14,33 @@ from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, Limit
 pytestmark = pytest.mark.integration
 
 
-async def _create_key() -> tuple[str, str]:
+async def _create_key(*, with_limits: bool = True) -> tuple[str, str]:
     async with SessionLocal() as session:
         created = await ApiKeysService(ApiKeysRepository(session)).create_key(
             ApiKeyCreateData(
                 name="quota-shop-test",
                 allowed_models=None,
+                quota_shop_enabled=not with_limits,
+                quota_shop_max_windows=1,
+                quota_shop_options=[{"limit_type":"total_tokens","limit_window":"lifetime"},{"limit_type":"total_tokens","limit_window":"5h"},{"limit_type":"cost_usd","limit_window":"lifetime"},{"limit_type":"cost_usd","limit_window":"weekly","model_filter":"gpt-5.4"}],
                 limits=[
                     LimitRuleInput(
                         limit_type="total_tokens",
                         limit_window="lifetime",
                         max_value=10_000_000,
+                        quota_shop_enabled=True,
                     ),
                     LimitRuleInput(
                         limit_type="total_tokens",
                         limit_window="5h",
                         max_value=4_000_000,
+                        quota_shop_enabled=True,
                     ),
                     LimitRuleInput(
                         limit_type="cost_usd",
                         limit_window="lifetime",
                         max_value=3_000_000,
+                        quota_shop_enabled=True,
                     ),
                     LimitRuleInput(
                         limit_type="cost_usd",
@@ -47,10 +53,52 @@ async def _create_key() -> tuple[str, str]:
                         limit_window="daily",
                         max_value=100_000,
                     ),
-                ],
+                ] if with_limits else [],
             )
         )
     return created.id, created.key
+
+
+@pytest.mark.asyncio
+async def test_catalog_supports_selected_options_before_any_limit_exists(async_client):
+    _, raw_key = await _create_key(with_limits=False)
+    response = await async_client.get(
+        "/v1/quota-shop/catalog",
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["quota_shop_enabled"] is True
+    assert body["windows_used"] == 0
+    assert body["windows_remaining"] == 1
+    assert len(body["rules"]) == 4
+    assert all(rule["limit_id"] == 0 for rule in body["rules"])
+    assert all(rule["reset_at"] for rule in body["rules"])
+
+
+@pytest.mark.asyncio
+async def test_quota_shop_mode_key_cannot_use_proxy_before_purchase(async_client):
+    _, raw_key = await _create_key(with_limits=False)
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {raw_key}"},
+        json={"model": "gpt-5.2", "input": "hi"},
+    )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == "rate_limit_exceeded"
+    assert "Quota Shop Mode" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -128,6 +176,67 @@ async def test_fulfill_increments_matching_lifetime_rule_and_is_idempotent(async
         assert refreshed is not None
         assert refreshed.max_value == original_max + 2_000_000
         assert len(purchases) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_option_purchase_creates_limit_disables_mode_and_retries_idempotently(async_client, monkeypatch):
+    key_id, raw_key = await _create_key(with_limits=False)
+    monkeypatch.setenv("CODEX_LB_QUOTA_SHOP_SECRET", "test-secret")
+
+    catalog = await async_client.get(
+        "/v1/quota-shop/catalog",
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+    assert catalog.status_code == 200
+    option = next(
+        x for x in catalog.json()["rules"]
+        if x["limit_type"] == "total_tokens" and x["limit_window"] == "lifetime"
+    )
+    assert option["limit_id"] == 0
+    payload = {
+        "order_ref": "AQ:first-choice",
+        "api_key": raw_key,
+        "limit_id": 0,
+        "purchased_value": 2_000_000,
+        "amount_vnd": 4000,
+        "limit_type": "total_tokens",
+        "limit_window": "lifetime",
+        "model_filter": None,
+        "target_reset_at": option["reset_at"],
+    }
+    first = await async_client.post(
+        "/v1/quota-shop/fulfill",
+        headers={"X-Quota-Shop-Secret": "test-secret"},
+        json=payload,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["idempotent"] is False
+    assert first.json()["limit_id"] > 0
+
+    second = await async_client.post(
+        "/v1/quota-shop/fulfill",
+        headers={"X-Quota-Shop-Secret": "test-secret"},
+        json=payload,
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["idempotent"] is True
+    assert second.json()["limit_id"] == first.json()["limit_id"]
+
+    post_catalog = await async_client.get(
+        "/v1/quota-shop/catalog",
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+    assert post_catalog.status_code == 200
+    body = post_catalog.json()
+    assert body["quota_shop_enabled"] is False
+    assert [(x["limit_type"], x["limit_window"]) for x in body["rules"]] == [
+        ("total_tokens", "lifetime"),
+    ]
+
+    async with SessionLocal() as session:
+        key = await ApiKeysRepository(session).get_by_id(key_id)
+        assert key is not None
+        assert key.quota_shop_enabled is False
 
 
 @pytest.mark.asyncio
@@ -270,6 +379,37 @@ async def test_expired_periodic_rule_cannot_be_fulfilled(async_client, monkeypat
         assert refreshed is not None
         assert refreshed.max_value == original_max
         assert purchase is None
+
+
+@pytest.mark.asyncio
+async def test_first_choice_requires_exact_model_option_identity(async_client, monkeypatch):
+    _, raw_key = await _create_key(with_limits=False)
+    monkeypatch.setenv("CODEX_LB_QUOTA_SHOP_SECRET", "test-secret")
+    catalog = await async_client.get(
+        "/v1/quota-shop/catalog",
+        headers={"Authorization": f"Bearer {raw_key}"},
+    )
+    option = next(
+        x for x in catalog.json()["rules"]
+        if x["limit_type"] == "cost_usd" and x["limit_window"] == "weekly"
+    )
+    response = await async_client.post(
+        "/v1/quota-shop/fulfill",
+        headers={"X-Quota-Shop-Secret": "test-secret"},
+        json={
+            "order_ref": "AQ:model-tamper",
+            "api_key": raw_key,
+            "limit_id": 0,
+            "purchased_value": 1_000_000,
+            "amount_vnd": 2000,
+            "limit_type": "cost_usd",
+            "limit_window": "weekly",
+            "model_filter": "attacker-model",
+            "target_reset_at": option["reset_at"],
+        },
+    )
+    assert response.status_code == 409
+    assert "not available" in response.json()["error"]["message"]
 
 
 @pytest.mark.asyncio

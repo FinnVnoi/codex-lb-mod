@@ -23,7 +23,13 @@ from app.core.clients.usage import UsageFetchError, fetch_usage
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
 from app.core.crypto import TokenEncryptor
-from app.core.exceptions import DashboardAuthError, DashboardPermissionError, ProxyAuthError, ProxyUpstreamError
+from app.core.exceptions import (
+    DashboardAuthError,
+    DashboardPermissionError,
+    ProxyAuthError,
+    ProxyRateLimitError,
+    ProxyUpstreamError,
+)
 from app.core.request_locality import is_local_request
 from app.core.socket_peer import raw_socket_peer_host
 from app.core.upstream_proxy import UpstreamProxyRouteError, resolve_upstream_route
@@ -87,7 +93,10 @@ async def validate_proxy_api_key_authorization(
     if not token:
         raise ProxyAuthError("Missing API key in Authorization header")
 
-    return await _validate_api_key_token(token)
+    api_key = await _validate_api_key_token(token)
+    if api_key.quota_shop_enabled:
+        raise ProxyRateLimitError("API key đang ở Quota Shop Mode. Vui lòng mua quota trước khi sử dụng.")
+    return api_key
 
 
 async def _validate_api_key_token(token: str) -> ApiKeyData:

@@ -28,9 +28,13 @@ export const ModelSourceSchema = z.object({
   baseUrl: z.string(),
   isEnabled: z.boolean(),
   healthStatus: z.string(),
+  pausedAt: z.string().nullable().optional().default(null),
+  pauseReason: z.string().nullable().optional().default(null),
+  consecutiveAutoPauseFailures: z.number().int().min(0).optional().default(0),
   supportsChatCompletions: z.boolean(),
   supportsResponses: z.boolean(),
   supportsAudioTranscriptions: z.boolean().default(false),
+  estimateMissingStreamUsage: z.boolean().default(true),
   timeoutSeconds: z.number().int().positive().nullable().default(null),
   maxConcurrency: z.number().int().positive().nullable().default(null),
   routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]).default("normal"),
@@ -67,6 +71,7 @@ export const ModelSourceCreateRequestSchema = z.object({
   supportsChatCompletions: z.boolean().optional(),
   supportsResponses: z.boolean().optional(),
   supportsAudioTranscriptions: z.boolean().optional(),
+  estimateMissingStreamUsage: z.boolean().optional(),
   timeoutSeconds: z.number().int().positive().nullable().optional(),
   maxConcurrency: z.number().int().positive().nullable().optional(),
   routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]).optional(),
@@ -81,12 +86,31 @@ export const ModelSourceUpdateRequestSchema = z.object({
   supportsChatCompletions: z.boolean().optional(),
   supportsResponses: z.boolean().optional(),
   supportsAudioTranscriptions: z.boolean().optional(),
+  estimateMissingStreamUsage: z.boolean().optional(),
   timeoutSeconds: z.number().int().positive().nullable().optional(),
   maxConcurrency: z.number().int().positive().nullable().optional(),
   routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]).optional(),
   models: z.array(ModelSourceModelInputSchema).optional(),
 });
 
+export const ModelSourceProbeRequestSchema = z.object({
+  sourceId: z.string().nullable().optional(),
+  baseUrl: z.string().min(1).max(2048),
+  apiKey: z.string().nullable().optional(),
+  model: z.string().min(1).max(255),
+  upstreamModel: z.string().max(255).nullable().optional(),
+  useResponses: z.boolean().optional().default(false),
+});
+
+export const ModelSourceProbeResponseSchema = z.object({
+  ok: z.boolean(),
+  statusCode: z.number().int().nullable().optional(),
+  model: z.string(),
+  message: z.string(),
+});
+
+export type ModelSourceProbeRequest = z.infer<typeof ModelSourceProbeRequestSchema>;
+export type ModelSourceProbeResponse = z.infer<typeof ModelSourceProbeResponseSchema>;
 export type ModelSource = z.infer<typeof ModelSourceSchema>;
 export type ModelSourceModel = z.infer<typeof ModelSourceModelSchema>;
 export type ModelSourceModelInput = z.infer<typeof ModelSourceModelInputSchema>;

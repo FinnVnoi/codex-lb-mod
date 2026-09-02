@@ -85,9 +85,10 @@ class AnthropicMessagesRequest(BaseModel):
         stream = _anthropic_bool_or_none(self.stream)
         if stream is not None:
             payload["stream"] = stream
-        stop_sequences = _anthropic_stop_sequences(self.stop_sequences)
-        if stop_sequences is not None:
-            payload["stop"] = cast(JsonValue, stop_sequences)
+        # Anthropic's ``stop_sequences`` has no supported equivalent on the
+        # OpenAI Responses endpoint used by Codex. Forwarding it as ``stop``
+        # makes upstream reject the entire request, so accept the compatibility
+        # field but deliberately ignore it.
         reasoning = _anthropic_thinking_to_reasoning(self.thinking)
         if reasoning is not None:
             payload["reasoning"] = reasoning.model_dump(mode="json", exclude_none=True)
@@ -133,17 +134,6 @@ def _anthropic_bool_or_none(value: JsonValue | None) -> bool | None:
         if lowered in {"false", "0", "no"}:
             return False
     return None
-
-
-def _anthropic_stop_sequences(value: JsonValue | None) -> str | list[str] | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        return value
-    values = _json_list(value)
-    if values is None:
-        return None
-    return [item for item in values if isinstance(item, str)]
 
 
 def _anthropic_system_to_instructions(system: JsonValue | None) -> str:

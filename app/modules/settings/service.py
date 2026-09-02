@@ -16,6 +16,13 @@ class DashboardSettingsData:
     sticky_threads_enabled: bool
     model_source_sticky_enabled: bool
     model_source_sticky_ttl_seconds: int
+    global_api_routing_override: str
+    provider_failure_policy: str
+    account_failure_policy: str
+    provider_max_attempts: int
+    account_max_attempts: int
+    model_source_auto_pause_enabled: bool
+    model_source_auto_pause_threshold: int
     upstream_stream_transport: str
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str
@@ -76,6 +83,13 @@ class DashboardSettingsUpdateData:
     sticky_threads_enabled: bool
     model_source_sticky_enabled: bool
     model_source_sticky_ttl_seconds: int
+    global_api_routing_override: str
+    provider_failure_policy: str
+    account_failure_policy: str
+    provider_max_attempts: int
+    account_max_attempts: int
+    model_source_auto_pause_enabled: bool
+    model_source_auto_pause_threshold: int
     upstream_stream_transport: str
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str
@@ -140,6 +154,13 @@ class SettingsService:
             sticky_threads_enabled=row.sticky_threads_enabled,
             model_source_sticky_enabled=row.model_source_sticky_enabled,
             model_source_sticky_ttl_seconds=row.model_source_sticky_ttl_seconds,
+            global_api_routing_override=row.global_api_routing_override,
+            provider_failure_policy=row.provider_failure_policy,
+            account_failure_policy=row.account_failure_policy,
+            provider_max_attempts=row.provider_max_attempts,
+            account_max_attempts=row.account_max_attempts,
+            model_source_auto_pause_enabled=row.model_source_auto_pause_enabled,
+            model_source_auto_pause_threshold=row.model_source_auto_pause_threshold,
             upstream_stream_transport=row.upstream_stream_transport,
             prohibit_fast_mode=row.prohibit_fast_mode,
             http_downstream_transport_policy=row.http_downstream_transport_policy,
@@ -217,6 +238,13 @@ class SettingsService:
             sticky_threads_enabled=payload.sticky_threads_enabled,
             model_source_sticky_enabled=payload.model_source_sticky_enabled,
             model_source_sticky_ttl_seconds=payload.model_source_sticky_ttl_seconds,
+            global_api_routing_override=payload.global_api_routing_override,
+            provider_failure_policy=payload.provider_failure_policy,
+            account_failure_policy=payload.account_failure_policy,
+            provider_max_attempts=payload.provider_max_attempts,
+            account_max_attempts=payload.account_max_attempts,
+            model_source_auto_pause_enabled=payload.model_source_auto_pause_enabled,
+            model_source_auto_pause_threshold=payload.model_source_auto_pause_threshold,
             upstream_stream_transport=payload.upstream_stream_transport,
             prohibit_fast_mode=payload.prohibit_fast_mode,
             http_downstream_transport_policy=payload.http_downstream_transport_policy,
@@ -276,6 +304,13 @@ class SettingsService:
             sticky_threads_enabled=row.sticky_threads_enabled,
             model_source_sticky_enabled=row.model_source_sticky_enabled,
             model_source_sticky_ttl_seconds=row.model_source_sticky_ttl_seconds,
+            global_api_routing_override=row.global_api_routing_override,
+            provider_failure_policy=row.provider_failure_policy,
+            account_failure_policy=row.account_failure_policy,
+            provider_max_attempts=row.provider_max_attempts,
+            account_max_attempts=row.account_max_attempts,
+            model_source_auto_pause_enabled=row.model_source_auto_pause_enabled,
+            model_source_auto_pause_threshold=row.model_source_auto_pause_threshold,
             upstream_stream_transport=row.upstream_stream_transport,
             prohibit_fast_mode=row.prohibit_fast_mode,
             http_downstream_transport_policy=row.http_downstream_transport_policy,

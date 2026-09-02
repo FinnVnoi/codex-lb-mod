@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -70,6 +71,8 @@ type ApiKeyCreateDraft = {
   usageSections: string;
   limitRules: LimitRuleCreate[];
   expiresAt: Date | null;
+  quotaShopEnabled: boolean;
+  quotaShopOptions: { limitType: string; limitWindow: string }[];
   enforcedModel: string;
   enforcedReasoningEffort: string;
   enforcedServiceTier: string;
@@ -86,6 +89,8 @@ const initialApiKeyCreateDraft: ApiKeyCreateDraft = {
   usageSections: "upstream_limits,account_pool_usage",
   limitRules: [],
   expiresAt: null,
+  quotaShopEnabled: false,
+  quotaShopOptions: [{ limitType: "total_tokens", limitWindow: "lifetime" }, { limitType: "cost_usd", limitWindow: "lifetime" }],
   enforcedModel: "",
   enforcedReasoningEffort: "none",
   enforcedServiceTier: "none",
@@ -133,6 +138,9 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
       trafficClass: draft.trafficClass,
       transportPolicyOverride: draft.transportPolicyOverride,
       expiresAt: draft.expiresAt?.toISOString(),
+      quotaShopEnabled: draft.quotaShopEnabled,
+      quotaShopMaxWindows: 1,
+      quotaShopOptions: draft.quotaShopOptions,
       limits: validLimits.length > 0 ? validLimits : undefined,
     };
 
@@ -304,8 +312,14 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
           </div>
 
           <div className="max-h-[55vh] space-y-3 overflow-y-auto overscroll-contain pl-1 pr-2 max-sm:mt-3 max-sm:border-t max-sm:pt-3">
-            <h4 className="sticky top-0 bg-background pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("apiKeys.form.limits")}</h4>
-            <LimitRulesEditor rules={draft.limitRules} onChange={(limitRules) => updateDraft({ limitRules })} />
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="flex items-center justify-between"><span className="text-sm font-medium">Quota Shop Mode</span><Switch checked={draft.quotaShopEnabled} onCheckedChange={(quotaShopEnabled) => updateDraft({ quotaShopEnabled, ...(quotaShopEnabled ? { limitRules: [] } : {}) })} /></div>
+              {draft.quotaShopEnabled ? <div className="text-xs text-muted-foreground">Khách được chọn một window đúng một lần. Sau khi thanh toán thành công, mode tự tắt và limit đã chọn được giữ lại.</div> : null}
+            </div>
+            {!draft.quotaShopEnabled ? <>
+              <h4 className="sticky top-0 bg-background pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("apiKeys.form.limits")}</h4>
+              <LimitRulesEditor rules={draft.limitRules} onChange={(limitRules) => updateDraft({ limitRules })} />
+            </> : null}
           </div>
         </div>
 

@@ -74,6 +74,9 @@ class ApiKeyLimitResetScheduler:
                     repo = ApiKeysRepository(session)
                     now = utcnow()
                     reset_count = await repo.reset_expired_limits(now=now)
+                    extended_count = await repo.process_auto_extend_expiry(now=now)
+                    if extended_count > 0:
+                        logger.info("Auto-extended API key expiry extended_count=%s", extended_count)
                     if reset_count > 0:
                         logger.info("Reset expired API key limits reset_count=%s", reset_count)
                     released_count = await repo.release_stale_usage_reservations(

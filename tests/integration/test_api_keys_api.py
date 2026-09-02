@@ -389,6 +389,57 @@ async def test_api_key_list_includes_pooled_credit_fields_for_selectable_assigne
 
 
 @pytest.mark.asyncio
+async def test_api_key_rejects_quota_shop_mode_with_fixed_limits(async_client):
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "invalid-dual-mode-key",
+            "quotaShopEnabled": True,
+            "quotaShopOptions": [{"limitType": "total_tokens", "limitWindow": "lifetime"}],
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1000}],
+        },
+    )
+    assert create.status_code == 400
+    assert "cannot both be enabled" in create.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_api_key_create_and_update_quota_shop_options(async_client):
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "quota-shop-key",
+            "quotaShopEnabled": True,
+            "quotaShopMaxWindows": 1,
+            "quotaShopOptions": [
+                {"limitType": "total_tokens", "limitWindow": "lifetime"},
+                {"limitType": "cost_usd", "limitWindow": "lifetime"},
+            ],
+        },
+    )
+    assert create.status_code == 200
+    payload = create.json()
+    assert payload["quotaShopEnabled"] is True
+    assert payload["quotaShopOptions"] == [
+        {"limitType": "total_tokens", "limitWindow": "lifetime", "modelFilter": None},
+        {"limitType": "cost_usd", "limitWindow": "lifetime", "modelFilter": None},
+    ]
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{payload['id']}",
+        json={
+            "quotaShopOptions": [
+                {"limitType": "total_tokens", "limitWindow": "daily"},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["quotaShopOptions"] == [
+        {"limitType": "total_tokens", "limitWindow": "daily", "modelFilter": None},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_deleted_assigned_accounts_do_not_fall_back_to_other_accounts(async_client, monkeypatch):
     await _populate_test_registry()
     monkeypatch.setattr(
@@ -3457,6 +3508,58 @@ async def test_update_key_reset_usage_requires_explicit_action(async_client):
         assert len(limits) == 1
         assert limits[0].current_value == 0
         assert limits[0].reset_at > original_reset_at
+
+
+@pytest.mark.asyncio
+async def test_adding_lifetime_limit_backfills_all_historical_usage(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "lifetime-backfill"},
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                RequestLog(
+                    api_key_id=key_id,
+                    request_id="lifetime-backfill-old",
+                    requested_at=datetime(2020, 1, 1),
+                    model="gpt-5.1",
+                    status="success",
+                    input_tokens=40,
+                    output_tokens=2,
+                ),
+                RequestLog(
+                    api_key_id=key_id,
+                    request_id="lifetime-backfill-new",
+                    requested_at=utcnow() - timedelta(minutes=1),
+                    model="gpt-5.1",
+                    status="success",
+                    input_tokens=50,
+                    output_tokens=8,
+                ),
+            ]
+        )
+        await session.commit()
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "lifetime", "maxValue": 1000},
+            ],
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["limits"][0]["currentValue"] == 100
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert limits[0].current_value == 100
+        assert limits[0].reset_at == datetime.max
 
 
 @pytest.mark.asyncio

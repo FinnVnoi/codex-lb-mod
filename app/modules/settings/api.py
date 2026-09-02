@@ -126,6 +126,11 @@ def _dashboard_settings_response(settings) -> DashboardSettingsResponse:
         sticky_threads_enabled=settings.sticky_threads_enabled,
         model_source_sticky_enabled=settings.model_source_sticky_enabled,
         model_source_sticky_ttl_seconds=settings.model_source_sticky_ttl_seconds,
+        global_api_routing_override=settings.global_api_routing_override,
+        provider_failure_policy=settings.provider_failure_policy,
+        account_failure_policy=settings.account_failure_policy,
+        provider_max_attempts=settings.provider_max_attempts,
+        account_max_attempts=settings.account_max_attempts,
         upstream_stream_transport=settings.upstream_stream_transport,
         prohibit_fast_mode=settings.prohibit_fast_mode,
         http_downstream_transport_policy=settings.http_downstream_transport_policy,
@@ -644,6 +649,41 @@ async def update_settings(
                     if payload.model_source_sticky_ttl_seconds is not None
                     else current.model_source_sticky_ttl_seconds
                 ),
+                global_api_routing_override=(
+                    payload.global_api_routing_override
+                    if payload.global_api_routing_override is not None
+                    else current.global_api_routing_override
+                ),
+                provider_failure_policy=(
+                    payload.provider_failure_policy
+                    if payload.provider_failure_policy is not None
+                    else current.provider_failure_policy
+                ),
+                account_failure_policy=(
+                    payload.account_failure_policy
+                    if payload.account_failure_policy is not None
+                    else current.account_failure_policy
+                ),
+                provider_max_attempts=(
+                    payload.provider_max_attempts
+                    if payload.provider_max_attempts is not None
+                    else current.provider_max_attempts
+                ),
+                account_max_attempts=(
+                    payload.account_max_attempts
+                    if payload.account_max_attempts is not None
+                    else current.account_max_attempts
+                ),
+                model_source_auto_pause_enabled=(
+                    payload.model_source_auto_pause_enabled
+                    if payload.model_source_auto_pause_enabled is not None
+                    else current.model_source_auto_pause_enabled
+                ),
+                model_source_auto_pause_threshold=(
+                    payload.model_source_auto_pause_threshold
+                    if payload.model_source_auto_pause_threshold is not None
+                    else current.model_source_auto_pause_threshold
+                ),
                 upstream_stream_transport=payload.upstream_stream_transport or current.upstream_stream_transport,
                 prohibit_fast_mode=(
                     payload.prohibit_fast_mode if payload.prohibit_fast_mode is not None else current.prohibit_fast_mode
@@ -872,6 +912,11 @@ async def update_settings(
             "sticky_threads_enabled",
             "model_source_sticky_enabled",
             "model_source_sticky_ttl_seconds",
+            "global_api_routing_override",
+            "provider_failure_policy",
+            "account_failure_policy",
+            "provider_max_attempts",
+            "account_max_attempts",
             "upstream_stream_transport",
             "prohibit_fast_mode",
             "http_downstream_transport_policy",

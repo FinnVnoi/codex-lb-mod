@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -201,6 +202,32 @@ class ApiKeyUsageRollup(Base):
 
     api_key_id: Mapped[str] = mapped_column(String, ForeignKey("api_keys.id", ondelete="CASCADE"), primary_key=True)
     request_count: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
+    input_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
+    cached_input_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
+    total_cost_usd: Mapped[float] = mapped_column(Float, default=0.0, server_default=text("0"), nullable=False)
+
+
+class ApiKeyLogicalRequest(Base):
+    """One durable row per downstream API request, across fallback attempts."""
+
+    __tablename__ = "api_key_logical_requests"
+    __table_args__ = (
+        UniqueConstraint("api_key_id", "logical_id", name="uq_api_key_logical_request"),
+        Index("idx_api_key_logical_requests_key_time", "api_key_id", "requested_at", "id"),
+        Index("idx_logical_retry_match", "api_key_id", "conversation_id", "model", "status", "requested_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    api_key_id: Mapped[str] = mapped_column(String, ForeignKey("api_keys.id", ondelete="CASCADE"), nullable=False)
+    logical_id: Mapped[str] = mapped_column(String, nullable=False)
+    conversation_id: Mapped[str | None] = mapped_column(String, nullable=True)
+    useragent_group: Mapped[str | None] = mapped_column(String, nullable=True)
+    superseded_by_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    model: Mapped[str] = mapped_column(String, nullable=False)
+    status: Mapped[str] = mapped_column(String, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(String, nullable=True)
     input_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
     output_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
     cached_input_tokens: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
@@ -613,6 +640,32 @@ class DashboardSettings(Base):
     model_source_sticky_ttl_seconds: Mapped[int] = mapped_column(
         Integer, default=1800, server_default="1800", nullable=False
     )
+    global_api_routing_override: Mapped[str] = mapped_column(
+        String,
+        default="normal",
+        server_default=text("'normal'"),
+        nullable=False,
+    )
+    provider_failure_policy: Mapped[str] = mapped_column(
+        String,
+        default="account_after_first_failure",
+        server_default=text("'account_after_first_failure'"),
+        nullable=False,
+    )
+    account_failure_policy: Mapped[str] = mapped_column(
+        String,
+        default="accounts_before_providers",
+        server_default=text("'accounts_before_providers'"),
+        nullable=False,
+    )
+    provider_max_attempts: Mapped[int] = mapped_column(Integer, default=3, server_default="3", nullable=False)
+    account_max_attempts: Mapped[int] = mapped_column(Integer, default=3, server_default="3", nullable=False)
+    model_source_auto_pause_enabled: Mapped[bool] = mapped_column(
+        Boolean, default=True, server_default=true(), nullable=False
+    )
+    model_source_auto_pause_threshold: Mapped[int] = mapped_column(
+        Integer, default=3, server_default="3", nullable=False
+    )
     upstream_stream_transport: Mapped[str] = mapped_column(
         String,
         default="default",
@@ -972,6 +1025,13 @@ class ApiKey(Base):
         server_default="upstream_limits,account_pool_usage",
     )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    auto_extend_expiry: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    auto_extend_expiry_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    auto_extend_expiry_threshold: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    auto_extend_expiry_last_processed_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    quota_shop_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false(), nullable=False)
+    quota_shop_max_windows: Mapped[int] = mapped_column(Integer, default=1, server_default="1", nullable=False)
+    quota_shop_options: Mapped[str] = mapped_column(Text, default='[{"limit_type":"total_tokens","limit_window":"lifetime"},{"limit_type":"cost_usd","limit_window":"lifetime"}]', server_default='[{"limit_type":"total_tokens","limit_window":"lifetime"},{"limit_type":"cost_usd","limit_window":"lifetime"}]', nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
@@ -1035,6 +1095,11 @@ class ModelSource(Base):
         server_default=text("'unknown'"),
         nullable=False,
     )
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    pause_reason: Mapped[str | None] = mapped_column(String, nullable=True)
+    consecutive_auto_pause_failures: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     supports_chat_completions: Mapped[bool] = mapped_column(
         Boolean,
         default=True,
@@ -1051,6 +1116,12 @@ class ModelSource(Base):
         Boolean,
         default=False,
         server_default=false(),
+        nullable=False,
+    )
+    estimate_missing_stream_usage: Mapped[bool] = mapped_column(
+        Boolean,
+        default=True,
+        server_default=true(),
         nullable=False,
     )
     timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
