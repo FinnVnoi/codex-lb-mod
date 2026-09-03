@@ -42,3 +42,18 @@ def test_client_payload_error_does_not_fallback() -> None:
         status_code=404,
     )
     assert not api._account_response_allows_provider_fallback(response)
+
+
+def test_source_order_keeps_fallback_only_last() -> None:
+    sources = [
+        SimpleNamespace(routing_policy="fallback_only"),
+        SimpleNamespace(routing_policy="preserve"),
+        SimpleNamespace(routing_policy="normal"),
+        SimpleNamespace(routing_policy="burn_first"),
+    ]
+    assert [source.routing_policy for source in sorted(sources, key=api._source_routing_rank)] == [
+        "burn_first",
+        "normal",
+        "preserve",
+        "fallback_only",
+    ]

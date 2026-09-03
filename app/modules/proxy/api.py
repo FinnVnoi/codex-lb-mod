@@ -1120,9 +1120,9 @@ async def responses(
     except ClientPayloadError as exc:
         error = openai_client_payload_error(exc)
         return _logged_error_json_response(request, 400, error)
-    source = None
+    sources: list[ModelSource] = []
     if not source_route_excluded:
-        source_selection = await _select_responses_model_source(
+        source_selection = await _select_responses_model_sources(
             responses_payload.model,
             api_key,
             raw_model=raw_source_model,
@@ -1130,18 +1130,18 @@ async def responses(
             request=request,
         )
         if source_selection is not None:
-            source, selected_model = source_selection
+            sources, selected_model = source_selection
             responses_payload.model = selected_model
-    if source is not None:
+    if sources:
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
         # not reject them.
         responses_payload.stream = True
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
-        return await _source_responses_response(
+        return await _source_responses_candidates_response(
             request,
             responses_payload,
-            source=source,
+            sources=sources,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
             pre_normalization_effort=pre_normalization_effort,
@@ -1287,7 +1287,7 @@ async def v1_responses(
     source_selection = (
         None
         if extract_input_file_ids(responses_payload.input)
-        else await _select_responses_model_source(
+        else await _select_responses_model_sources(
             responses_payload.model,
             api_key,
             raw_model=raw_source_model,
@@ -1295,18 +1295,18 @@ async def v1_responses(
             request=request,
         )
     )
-    source = source_selection[0] if source_selection is not None else None
+    sources = source_selection[0] if source_selection is not None else []
     if source_selection is not None:
         responses_payload.model = source_selection[1]
-    if source is not None:
+    if sources:
         # Opportunistic admission gates subscription *account* capacity;
         # source-routed requests use no account, so a closed/empty pool must
         # not reject them.
         rate_limit_headers = await _rate_limit_headers_for_request(context, api_key)
-        return await _source_responses_response(
+        return await _source_responses_candidates_response(
             request,
             responses_payload,
-            source=source,
+            sources=sources,
             api_key=api_key,
             rate_limit_headers=rate_limit_headers,
             pre_normalization_effort=pre_normalization_effort,
@@ -4454,7 +4454,14 @@ def _route_to_provider_for_native_model(
     return decision
 
 
-async def _select_responses_model_source(
+def _source_routing_rank(source: ModelSource) -> int:
+    return {"burn_first": 0, "normal": 1, "preserve": 2, "fallback_only": 3}.get(
+        getattr(source, "routing_policy", "normal"),
+        1,
+    )
+
+
+async def _select_responses_model_sources(
     model: str,
     api_key: ApiKeyData | None,
     *,
@@ -4462,7 +4469,7 @@ async def _select_responses_model_source(
     require_streaming: bool = False,
     allow_native_provider_fallback: bool = False,
     request: Request | None = None,
-) -> tuple[ModelSource, str] | None:
+) -> tuple[list[ModelSource], str] | None:
     assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
     exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
     candidates = list(dict.fromkeys(candidate for candidate in (raw_model, model) if candidate))
@@ -4478,15 +4485,46 @@ async def _select_responses_model_source(
                 and not _route_to_provider_for_native_model(api_key, model=candidate, request=request)
             ):
                 continue
-            source = await repository.find_responses_source_for_model(
+            sources = await repository.find_responses_sources_for_model(
                 candidate,
                 allowed_source_ids=assigned_source_ids,
                 require_streaming=require_streaming,
             )
-            if source is not None:
+            if sources:
                 detach_session_objects(session)
-                return source, candidate
+                settings = await get_settings_cache().get()
+                max_attempts = max(1, min(10, int(settings.provider_max_attempts)))
+                ordered = sorted(sources, key=_source_routing_rank)
+                regular = [source for source in ordered if source.routing_policy != "fallback_only"]
+                fallback = [source for source in ordered if source.routing_policy == "fallback_only"]
+                # A fallback-only source is last resort and never displaces an
+                # available regular source merely because it was created first.
+                selected = [*regular, *fallback][:max_attempts]
+                return selected, candidate
         return None
+
+
+async def _select_responses_model_source(
+    model: str,
+    api_key: ApiKeyData | None,
+    *,
+    raw_model: str | None = None,
+    require_streaming: bool = False,
+    allow_native_provider_fallback: bool = False,
+    request: Request | None = None,
+) -> tuple[ModelSource, str] | None:
+    selection = await _select_responses_model_sources(
+        model,
+        api_key,
+        raw_model=raw_model,
+        require_streaming=require_streaming,
+        allow_native_provider_fallback=allow_native_provider_fallback,
+        request=request,
+    )
+    if selection is None:
+        return None
+    sources, candidate = selection
+    return (sources[0], candidate) if sources else None
 
 
 async def _select_embeddings_model_source(model: str, api_key: ApiKeyData | None) -> ModelSource | None:
@@ -4798,7 +4836,7 @@ async def _account_responses_provider_fallback_response(
 ) -> Response | None:
     if not _responses_request_allows_safe_branch_fallback(payload):
         return None
-    selection = await _select_responses_model_source(
+    selection = await _select_responses_model_sources(
         payload.model,
         api_key,
         raw_model=payload.model,
@@ -4808,17 +4846,54 @@ async def _account_responses_provider_fallback_response(
     )
     if selection is None:
         return None
-    source, selected_model = selection
+    sources, selected_model = selection
     provider_payload = payload.model_copy(deep=True)
     provider_payload.model = selected_model
     request.state.model_source_fallback = True
-    return await _source_responses_response(
+    last_response: Response | None = None
+    for source in sources:
+        last_response = await _source_responses_response(
+            request,
+            provider_payload.model_copy(deep=True),
+            source=source,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+            pre_normalization_effort=pre_normalization_effort,
+        )
+        if not _account_response_allows_provider_fallback(last_response):
+            return last_response
+    return last_response
+
+
+async def _source_responses_candidates_response(
+    request: Request,
+    payload: ResponsesRequest,
+    *,
+    sources: list[ModelSource],
+    api_key: ApiKeyData | None,
+    rate_limit_headers: Mapping[str, str],
+    pre_normalization_effort: str | None,
+) -> Response:
+    last_response: Response | None = None
+    for source in sources:
+        last_response = await _source_responses_response(
+            request,
+            payload.model_copy(deep=True),
+            source=source,
+            api_key=api_key,
+            rate_limit_headers=rate_limit_headers,
+            pre_normalization_effort=pre_normalization_effort,
+        )
+        if not _account_response_allows_provider_fallback(last_response):
+            return last_response
+        request.state.model_source_fallback = True
+    if last_response is not None:
+        return last_response
+    return _logged_error_json_response(
         request,
-        provider_payload,
-        source=source,
-        api_key=api_key,
-        rate_limit_headers=rate_limit_headers,
-        pre_normalization_effort=pre_normalization_effort,
+        503,
+        openai_error("model_source_unavailable", "No model source is available", error_type="server_error"),
+        headers=rate_limit_headers,
     )
 
 
