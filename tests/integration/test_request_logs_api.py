@@ -535,3 +535,39 @@ async def test_request_log_total_count_is_cached_per_filter_signature(async_clie
     # One COUNT for the shared default signature (page 2 reuses it), one for
     # the status-filtered signature.
     assert len(count_statements) == 2
+
+
+@pytest.mark.asyncio
+async def test_request_logs_search_matches_model_source_name_and_id(async_client, db_setup):
+    del db_setup
+    async with SessionLocal() as session:
+        session.add(
+            ModelSource(
+                id="source_searchable_provider",
+                name="Searchable Provider Alpha",
+                base_url="https://provider-search.example.invalid/v1",
+            )
+        )
+        await session.commit()
+        logs_repo = RequestLogsRepository(session)
+        await logs_repo.add_log(
+            account_id=None,
+            model_source_id="source_searchable_provider",
+            model_source_kind="openai_compatible",
+            request_id="req_searchable_provider",
+            model="provider-model",
+            input_tokens=10,
+            output_tokens=20,
+            latency_ms=100,
+            status="success",
+            error_code=None,
+            source="model_source",
+        )
+
+    by_name = await async_client.get("/api/request-logs", params={"search": "Provider Alpha"})
+    assert by_name.status_code == 200
+    assert [item["requestId"] for item in by_name.json()["requests"]] == ["req_searchable_provider"]
+
+    by_id = await async_client.get("/api/request-logs", params={"search": "source_searchable_provider"})
+    assert by_id.status_code == 200
+    assert [item["requestId"] for item in by_id.json()["requests"]] == ["req_searchable_provider"]

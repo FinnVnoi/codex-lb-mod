@@ -82,13 +82,14 @@ def _maybe_log_proxy_request_shape(
     extra_keys = sorted(payload.model_extra.keys()) if payload.model_extra else []
     fields_set = sorted(payload.model_fields_set)
     input_summary = _summarize_input(payload.input)
+    input_item_types = _summarize_input_item_types(payload.input)
     header_keys = _interesting_header_keys(headers)
     session_header_present = _sticky_key_from_session_header(headers) is not None
     tools_hash = _tools_hash(payload)
     model_class = _extract_model_class(payload.model)
 
     logger.warning(
-        "proxy_request_shape request_id=%s kind=%s model=%s stream=%s input=%s "
+        "proxy_request_shape request_id=%s kind=%s model=%s stream=%s input=%s input_item_types=%s "
         "prompt_cache_key=%s prompt_cache_key_raw=%s fields=%s extra=%s headers=%s "
         "sticky_kind=%s sticky_key_source=%s prompt_cache_key_set=%s"
         " session_header_present=%s tools_hash=%s model_class=%s",
@@ -97,6 +98,7 @@ def _maybe_log_proxy_request_shape(
         payload.model,
         getattr(payload, "stream", None),
         input_summary,
+        input_item_types,
         prompt_cache_key_hash,
         prompt_cache_key_raw,
         fields_set,
@@ -288,6 +290,21 @@ def _summarize_input(items: JsonValue) -> str:
         summary = ",".join(f"{key}={type_counts[key]}" for key in sorted(type_counts))
         return f"{len(items)}({summary})"
     return type(items).__name__
+
+
+def _summarize_input_item_types(items: JsonValue) -> str | None:
+    """Summarize Responses input item types without logging prompt contents."""
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes, bytearray)):
+        return None
+    type_counts: dict[str, int] = {}
+    for item in items:
+        if not isinstance(item, Mapping):
+            type_name = type(item).__name__
+        else:
+            raw_type = item.get("type")
+            type_name = raw_type if isinstance(raw_type, str) and raw_type else "mapping"
+        type_counts[type_name] = type_counts.get(type_name, 0) + 1
+    return ",".join(f"{key}={type_counts[key]}" for key in sorted(type_counts)) or "empty"
 
 
 def _truncate_identifier(value: str, *, max_length: int = 96) -> str:

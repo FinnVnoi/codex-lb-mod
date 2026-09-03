@@ -5,7 +5,15 @@ from datetime import timedelta
 import pytest
 
 from app.core.utils.time import utcnow
-from app.db.models import Account, AccountStatus, ApiKeyLimit, LimitType, LimitWindow, UsageHistory
+from app.db.models import (
+    Account,
+    AccountStatus,
+    ApiKeyLimit,
+    ApiKeyLogicalRequest,
+    LimitType,
+    LimitWindow,
+    UsageHistory,
+)
 from app.db.session import SessionLocal
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeysService, LimitRuleInput
@@ -290,6 +298,7 @@ async def test_v1_usage_returns_zero_usage_for_key_without_logs(async_client):
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
+        "expires_at": None,
         "limits": [],
         "upstream_limits": [],
         "account_pool_usage": {
@@ -314,6 +323,7 @@ async def test_v1_usage_omits_disabled_account_pool_usage_section(async_client):
         "total_tokens": 0,
         "cached_input_tokens": 0,
         "total_cost_usd": 0.0,
+        "expires_at": None,
         "limits": [],
         "upstream_limits": [],
         "account_pool_usage": None,
@@ -756,3 +766,207 @@ async def test_v1_usage_ignores_paused_and_deactivated_accounts_in_aggregate_cre
         },
     ]
     assert payload["limits"] == payload["upstream_limits"]
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_bulk_returns_usage_for_newline_separated_keys(async_client):
+    key_a_id, key_a = await _create_api_key(
+        name="bulk-usage-a",
+        limits=[LimitRuleInput(limit_type="credits", limit_window="5h", max_value=60)],
+    )
+    _, key_b = await _create_api_key(name="bulk-usage-b")
+    now = utcnow()
+    reset_at = now + timedelta(hours=5)
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        await repo.replace_limits(
+            key_a_id,
+            [
+                ApiKeyLimit(
+                    api_key_id=key_a_id,
+                    limit_type=LimitType.CREDITS,
+                    limit_window=LimitWindow.FIVE_HOURS,
+                    max_value=60,
+                    current_value=12,
+                    model_filter=None,
+                    reset_at=reset_at,
+                )
+            ],
+        )
+        logs = RequestLogsRepository(session)
+        await logs.add_log(
+            account_id=None,
+            api_key_id=key_a_id,
+            request_id="req_v1_bulk_usage_a1",
+            model="gpt-5.4",
+            input_tokens=10,
+            output_tokens=5,
+            cached_input_tokens=2,
+            latency_ms=100,
+            status="success",
+            error_code=None,
+            requested_at=now - timedelta(minutes=1),
+        )
+
+    response = await async_client.post(
+        "/v1/usage/bulk",
+        content=f"# comment\napiKey={key_a}\nserialKey={key_b}\ninvalid-key\n",
+        headers={"Content-Type": "text/plain"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 3
+    assert payload["ok"] == 2
+    assert payload["error"] == 1
+
+    first = payload["data"][0]
+    assert first["ok"] is True
+    assert first["status_code"] == 200
+    assert first["usage"]["request_count"] == 1
+    assert first["usage"]["total_tokens"] == 15
+    assert first["usage"]["limits"] == [
+        {
+            "limit_type": "credits",
+            "limit_window": "5h",
+            "max_value": 60,
+            "current_value": 12,
+            "remaining_value": 48,
+            "model_filter": None,
+            "reset_at": reset_at.isoformat() + "Z",
+            "source": "api_key_limit",
+        }
+    ]
+    assert first["codex_usage"]["plan_type"] == "api_key"
+    assert first["codex_usage"]["credits"]["balance"] == "48"
+
+    second = payload["data"][1]
+    assert second["ok"] is True
+    assert second["usage"]["request_count"] == 0
+
+    third = payload["data"][2]
+    assert third["ok"] is False
+    assert third["status_code"] == 401
+    assert third["error"]["code"] == "invalid_api_key"
+
+
+@pytest.mark.asyncio
+async def test_v1_usage_bulk_accepts_json_payload(async_client):
+    _, key = await _create_api_key(name="bulk-usage-json")
+
+    response = await async_client.post(
+        "/v1/usage/bulk",
+        json={"keys": [{"serialKey": key}]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 1
+    assert payload["ok"] == 1
+    assert payload["data"][0]["ok"] is True
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_collapses_fallback_attempts(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-fallback")
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add_all([
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="logical-1", requested_at=now - timedelta(minutes=1), model="gpt-b", status="success", error_code=None, input_tokens=30, output_tokens=4, cached_input_tokens=6, total_cost_usd=.03),
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="logical-2", requested_at=now, model="gpt-c", status="error", error_code="no_accounts", input_tokens=5, output_tokens=0, cached_input_tokens=0, total_cost_usd=.005),
+        ])
+        await session.commit()
+
+    response = await async_client.get("/v1/usage/activity?window=1d&page=1", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"] == {"request_count": 2, "total_tokens": 39, "cached_input_tokens": 6, "total_cost_usd": pytest.approx(.035)}
+    assert payload["requests"][0]["status"] == "error"
+    assert payload["requests"][0]["error_code"] == "no_accounts"
+    assert payload["requests"][1]["status"] == "success"
+    assert payload["requests"][1]["error_code"] is None
+    assert payload["requests"][1]["model"] == "gpt-b"
+    assert payload["requests"][1]["total_tokens"] == 34
+    assert payload["model_aggregates"] == [
+        {"model": "gpt-b", "success_count": 1, "failed_count": 0, "total_tokens": 34, "total_cost_usd": pytest.approx(.03)},
+        {"model": "gpt-c", "success_count": 0, "failed_count": 1, "total_tokens": 5, "total_cost_usd": pytest.approx(.005)},
+    ]
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_model_aggregates_are_lifetime_and_all_non_success(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-model-aggregates")
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add_all([
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="recent-success", requested_at=now, model="gpt-z", status="success", error_code=None, input_tokens=10, output_tokens=2, cached_input_tokens=1, total_cost_usd=.02),
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="recent-cancelled", requested_at=now, model="gpt-z", status="cancelled", error_code="cancelled", input_tokens=1, output_tokens=0, cached_input_tokens=0, total_cost_usd=.001),
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="old-error", requested_at=now - timedelta(days=40), model="gpt-old", status="error", error_code="failed", input_tokens=3, output_tokens=0, cached_input_tokens=0, total_cost_usd=.003),
+        ])
+        await session.commit()
+
+    response = await async_client.get("/v1/usage/activity?window=1d&include_logs=false", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"]["request_count"] == 2
+    assert payload["requests"] == []
+    assert payload["model_aggregates"] == [
+        {"model": "gpt-z", "success_count": 1, "failed_count": 1, "total_tokens": 13, "total_cost_usd": pytest.approx(.021)},
+        {"model": "gpt-old", "success_count": 0, "failed_count": 1, "total_tokens": 3, "total_cost_usd": pytest.approx(.003)},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_request_log_writer_upserts_one_logical_request():
+    now = utcnow()
+    key_id, _ = await _create_api_key(name="activity-writer")
+    async with SessionLocal() as session:
+        repo = RequestLogsRepository(session)
+        await repo.add_log(None, "attempt-1", "gpt-a", 10, 1, 1, "error", "retryable", requested_at=now, cached_input_tokens=2, api_key_id=key_id, archive_request_id="logical-write", cost_usd=.01)
+        await repo.add_log(None, "attempt-2", "gpt-b", 20, 3, 1, "ok", None, requested_at=now + timedelta(seconds=1), cached_input_tokens=4, api_key_id=key_id, archive_request_id="logical-write", cost_usd=.02)
+    async with SessionLocal() as session:
+        from sqlalchemy import select
+        row = (await session.execute(select(ApiKeyLogicalRequest).where(ApiKeyLogicalRequest.api_key_id == key_id))).scalar_one()
+        assert row.status == "success"
+        assert row.error_code is None
+        assert row.model == "gpt-b"
+        assert (row.input_tokens, row.output_tokens, row.cached_input_tokens) == (30, 4, 6)
+        assert row.total_cost_usd == pytest.approx(.03)
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_after_id_returns_only_new_logs(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-cursor")
+    now = utcnow()
+    async with SessionLocal() as session:
+        old = ApiKeyLogicalRequest(api_key_id=key_id, logical_id="cursor-old", requested_at=now, model="old", status="success", input_tokens=1, output_tokens=1, cached_input_tokens=0, total_cost_usd=.01)
+        session.add(old); await session.commit(); await session.refresh(old); cursor = old.id
+        session.add(ApiKeyLogicalRequest(api_key_id=key_id, logical_id="cursor-new", requested_at=now + timedelta(seconds=1), model="new", status="success", input_tokens=2, output_tokens=1, cached_input_tokens=0, total_cost_usd=.02)); await session.commit()
+    response = await async_client.get(f"/v1/usage/activity?window=lt&include_logs=true&after_id={cursor}", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert [row["model"] for row in payload["requests"]] == ["new"]
+    assert payload["max_rows"] == 2
+    assert payload["latest_id"] > cursor
+    assert payload["totals"]["request_count"] == 2
+    assert payload["model_aggregates"] == [
+        {"model": "new", "success_count": 1, "failed_count": 0, "total_tokens": 3, "total_cost_usd": pytest.approx(.02)},
+        {"model": "old", "success_count": 1, "failed_count": 0, "total_tokens": 2, "total_cost_usd": pytest.approx(.01)},
+    ]
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_hides_superseded_client_retry(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-client-retry")
+    now = utcnow()
+    async with SessionLocal() as session:
+        failed = ApiKeyLogicalRequest(api_key_id=key_id, logical_id="retry-failed", conversation_id="conv-1", requested_at=now, model="gpt-x", status="error", error_code="insufficient_quota", input_tokens=0, output_tokens=0, cached_input_tokens=0, total_cost_usd=0)
+        session.add(failed); await session.flush()
+        success = ApiKeyLogicalRequest(api_key_id=key_id, logical_id="retry-success", conversation_id="conv-1", requested_at=now + timedelta(seconds=9), model="gpt-x", status="success", input_tokens=10, output_tokens=2, cached_input_tokens=1, total_cost_usd=.02)
+        session.add(success); await session.flush(); failed.superseded_by_id = success.id; await session.commit(); failed_id = failed.id
+    response = await async_client.get("/v1/usage/activity?window=lt&include_logs=true&after_id=0", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"]["request_count"] == 1
+    assert [row["status"] for row in payload["requests"]] == ["success"]
+    assert payload["model_aggregates"] == [
+        {"model": "gpt-x", "success_count": 1, "failed_count": 0, "total_tokens": 12, "total_cost_usd": pytest.approx(.02)},
+    ]
+    assert failed_id in payload["removed_ids"]

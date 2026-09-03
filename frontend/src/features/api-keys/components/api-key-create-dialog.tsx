@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/dialog";
 import { Form, FormControl, FormField, FormItem, FormLabel, FormMessage } from "@/components/ui/form";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -34,6 +35,7 @@ import type {
   ApiKeyCreateRequest,
   LimitRuleCreate,
   ReasoningEffortType,
+  RoutingMode,
   ServiceTierType,
   TrafficClass,
   TransportPolicyOverride,
@@ -71,12 +73,15 @@ type ApiKeyCreateDraft = {
   usageSections: string;
   limitRules: LimitRuleCreate[];
   expiresAt: Date | null;
+  quotaShopEnabled: boolean;
+  quotaShopOptions: { limitType: string; limitWindow: string }[];
   enforcedModel: string;
   enforcedReasoningEffort: string;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
   applyToCodexModel: boolean;
+  routingMode: RoutingMode;
 };
 
 const initialApiKeyCreateDraft: ApiKeyCreateDraft = {
@@ -87,12 +92,15 @@ const initialApiKeyCreateDraft: ApiKeyCreateDraft = {
   usageSections: "upstream_limits,account_pool_usage",
   limitRules: [],
   expiresAt: null,
+  quotaShopEnabled: false,
+  quotaShopOptions: [{ limitType: "total_tokens", limitWindow: "lifetime" }, { limitType: "cost_usd", limitWindow: "lifetime" }],
   enforcedModel: "",
   enforcedReasoningEffort: "none",
   enforcedServiceTier: "none",
   trafficClass: "foreground",
   transportPolicyOverride: null,
   applyToCodexModel: false,
+  routingMode: "balanced",
 };
 
 function apiKeyCreateDraftReducer(
@@ -120,6 +128,7 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
       name: values.name,
       allowedModels: draft.selectedModels.length > 0 ? draft.selectedModels : undefined,
       applyToCodexModel: draft.applyToCodexModel,
+      routingMode: draft.routingMode,
       ...(draft.selectedAccountIds.length > 0 ? { assignedAccountIds: draft.selectedAccountIds } : {}),
       ...(draft.selectedSourceIds.length > 0 ? { assignedSourceIds: draft.selectedSourceIds } : {}),
       usageSections: draft.usageSections,
@@ -135,6 +144,9 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
       trafficClass: draft.trafficClass,
       transportPolicyOverride: draft.transportPolicyOverride,
       expiresAt: draft.expiresAt?.toISOString(),
+      quotaShopEnabled: draft.quotaShopEnabled,
+      quotaShopMaxWindows: 1,
+      quotaShopOptions: draft.quotaShopOptions,
       limits: validLimits.length > 0 ? validLimits : undefined,
     };
 
@@ -182,6 +194,19 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
               <label htmlFor="create-api-key-apply-to-codex-model" className="cursor-pointer">
                 {t("apiKeys.form.applyToCodexModel")}
               </label>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-sm font-medium">{t("apiKeys.form.routingMode")}</label>
+              <Select value={draft.routingMode} onValueChange={(routingMode) => updateDraft({ routingMode: routingMode as RoutingMode })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="balanced">{t("apiKeys.routing.balanced")}</SelectItem>
+                  <SelectItem value="account_first">{t("apiKeys.routing.accountFirst")}</SelectItem>
+                  <SelectItem value="provider_first">{t("apiKeys.routing.providerFirst")}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("apiKeys.routing.description")}</p>
             </div>
 
             <div className="space-y-1">
@@ -310,8 +335,14 @@ function ApiKeyCreateForm({ busy, onClose, onSubmit }: ApiKeyCreateFormProps) {
           </div>
 
           <div className="max-h-[55vh] space-y-3 overflow-y-auto overscroll-contain pl-1 pr-2 max-sm:mt-3 max-sm:border-t max-sm:pt-3">
-            <h4 className="sticky top-0 bg-background pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("apiKeys.form.limits")}</h4>
-            <LimitRulesEditor rules={draft.limitRules} onChange={(limitRules) => updateDraft({ limitRules })} />
+            <div className="rounded-md border p-3 space-y-3">
+              <div className="flex items-center justify-between"><span className="text-sm font-medium">Quota Shop Mode</span><Switch checked={draft.quotaShopEnabled} onCheckedChange={(quotaShopEnabled) => updateDraft({ quotaShopEnabled, ...(quotaShopEnabled ? { limitRules: [] } : {}) })} /></div>
+              {draft.quotaShopEnabled ? <div className="text-xs text-muted-foreground">Khách được chọn một window đúng một lần. Sau khi thanh toán thành công, mode tự tắt và limit đã chọn được giữ lại.</div> : null}
+            </div>
+            {!draft.quotaShopEnabled ? <>
+              <h4 className="sticky top-0 bg-background pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("apiKeys.form.limits")}</h4>
+              <LimitRulesEditor rules={draft.limitRules} onChange={(limitRules) => updateDraft({ limitRules })} />
+            </> : null}
           </div>
         </div>
 

@@ -55,7 +55,12 @@ export function LimitRulesEditor({ rules, onChange }: LimitRulesEditorProps) {
     if (val > 0) {
       onChange([
         ...otherRules,
-        { limitType: "total_tokens", limitWindow: "weekly", maxValue: val, modelFilter: null },
+        {
+          limitType: "total_tokens",
+          limitWindow: "weekly",
+          maxValue: val,
+          modelFilter: null,
+        },
       ]);
     } else {
       onChange(otherRules);

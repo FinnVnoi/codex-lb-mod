@@ -125,6 +125,13 @@ def _dashboard_settings_response(settings) -> DashboardSettingsResponse:
     ]
     return DashboardSettingsResponse(
         sticky_threads_enabled=settings.sticky_threads_enabled,
+        model_source_sticky_enabled=settings.model_source_sticky_enabled,
+        model_source_sticky_ttl_seconds=settings.model_source_sticky_ttl_seconds,
+        global_api_routing_override=settings.global_api_routing_override,
+        provider_failure_policy=settings.provider_failure_policy,
+        account_failure_policy=settings.account_failure_policy,
+        provider_max_attempts=settings.provider_max_attempts,
+        account_max_attempts=settings.account_max_attempts,
         upstream_stream_transport=settings.upstream_stream_transport,
         prohibit_fast_mode=settings.prohibit_fast_mode,
         http_downstream_transport_policy=settings.http_downstream_transport_policy,
@@ -132,9 +139,13 @@ def _dashboard_settings_response(settings) -> DashboardSettingsResponse:
         proxy_account_stream_limit=settings.proxy_account_stream_limit,
         proxy_account_stream_recovery_reserve=settings.proxy_account_stream_recovery_reserve,
         proxy_api_key_fair_share_congestion_threshold_pct=(settings.proxy_api_key_fair_share_congestion_threshold_pct),
+        overload_cooldown_seconds=settings.overload_cooldown_seconds,
         upstream_proxy_routing_enabled=settings.upstream_proxy_routing_enabled,
         upstream_proxy_default_pool_id=settings.upstream_proxy_default_pool_id,
         prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+        prefer_unstarted_quota_accounts=settings.prefer_unstarted_quota_accounts,
+        prefer_unstarted_quota_window=settings.prefer_unstarted_quota_window,
+        prefer_earlier_renewal_accounts=settings.prefer_earlier_renewal_accounts,
         prefer_earlier_reset_window=settings.prefer_earlier_reset_window,
         show_reset_credit_badges=settings.show_reset_credit_badges,
         auto_redeem_reset_credits_before_expiry=settings.auto_redeem_reset_credits_before_expiry,
@@ -646,6 +657,51 @@ async def update_settings(
                     if payload.sticky_threads_enabled is not None
                     else current.sticky_threads_enabled
                 ),
+                model_source_sticky_enabled=(
+                    payload.model_source_sticky_enabled
+                    if payload.model_source_sticky_enabled is not None
+                    else current.model_source_sticky_enabled
+                ),
+                model_source_sticky_ttl_seconds=(
+                    payload.model_source_sticky_ttl_seconds
+                    if payload.model_source_sticky_ttl_seconds is not None
+                    else current.model_source_sticky_ttl_seconds
+                ),
+                global_api_routing_override=(
+                    payload.global_api_routing_override
+                    if payload.global_api_routing_override is not None
+                    else current.global_api_routing_override
+                ),
+                provider_failure_policy=(
+                    payload.provider_failure_policy
+                    if payload.provider_failure_policy is not None
+                    else current.provider_failure_policy
+                ),
+                account_failure_policy=(
+                    payload.account_failure_policy
+                    if payload.account_failure_policy is not None
+                    else current.account_failure_policy
+                ),
+                provider_max_attempts=(
+                    payload.provider_max_attempts
+                    if payload.provider_max_attempts is not None
+                    else current.provider_max_attempts
+                ),
+                account_max_attempts=(
+                    payload.account_max_attempts
+                    if payload.account_max_attempts is not None
+                    else current.account_max_attempts
+                ),
+                model_source_auto_pause_enabled=(
+                    payload.model_source_auto_pause_enabled
+                    if payload.model_source_auto_pause_enabled is not None
+                    else current.model_source_auto_pause_enabled
+                ),
+                model_source_auto_pause_threshold=(
+                    payload.model_source_auto_pause_threshold
+                    if payload.model_source_auto_pause_threshold is not None
+                    else current.model_source_auto_pause_threshold
+                ),
                 upstream_stream_transport=payload.upstream_stream_transport or current.upstream_stream_transport,
                 prohibit_fast_mode=(
                     payload.prohibit_fast_mode if payload.prohibit_fast_mode is not None else current.prohibit_fast_mode
@@ -673,6 +729,11 @@ async def update_settings(
                     if "proxy_api_key_fair_share_congestion_threshold_pct" in payload.model_fields_set
                     else None
                 ),
+                overload_cooldown_seconds=(
+                    payload.overload_cooldown_seconds
+                    if payload.overload_cooldown_seconds is not None
+                    else current.overload_cooldown_seconds
+                ),
                 upstream_proxy_routing_enabled=(
                     payload.upstream_proxy_routing_enabled
                     if payload.upstream_proxy_routing_enabled is not None
@@ -687,6 +748,19 @@ async def update_settings(
                     payload.prefer_earlier_reset_accounts
                     if payload.prefer_earlier_reset_accounts is not None
                     else current.prefer_earlier_reset_accounts
+                ),
+                prefer_unstarted_quota_accounts=(
+                    payload.prefer_unstarted_quota_accounts
+                    if payload.prefer_unstarted_quota_accounts is not None
+                    else current.prefer_unstarted_quota_accounts
+                ),
+                prefer_unstarted_quota_window=(
+                    payload.prefer_unstarted_quota_window or current.prefer_unstarted_quota_window
+                ),
+                prefer_earlier_renewal_accounts=(
+                    payload.prefer_earlier_renewal_accounts
+                    if payload.prefer_earlier_renewal_accounts is not None
+                    else current.prefer_earlier_renewal_accounts
                 ),
                 prefer_earlier_reset_window=payload.prefer_earlier_reset_window or current.prefer_earlier_reset_window,
                 show_reset_credit_badges=(
@@ -859,6 +933,13 @@ async def update_settings(
         field_name
         for field_name in (
             "sticky_threads_enabled",
+            "model_source_sticky_enabled",
+            "model_source_sticky_ttl_seconds",
+            "global_api_routing_override",
+            "provider_failure_policy",
+            "account_failure_policy",
+            "provider_max_attempts",
+            "account_max_attempts",
             "upstream_stream_transport",
             "prohibit_fast_mode",
             "http_downstream_transport_policy",
@@ -866,9 +947,13 @@ async def update_settings(
             "proxy_account_stream_limit",
             "proxy_account_stream_recovery_reserve",
             "proxy_api_key_fair_share_congestion_threshold_pct",
+            "overload_cooldown_seconds",
             "upstream_proxy_routing_enabled",
             "upstream_proxy_default_pool_id",
             "prefer_earlier_reset_accounts",
+            "prefer_unstarted_quota_accounts",
+            "prefer_unstarted_quota_window",
+            "prefer_earlier_renewal_accounts",
             "prefer_earlier_reset_window",
             "show_reset_credit_badges",
             "auto_redeem_reset_credits_before_expiry",

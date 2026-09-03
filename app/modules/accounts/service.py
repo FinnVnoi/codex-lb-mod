@@ -14,6 +14,7 @@ from sqlalchemy.exc import OperationalError
 from app.core.auth import (
     DEFAULT_EMAIL,
     DEFAULT_PLAN,
+    AuthFile,
     claims_from_auth,
     generate_unique_account_id,
     parse_auth_json,
@@ -96,6 +97,35 @@ IMPORT_PROXY_REQUIRED_PAUSE_REASON = "upstream_proxy_required_on_import"
 
 class InvalidAuthJsonError(Exception):
     pass
+
+
+def _parse_import_payload(raw: bytes) -> list[AuthFile]:
+    try:
+        decoded = raw.decode("utf-8-sig")
+        data = json.loads(decoded)
+        if isinstance(data, dict) and isinstance(data.get("accounts"), list):
+            auths: list[AuthFile] = []
+            for entry in data["accounts"]:
+                if not isinstance(entry, dict):
+                    continue
+                credentials = entry.get("credentials")
+                if not isinstance(credentials, dict):
+                    continue
+                payload = {
+                    "type": "codex",
+                    "access_token": credentials.get("access_token"),
+                    "id_token": credentials.get("id_token") or credentials.get("access_token"),
+                    "refresh_token": credentials.get("refresh_token") or "",
+                    "account_id": credentials.get("account_id") or credentials.get("chatgpt_account_id"),
+                    "email": credentials.get("email") or entry.get("name"),
+                    "last_refresh": (entry.get("extra") or {}).get("last_refresh") or data.get("exported_at"),
+                }
+                auths.append(parse_auth_json(json.dumps(payload).encode("utf-8")))
+            if auths:
+                return auths
+        return [parse_auth_json(decoded.encode("utf-8"))]
+    except (json.JSONDecodeError, ValidationError, UnicodeDecodeError, TypeError) as exc:
+        raise InvalidAuthJsonError("Invalid auth.json payload") from exc
 
 
 class AccountNotProbableError(Exception):
@@ -511,18 +541,29 @@ class AccountsService:
         )
 
     async def import_account(self, raw: bytes) -> AccountImportResponse:
-        try:
-            auth = parse_auth_json(raw)
-        except (json.JSONDecodeError, ValidationError, UnicodeDecodeError, TypeError) as exc:
-            raise InvalidAuthJsonError("Invalid auth.json payload") from exc
-        claims = claims_from_auth(auth)
+        auths = _parse_import_payload(raw)
+        imported: list[AccountImportResponse] = []
+        for auth in auths:
+            imported.append(await self._import_auth(auth, refresh_usage=len(auths) == 1))
+        if len(auths) > 1 and self._usage_repo and self._usage_updater:
+            account_ids = [entry.account_id for entry in imported]
+            accounts = [account for account_id in account_ids if (account := await self._repo.get_by_id(account_id))]
+            refreshable = [account for account in accounts if account.status == AccountStatus.ACTIVE]
+            if refreshable:
+                latest_usage = await self._usage_repo.latest_by_account(window="primary")
+                await self._usage_updater.refresh_accounts(refreshable, latest_usage)
+        get_account_selection_cache().invalidate()
+        if imported:
+            return imported[-1]
+        raise InvalidAuthJsonError("Invalid auth.json payload")
 
+    async def _import_auth(self, auth: AuthFile, *, refresh_usage: bool) -> AccountImportResponse:
+        claims = claims_from_auth(auth)
         email = claims.email or DEFAULT_EMAIL
         raw_account_id = claims.account_id
         account_id = generate_unique_account_id(raw_account_id, email, claims.workspace_id, claims.workspace_label)
         plan_type = coerce_account_plan_type(claims.plan_type, DEFAULT_PLAN)
         last_refresh = to_utc_naive(auth.last_refresh_at) if auth.last_refresh_at else utcnow()
-
         account = Account(
             id=account_id,
             chatgpt_account_id=raw_account_id,
@@ -538,7 +579,6 @@ class AccountsService:
             status=AccountStatus.ACTIVE,
             deactivation_reason=None,
         )
-
         saved = await self._repo.upsert_account_slot(account)
         import_usage_refresh_allowed = await self._import_usage_refresh_allowed(saved)
         if not import_usage_refresh_allowed:
@@ -551,12 +591,11 @@ class AccountsService:
             )
             mark_account_routing_unavailable(saved.id)
             saved = await self._repo.get_by_id(saved.id) or saved
-        if import_usage_refresh_allowed and self._usage_repo and self._usage_updater:
+        if refresh_usage and import_usage_refresh_allowed and self._usage_repo and self._usage_updater:
             latest_usage = await self._usage_repo.latest_by_account(window="primary")
             await self._usage_updater.refresh_accounts([saved], latest_usage)
         if saved.status == AccountStatus.ACTIVE:
             clear_account_routing_unavailable(saved.id)
-        get_account_selection_cache().invalidate()
         return AccountImportResponse(
             account_id=saved.id,
             email=saved.email,

@@ -259,7 +259,7 @@ class V1UsageLimitResponse(BaseModel):
     current_value: int
     remaining_value: int
     model_filter: str | None = None
-    reset_at: str
+    reset_at: str | None
     source: str = "api_key_limit"
 
 
@@ -277,9 +277,88 @@ class V1UsageResponse(BaseModel):
     total_tokens: int
     cached_input_tokens: int
     total_cost_usd: float
+    expires_at: datetime | None = None
     limits: list[V1UsageLimitResponse]
     upstream_limits: list[V1UsageLimitResponse] = []
     account_pool_usage: AccountPoolUsageResponse | None = None
+
+
+class V1UsageActivityTotals(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    request_count: int
+    total_tokens: int
+    cached_input_tokens: int
+    total_cost_usd: float
+
+
+class V1UsageActivityRow(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: int
+    requested_at: datetime
+    model: str
+    status: str
+    error_code: str | None = None
+    total_tokens: int
+    cached_input_tokens: int
+    cost_usd: float
+
+
+class V1UsageActivityModelAggregate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    success_count: int
+    failed_count: int
+    total_tokens: int
+    total_cost_usd: float
+
+
+class V1UsageActivityResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    window: str
+    page: int
+    page_size: int
+    total_pages: int
+    max_rows: int
+    latest_id: int | None = None
+    removed_ids: list[int] = []
+    totals: V1UsageActivityTotals
+    model_aggregates: list[V1UsageActivityModelAggregate] = []
+    requests: list[V1UsageActivityRow]
+
+
+class V1BulkUsageError(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    code: str
+    message: str
+
+
+class V1BulkUsageItem(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    index: int
+    masked_key: str
+    key_prefix: str | None = None
+    expires_at: datetime | None = None
+    ok: bool
+    status_code: int
+    usage: V1UsageResponse | None = None
+    codex_usage: RateLimitStatusPayload | None = None
+    error: V1BulkUsageError | None = None
+
+
+class V1BulkUsageResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    object: str = "list"
+    total: int
+    ok: int
+    error: int
+    data: list[V1BulkUsageItem]
 
 
 class V1ResetCreditEntry(BaseModel):

@@ -12,6 +12,7 @@ import { normalizeSupportedLanguage, SUPPORTED_LANGUAGES, type SupportedLanguage
 
 const LANGUAGE_LABEL_KEY: Record<SupportedLanguage, string> = {
   en: "common.english",
+  vi: "common.vietnamese",
   "zh-CN": "common.chinese",
   ko: "common.korean",
 };

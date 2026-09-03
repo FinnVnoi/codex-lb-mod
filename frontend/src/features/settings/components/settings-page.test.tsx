@@ -12,6 +12,7 @@ const useSettingsMock = vi.fn();
 const useAccountsMock = vi.fn();
 const useUpstreamProxyAdminMock = vi.fn();
 const routingSettingsMock = vi.fn();
+const trafficRoutingSettingsMock = vi.fn();
 const upstreamProxySettingsMock = vi.fn();
 const importSettingsMock = vi.fn();
 const guestAccessSettingsMock = vi.fn();
@@ -40,6 +41,13 @@ vi.mock("@/features/settings/components/routing-settings", () => ({
   RoutingSettings: (props: unknown) => {
     routingSettingsMock(props);
     return <div>Routing Settings</div>;
+  },
+}));
+
+vi.mock("@/features/settings/components/traffic-routing-settings", () => ({
+  TrafficRoutingSettings: (props: unknown) => {
+    trafficRoutingSettingsMock(props);
+    return <div>Traffic Routing Settings</div>;
   },
 }));
 

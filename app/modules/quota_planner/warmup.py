@@ -181,7 +181,9 @@ class QuotaWarmupService:
                     fallback_reason="api_key_invalid",
                 )
             except ApiKeyRateLimitExceededError as exc:
-                reason = f"api_key_rate_limit_exceeded:{exc.reset_at.isoformat()}Z"
+                reason = "api_key_rate_limit_exceeded"
+                if exc.reset_at is not None:
+                    reason += f":{exc.reset_at.isoformat()}Z"
                 row = await self._planner.update_decision_status(
                     decision.id,
                     status="skipped",

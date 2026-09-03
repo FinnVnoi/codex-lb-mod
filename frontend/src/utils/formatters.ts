@@ -9,11 +9,8 @@ function t(key: string, options?: Record<string, unknown>): string {
 
 function getIntlLocale(): string {
   const language = (i18n.resolvedLanguage ?? i18n.language ?? "en").toLowerCase();
-  if (language.startsWith("ko")) {
-    return "ko-KR";
-  }
-  if (language.startsWith("zh")) {
-    return "zh-CN";
+  if (language.startsWith("vi")) {
+    return "vi-VN";
   }
   return "en-US";
 }
@@ -343,6 +340,11 @@ function formatISOTime(date: Date): string {
   return `${padTwo(date.getHours())}:${padTwo(date.getMinutes())}:${padTwo(date.getSeconds())}`;
 }
 
+export function formatDateOnly(iso: string | null | undefined): string {
+  const date = parseDate(iso);
+  return date ? getDateFormatter().format(date) : "--";
+}
+
 function padTwo(value: number): string {
   return String(value).padStart(2, "0");
 }
@@ -437,6 +439,11 @@ export type SingleUnitRemaining = {
   label: string;
   expiringSoon: boolean;
 };
+
+export function isExpiredDateTime(iso: string | null | undefined): boolean {
+  const date = parseDate(iso);
+  return date !== null && date.getTime() <= Date.now();
+}
 
 export function formatSingleUnitRemaining(expiresAtIso: string): SingleUnitRemaining {
   const ms = new Date(expiresAtIso).getTime() - Date.now();

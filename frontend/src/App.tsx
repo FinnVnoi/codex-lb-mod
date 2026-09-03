@@ -31,6 +31,9 @@ const ApisPage = lazy(() => import("@/features/apis/components/apis-page").then(
 const SettingsPage = lazy(() =>
   import("@/features/settings/components/settings-page").then((m) => ({ default: m.SettingsPage })),
 );
+const ModelSourcesPage = lazy(() =>
+  import("@/features/model-sources/components/model-sources-page").then((m) => ({ default: m.ModelSourcesPage })),
+);
 
 function AppLayout() {
   const logout = useAuthStore((state) => state.logout);
@@ -79,6 +82,7 @@ export default function App() {
             <Route path="/reports" element={<ReportsPage />} />
             <Route path="/accounts" element={<AccountsPage />} />
             <Route path="/automations" element={<AutomationsPage />} />
+            <Route path="/providers" element={<ModelSourcesPage />} />
             <Route path="/apis" element={<ApisPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="/firewall" element={<Navigate to="/settings?advanced=1#firewall" replace />} />

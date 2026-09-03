@@ -29,11 +29,13 @@ const LIMIT_TYPE_LABELS: Record<LimitType, string> = {
 };
 
 const WINDOW_LABELS: Record<LimitWindowType, string> = {
+  "1h": "1 hour",
   daily: "Daily",
   weekly: "Weekly",
   monthly: "Monthly",
   "5h": "5h",
   "7d": "7d",
+  lifetime: "Lifetime",
 };
 
 const LIMIT_TYPE_SET: ReadonlySet<string> = new Set(LIMIT_TYPES);

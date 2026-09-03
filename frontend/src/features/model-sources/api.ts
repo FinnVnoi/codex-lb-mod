@@ -2,6 +2,8 @@ import { del, get, patch, post } from "@/lib/api-client";
 
 import {
   ModelSourceCreateRequestSchema,
+  ModelSourceProbeRequestSchema,
+  ModelSourceProbeResponseSchema,
   ModelSourceSchema,
   ModelSourcesResponseSchema,
   ModelSourceUpdateRequestSchema,
@@ -25,6 +27,11 @@ export function updateModelSource(sourceId: string, payload: unknown) {
   return patch(`${MODEL_SOURCES_PATH}/${encodeURIComponent(sourceId)}`, ModelSourceSchema, {
     body: validated,
   });
+}
+
+export function probeModelSource(payload: unknown) {
+  const validated = ModelSourceProbeRequestSchema.parse(payload);
+  return post(`${MODEL_SOURCES_PATH}/probe`, ModelSourceProbeResponseSchema, { body: validated });
 }
 
 export function deleteModelSource(sourceId: string) {

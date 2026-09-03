@@ -340,6 +340,11 @@ class AuthManager:
         return value
 
     async def refresh_account(self, account: Account) -> Account:
+        # CPA exports may omit refresh_token. Keep the account usable with its
+        # current access token and avoid entering the cross-replica claim path
+        # for an exchange that cannot succeed.
+        if not self._encryptor.decrypt(account.refresh_token_encrypted):
+            return account
         claims = self._refresh_claims if self._refresh_claims is not None else get_refresh_claim_coordinator()
         if claims is None:
             return await self._perform_refresh(account, refresh_token_encrypted=account.refresh_token_encrypted)

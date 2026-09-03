@@ -9,6 +9,8 @@ import { Switch } from "@/components/ui/switch";
 import { ModelSourceCreateDialog } from "@/features/model-sources/components/model-source-create-dialog";
 import { ModelSourceEditDialog } from "@/features/model-sources/components/model-source-edit-dialog";
 import { useModelSources } from "@/features/model-sources/hooks/use-model-sources";
+import { globalApiRoutingOverrideLabel, providerFailurePolicyLabel } from "@/features/settings/routing-policy-labels";
+import type { DashboardSettings } from "@/features/settings/schemas";
 import type {
   ModelSource,
   ModelSourceCreateRequest,
@@ -17,19 +19,22 @@ import type {
 import { useDialogState } from "@/hooks/use-dialog-state";
 import { getErrorMessageOrNull } from "@/utils/errors";
 
-function modelPriceLabel(source: ModelSource): string | null {
-  const priced = source.models.find(
-    (model) => model.inputPer1M !== null || model.outputPer1M !== null,
-  );
-  if (!priced) return null;
-  const input = priced.inputPer1M ?? 0;
-  const output = priced.outputPer1M ?? 0;
-  return `$${input}/$${output} per 1M`;
+function modelPriceLabel(model: ModelSource["models"][number]): string | null {
+  if (model.inputPer1M === null && model.outputPer1M === null) return null;
+  return `$${model.inputPer1M ?? 0}/$${model.outputPer1M ?? 0} per 1M`;
 }
 
 export type ModelSourcesSettingsProps = {
   disabled?: boolean;
+  settings?: DashboardSettings | null;
 };
+
+function routingPolicyTone(policy: ModelSource["routingPolicy"]): "default" | "secondary" | "outline" | "destructive" {
+  if (policy === "burn_first") return "default";
+  if (policy === "fallback_only") return "destructive";
+  if (policy === "preserve") return "outline";
+  return "secondary";
+}
 
 function protocolBadges(source: ModelSource) {
   return [
@@ -40,7 +45,7 @@ function protocolBadges(source: ModelSource) {
   ].filter((value): value is string => value !== null);
 }
 
-export function ModelSourcesSettings({ disabled = false }: ModelSourcesSettingsProps) {
+export function ModelSourcesSettings({ disabled = false, settings = null }: ModelSourcesSettingsProps) {
   const { t } = useTranslation();
   const {
     modelSourcesQuery,
@@ -106,31 +111,56 @@ export function ModelSourcesSettings({ disabled = false }: ModelSourcesSettingsP
                 <div className="min-w-0 space-y-1">
                   <div className="flex flex-wrap items-center gap-2">
                     <span className="font-medium">{source.name}</span>
-                    <Badge variant={source.isEnabled ? "default" : "secondary"}>
-	                      {source.isEnabled ? t("common.states.enabled") : t("common.states.disabled")}
+                    <Badge variant={!source.isEnabled || source.pausedAt ? "secondary" : "default"}>
+                      {!source.isEnabled
+                        ? t("common.states.disabled")
+                        : source.pausedAt
+                          ? t("common.states.paused")
+                          : t("common.states.enabled")}
                     </Badge>
+                    {source.pausedAt ? (
+                      <Badge variant="outline">
+                        {t("modelSources.autoPaused", { reason: source.pauseReason ?? "unknown" })}
+                      </Badge>
+                    ) : null}
                     {protocolBadges(source).map((protocol) => (
                       <Badge key={protocol} variant="secondary">
                         {protocol}
                       </Badge>
                     ))}
+                    <Badge variant={routingPolicyTone(source.routingPolicy)}>
+                      {t(
+                        `common.routingPolicies.${
+                          source.routingPolicy === "burn_first"
+                            ? "burnFirst"
+                            : source.routingPolicy === "fallback_only"
+                              ? "fallbackOnly"
+                              : source.routingPolicy
+                        }`,
+                      )}
+                    </Badge>
                   </div>
                   <div className="truncate text-xs text-muted-foreground">{source.baseUrl}</div>
                   <div className="flex flex-wrap items-center gap-1 pt-1">
-                    {source.models.map((model) => (
-                      <Badge key={model.id} variant={model.isEnabled ? "outline" : "secondary"}>
-                        {model.model}
-                      </Badge>
-                    ))}
-                    {modelPriceLabel(source) ? (
-                      <Badge variant="secondary">{modelPriceLabel(source)}</Badge>
-                    ) : null}
+                    {source.models.map((model) => {
+                      const price = modelPriceLabel(model);
+                      return (
+                        <div key={model.id} className="flex items-center gap-1">
+                          <Badge variant={model.isEnabled ? "outline" : "secondary"}>
+                            {model.upstreamModel && model.upstreamModel !== model.model
+                              ? `${model.model} → ${model.upstreamModel}`
+                              : model.model}
+                          </Badge>
+                          {price ? <Badge variant="secondary">{price}</Badge> : null}
+                        </div>
+                      );
+                    })}
                   </div>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
                   <Switch
 	                    aria-label={t("modelSources.actions.toggleAria", { name: source.name })}
-                    checked={source.isEnabled}
+                    checked={source.isEnabled && !source.pausedAt}
                     disabled={busy}
                     onCheckedChange={(checked) =>
                       void updateMutation.mutateAsync({
@@ -169,6 +199,16 @@ export function ModelSourcesSettings({ disabled = false }: ModelSourcesSettingsP
           </div>
         )}
       </div>
+
+      {settings ? (
+        <div className="rounded-lg border bg-muted/20 p-3 text-xs text-muted-foreground">
+          {t("modelSources.routingSummary", {
+            global: globalApiRoutingOverrideLabel(t, settings.globalApiRoutingOverride),
+            provider: providerFailurePolicyLabel(t, settings.providerFailurePolicy),
+            count: settings.providerMaxAttempts,
+          })}
+        </div>
+      ) : null}
 
       <ModelSourceCreateDialog
         open={createDialog.open}

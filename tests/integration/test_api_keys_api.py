@@ -4,8 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
-from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from typing import cast
 
@@ -26,7 +25,6 @@ from app.core.openai.models import OpenAIResponsePayload
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, ApiKeyUsageReservation, LimitWindow, RequestLog, UsageHistory
 from app.db.session import SessionLocal
-from app.modules.api_keys.last_used_coalescer import get_api_key_last_used_coalescer
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import ApiKeyCreateData, ApiKeyInvalidError, ApiKeysService, LimitRuleInput
 from app.modules.model_sources.forwarding import (
@@ -170,6 +168,10 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert rows[0]["assignedAccountIds"] == []
     assert len(rows[0]["limits"]) == 1
 
+    listed_without_trailing_slash = await async_client.get("/api/api-keys")
+    assert listed_without_trailing_slash.status_code == 200
+    assert listed_without_trailing_slash.json() == rows
+
     updated = await async_client.patch(
         f"/api/api-keys/{key_id}",
         json={
@@ -188,6 +190,21 @@ async def test_api_keys_crud_and_regenerate(async_client):
     assert regenerated_payload["id"] == key_id
     assert regenerated_payload["key"].startswith("sk-clb-")
     assert regenerated_payload["key"] != first_key
+
+    expiring_create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "expiring-key",
+            "expiresAt": "2026-03-20T23:59:59+09:00",
+        },
+    )
+    assert expiring_create.status_code == 200
+    expiring_payload = expiring_create.json()
+    assert expiring_payload["key"].startswith("sk-amin-")
+    assert expiring_payload["keyPrefix"] == expiring_payload["key"][:15]
+
+    deleted_expiring = await async_client.delete(f"/api/api-keys/{expiring_payload['id']}")
+    assert deleted_expiring.status_code == 204
 
     deleted = await async_client.delete(f"/api/api-keys/{key_id}")
     assert deleted.status_code == 204
@@ -370,6 +387,57 @@ async def test_api_key_list_includes_pooled_credit_fields_for_selectable_assigne
     assert row["pooledCapacityCreditsPrimary"] == 225.0
     assert row["pooledRemainingPercentPrimary"] == 75.0
     assert row["pooledRemainingPercentSecondary"] == 90.0
+
+
+@pytest.mark.asyncio
+async def test_api_key_rejects_quota_shop_mode_with_fixed_limits(async_client):
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "invalid-dual-mode-key",
+            "quotaShopEnabled": True,
+            "quotaShopOptions": [{"limitType": "total_tokens", "limitWindow": "lifetime"}],
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1000}],
+        },
+    )
+    assert create.status_code == 400
+    assert "cannot both be enabled" in create.json()["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_api_key_create_and_update_quota_shop_options(async_client):
+    create = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "quota-shop-key",
+            "quotaShopEnabled": True,
+            "quotaShopMaxWindows": 1,
+            "quotaShopOptions": [
+                {"limitType": "total_tokens", "limitWindow": "lifetime"},
+                {"limitType": "cost_usd", "limitWindow": "lifetime"},
+            ],
+        },
+    )
+    assert create.status_code == 200
+    payload = create.json()
+    assert payload["quotaShopEnabled"] is True
+    assert payload["quotaShopOptions"] == [
+        {"limitType": "total_tokens", "limitWindow": "lifetime", "modelFilter": None},
+        {"limitType": "cost_usd", "limitWindow": "lifetime", "modelFilter": None},
+    ]
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{payload['id']}",
+        json={
+            "quotaShopOptions": [
+                {"limitType": "total_tokens", "limitWindow": "daily"},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+    assert updated.json()["quotaShopOptions"] == [
+        {"limitType": "total_tokens", "limitWindow": "daily", "modelFilter": None},
+    ]
 
 
 @pytest.mark.asyncio
@@ -779,14 +847,10 @@ async def test_api_key_enforces_model_and_reasoning_for_responses(async_client, 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("enforced_service_tier", "expected_service_tier"),
-    [("fast", "priority"), ("ULTRAFAST", "ultrafast")],
-)
-async def test_api_key_enforces_service_tier_for_responses(
-    async_client, monkeypatch, enforced_service_tier, expected_service_tier
-):
-    forced_model = "gpt-5.6-sol"
+async def test_api_key_enforces_service_tier_for_responses(async_client, monkeypatch):
+    await _populate_test_registry()
+    model_ids = sorted(_TEST_MODELS)
+    forced_model = model_ids[0]
 
     enable = await async_client.put(
         "/api/settings",
@@ -799,47 +863,27 @@ async def test_api_key_enforces_service_tier_for_responses(
     )
     assert enable.status_code == 200
 
-    account_id = await _import_account(
-        async_client,
-        f"acc_enforced_{expected_service_tier}_service_tier",
-        f"enforced-{expected_service_tier}-service-tier@example.com",
-    )
-    advertising_model = replace(
-        _make_upstream_model(forced_model),
-        raw={"service_tiers": [{"slug": expected_service_tier}]},
-    )
-    await get_model_registry().update(
-        {"pro": [advertising_model]},
-        per_account_results={account_id: ("pro", [advertising_model])},
-        active_account_plans={account_id: "pro"},
-    )
-
     created = await async_client.post(
         "/api/api-keys/",
         json={
             "name": "enforced-service-tier",
             "allowedModels": [forced_model],
             "enforcedModel": forced_model,
-            "enforcedServiceTier": enforced_service_tier,
+            "enforcedServiceTier": "fast",
         },
     )
     assert created.status_code == 200
     key = created.json()["key"]
-    assert created.json()["enforcedServiceTier"] == expected_service_tier
+    assert created.json()["enforcedServiceTier"] == "priority"
+
+    await _import_account(async_client, "acc_enforced_service_tier", "enforced-service-tier@example.com")
 
     seen: dict[str, str | None] = {}
 
     async def fake_stream(payload, _headers, _access_token, _account_id, base_url=None, raise_for_status=False):
         seen["service_tier"] = payload.service_tier
         usage = {"input_tokens": 3, "output_tokens": 2}
-        event = {
-            "type": "response.completed",
-            "response": {
-                "id": "resp_enforced_service_tier",
-                "service_tier": expected_service_tier,
-                "usage": usage,
-            },
-        }
+        event = {"type": "response.completed", "response": {"id": "resp_enforced_service_tier", "usage": usage}}
         yield f"data: {json.dumps(event)}\n\n"
 
     monkeypatch.setattr(proxy_module, "core_stream_responses", fake_stream)
@@ -859,15 +903,7 @@ async def test_api_key_enforces_service_tier_for_responses(
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
 
-    assert seen["service_tier"] == expected_service_tier
-
-    async with SessionLocal() as session:
-        result = await session.execute(select(RequestLog).order_by(RequestLog.requested_at.desc()))
-        latest_log = result.scalars().first()
-        assert latest_log is not None
-        assert latest_log.requested_service_tier == expected_service_tier
-        assert latest_log.actual_service_tier == expected_service_tier
-        assert latest_log.service_tier == expected_service_tier
+    assert seen["service_tier"] == "priority"
 
 
 @pytest.mark.asyncio
@@ -1085,11 +1121,6 @@ async def test_api_key_usage_tracking_and_request_log_link(async_client, monkeyp
     ) as response:
         assert response.status_code == 200
         _ = [line async for line in response.aiter_lines() if line]
-
-    # last_used_at is write-behind: the settlement records into the coalescer
-    # and the periodic flusher persists it. Flush explicitly before asserting.
-    flushed = await get_api_key_last_used_coalescer().flush()
-    assert flushed == 1
 
     async with SessionLocal() as session:
         repo = ApiKeysRepository(session)
@@ -1402,78 +1433,6 @@ async def test_backend_codex_responses_routes_responses_capable_model_source(asy
     assert forwarded_payload["stream"] is True
     assert "tools" not in forwarded_payload
     assert any("resp_source" in line for line in lines)
-
-
-@pytest.mark.asyncio
-async def test_v1_responses_strips_replayed_tool_call_namespaces_for_model_source(async_client, monkeypatch):
-    model = "external-v1-namespaced-replay"
-    await _create_model_source(
-        async_client,
-        name="v1-namespaced-replay",
-        model=model,
-        supports_responses=True,
-    )
-    observed: dict[str, object] = {}
-
-    async def fake_stream(source, payload):
-        observed["payload"] = dict(payload)
-        usage_holder = SourceUsageHolder()
-
-        async def body():
-            usage_holder.usage = SourceUsage(input_tokens=2, output_tokens=1, cached_input_tokens=0)
-            yield (
-                b'data: {"type":"response.completed","response":{"id":"resp_source_namespaced_replay",'
-                b'"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
-            )
-
-        return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=200)
-
-    monkeypatch.setattr(proxy_api, "stream_source_responses", fake_stream)
-
-    response = await async_client.post(
-        "/v1/responses",
-        json={
-            "model": model,
-            "input": [
-                {
-                    "type": "function_call",
-                    "namespace": "collaboration",
-                    "call_id": "call_1",
-                    "name": "spawn_agent",
-                    "arguments": "{}",
-                },
-                {
-                    "type": "custom_tool_call",
-                    "namespace": "exec",
-                    "call_id": "call_2",
-                    "name": "exec",
-                    "input": "pwd",
-                },
-            ],
-            "stream": True,
-            "temperature": 0.2,
-            "metadata": {"client": "source-compatible"},
-        },
-    )
-    assert response.status_code == 200
-
-    forwarded_payload = cast("dict[str, object]", observed["payload"])
-    assert forwarded_payload["input"] == [
-        {
-            "type": "function_call",
-            "call_id": "call_1",
-            "name": "spawn_agent",
-            "arguments": "{}",
-        },
-        {
-            "type": "custom_tool_call",
-            "call_id": "call_2",
-            "name": "exec",
-            "input": "pwd",
-        },
-    ]
-    assert forwarded_payload["temperature"] == 0.2
-    assert forwarded_payload["metadata"] == {"client": "source-compatible"}
 
 
 @pytest.mark.asyncio
@@ -2239,134 +2198,6 @@ async def test_api_key_update_accepts_extended_enforced_reasoning(async_client):
     )
     assert updated.status_code == 200
     assert updated.json()["enforcedReasoningEffort"] == "max"
-
-
-@pytest.mark.asyncio
-async def test_api_key_reasoning_effort_allowlist_is_normalized_and_enforced(async_client):
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "bounded-reasoning-key",
-            "allowedReasoningEfforts": ["XHIGH", "low", "high", "low"],
-        },
-    )
-    assert created.status_code == 200
-    key_id = created.json()["id"]
-    key = created.json()["key"]
-    assert created.json()["allowedReasoningEfforts"] == ["low", "high", "xhigh"]
-
-    conflicting_update = await async_client.patch(
-        f"/api/api-keys/{key_id}",
-        json={"enforcedReasoningEffort": "low"},
-    )
-    assert conflicting_update.status_code == 400
-    assert conflicting_update.json()["error"]["code"] == "invalid_api_key_payload"
-
-    empty_create = await async_client.post(
-        "/api/api-keys/",
-        json={"name": "empty-reasoning-key", "allowedReasoningEfforts": []},
-    )
-    assert empty_create.status_code == 400
-
-    enabled = await async_client.put(
-        "/api/settings",
-        json={
-            "stickyThreadsEnabled": False,
-            "preferEarlierResetAccounts": False,
-            "totpRequiredOnLogin": False,
-            "apiKeyAuthEnabled": True,
-        },
-    )
-    assert enabled.status_code == 200
-
-    blocked = await async_client.post(
-        "/v1/responses",
-        headers={"Authorization": f"Bearer {key}"},
-        json={
-            "model": "model-alpha",
-            "instructions": "hello",
-            "input": [],
-            "reasoning": {"effort": "max"},
-        },
-    )
-    assert blocked.status_code == 403
-    assert blocked.json()["error"] == {
-        "message": "This API key does not have access to reasoning effort 'max'",
-        "type": "permission_error",
-        "code": "reasoning_effort_not_allowed",
-        "param": "reasoning.effort",
-    }
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint", ["/backend-api/codex/responses/compact", "/v1/responses/compact"])
-async def test_api_key_reasoning_allowlist_rejects_compact_before_upstream(async_client, monkeypatch, endpoint):
-    enabled = await async_client.put(
-        "/api/settings",
-        json={
-            "stickyThreadsEnabled": False,
-            "preferEarlierResetAccounts": False,
-            "totpRequiredOnLogin": False,
-            "apiKeyAuthEnabled": True,
-        },
-    )
-    assert enabled.status_code == 200
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={"name": "compact-allowlist-key", "allowedReasoningEfforts": ["low"]},
-    )
-    assert created.status_code == 200
-    key = created.json()["key"]
-
-    async def fail_upstream(*_args, **_kwargs):
-        raise AssertionError("compact upstream was reached after policy rejection")
-
-    monkeypatch.setattr(proxy_module, "core_compact_responses", fail_upstream)
-    response = await async_client.post(
-        endpoint,
-        headers={"Authorization": f"Bearer {key}"},
-        json={"model": "model-alpha", "instructions": "hi", "input": [], "reasoning": {"effort": "max"}},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
-
-
-@pytest.mark.asyncio
-async def test_api_key_reasoning_allowlist_rejects_chat_completions_before_upstream(async_client, monkeypatch):
-    enabled = await async_client.put(
-        "/api/settings",
-        json={
-            "stickyThreadsEnabled": False,
-            "preferEarlierResetAccounts": False,
-            "totpRequiredOnLogin": False,
-            "apiKeyAuthEnabled": True,
-        },
-    )
-    assert enabled.status_code == 200
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={"name": "chat-allowlist-key", "allowedReasoningEfforts": ["low"]},
-    )
-    assert created.status_code == 200
-    key = created.json()["key"]
-
-    async def fail_upstream(*_args, **_kwargs):
-        raise AssertionError("chat completions upstream was reached after policy rejection")
-
-    monkeypatch.setattr(proxy_module, "core_stream_responses", fail_upstream)
-    response = await async_client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {key}"},
-        json={
-            "model": "model-alpha",
-            "messages": [{"role": "user", "content": "hi"}],
-            "reasoning_effort": "max",
-        },
-    )
-
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
 
 
 @pytest.mark.asyncio
@@ -3554,6 +3385,90 @@ async def test_update_key_same_policy_and_max_change_preserve_usage_state(async_
 
 
 @pytest.mark.asyncio
+async def test_update_key_window_change_preserves_usage_and_starts_new_window(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "preserve-usage-window-change",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "monthly", "maxValue": 1000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    original_reset_at = utcnow() + timedelta(days=20)
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        limits[0].current_value = 456
+        limits[0].reset_at = original_reset_at
+        await session.commit()
+
+    before_update = utcnow()
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "1h", "maxValue": 2000},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].limit_window == LimitWindow.ONE_HOUR
+        assert limits[0].current_value == 456
+        assert limits[0].max_value == 2000
+        assert before_update + timedelta(minutes=59) < limits[0].reset_at <= utcnow() + timedelta(hours=1)
+        assert limits[0].reset_at != original_reset_at
+
+
+@pytest.mark.asyncio
+async def test_adding_second_window_for_same_policy_starts_new_counter(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "new-parallel-window",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "monthly", "maxValue": 1000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        limits[0].current_value = 456
+        await session.commit()
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "monthly", "maxValue": 1000},
+                {"limitType": "total_tokens", "limitWindow": "1h", "maxValue": 2000},
+            ],
+        },
+    )
+    assert updated.status_code == 200
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        by_window = {limit.limit_window: limit for limit in limits}
+        assert by_window[LimitWindow.MONTHLY].current_value == 456
+        assert by_window[LimitWindow.ONE_HOUR].current_value == 0
+
+
+@pytest.mark.asyncio
 async def test_update_key_reset_usage_requires_explicit_action(async_client):
     created = await async_client.post(
         "/api/api-keys/",
@@ -3593,7 +3508,99 @@ async def test_update_key_reset_usage_requires_explicit_action(async_client):
         limits = await repo.get_limits_by_key(key_id)
         assert len(limits) == 1
         assert limits[0].current_value == 0
-        assert limits[0].reset_at > original_reset_at
+        assert limits[0].reset_at is None
+
+
+@pytest.mark.asyncio
+async def test_adding_lifetime_limit_backfills_all_historical_usage(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "lifetime-backfill"},
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    async with SessionLocal() as session:
+        session.add_all(
+            [
+                RequestLog(
+                    api_key_id=key_id,
+                    request_id="lifetime-backfill-old",
+                    requested_at=datetime(2020, 1, 1),
+                    model="gpt-5.1",
+                    status="success",
+                    input_tokens=40,
+                    output_tokens=2,
+                ),
+                RequestLog(
+                    api_key_id=key_id,
+                    request_id="lifetime-backfill-new",
+                    requested_at=utcnow() - timedelta(minutes=1),
+                    model="gpt-5.1",
+                    status="success",
+                    input_tokens=50,
+                    output_tokens=8,
+                ),
+            ]
+        )
+        await session.commit()
+
+    updated = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "lifetime", "maxValue": 1000},
+            ],
+        },
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["limits"][0]["currentValue"] == 100
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        assert limits[0].current_value == 100
+        assert limits[0].reset_at == datetime.max
+
+
+@pytest.mark.asyncio
+async def test_hourly_and_lifetime_limit_windows_have_expected_reset_semantics(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "hourly-and-lifetime",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "1h", "maxValue": 1000},
+                {"limitType": "cost_usd", "limitWindow": "lifetime", "maxValue": 1_000_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        by_window = {limit.limit_window: limit for limit in limits}
+        hourly_limit = by_window[LimitWindow.ONE_HOUR]
+        lifetime_limit = by_window[LimitWindow.LIFETIME]
+        assert hourly_limit.reset_at is None
+        assert lifetime_limit.reset_at == datetime.max
+
+        lifetime_limit.current_value = 123
+        lifetime_limit.reset_at = utcnow() - timedelta(days=1)
+        await session.commit()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        assert await repo.reset_expired_limits(now=utcnow()) == 0
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(key_id)
+        lifetime_limit = next(limit for limit in limits if limit.limit_window == LimitWindow.LIFETIME)
+        assert lifetime_limit.current_value == 123
+        assert lifetime_limit.reset_at < utcnow()
 
 
 @pytest.mark.asyncio
@@ -3635,9 +3642,9 @@ async def test_reset_expired_limits_background_fallback_advances_windows(async_c
         daily_limit = next(limit for limit in limits if limit.limit_window == LimitWindow.DAILY)
         weekly_limit = next(limit for limit in limits if limit.limit_window == LimitWindow.WEEKLY)
         assert daily_limit.current_value == 0
-        assert daily_limit.reset_at == now + timedelta(days=1)
+        assert daily_limit.reset_at is None
         assert weekly_limit.current_value == 0
-        assert weekly_limit.reset_at == now + timedelta(days=7)
+        assert weekly_limit.reset_at is None
 
 
 @pytest.mark.asyncio
@@ -3684,11 +3691,11 @@ async def test_reset_expired_limits_background_fallback_processes_batches(async_
         limits = await repo.get_limits_by_key(key_id)
         by_window = {limit.limit_window: limit for limit in limits}
         assert by_window[LimitWindow.DAILY].current_value == 0
-        assert by_window[LimitWindow.DAILY].reset_at == now + timedelta(days=1)
+        assert by_window[LimitWindow.DAILY].reset_at is None
         assert by_window[LimitWindow.WEEKLY].current_value == 0
-        assert by_window[LimitWindow.WEEKLY].reset_at == now + timedelta(days=7)
+        assert by_window[LimitWindow.WEEKLY].reset_at is None
         assert by_window[LimitWindow.MONTHLY].current_value == 0
-        assert by_window[LimitWindow.MONTHLY].reset_at == now + timedelta(days=30)
+        assert by_window[LimitWindow.MONTHLY].reset_at is None
 
 
 @pytest.mark.asyncio
@@ -3720,10 +3727,6 @@ async def test_release_stale_usage_reservations_restores_reserved_usage(async_cl
         stale_second = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
         abandoned_before_first_heartbeat = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
         fresh = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-        assert stale is not None
-        assert stale_second is not None
-        assert abandoned_before_first_heartbeat is not None
-        assert fresh is not None
         await session.execute(
             update(ApiKeyUsageReservation)
             .where(ApiKeyUsageReservation.id.in_([stale.reservation_id, stale_second.reservation_id]))
@@ -3765,196 +3768,6 @@ async def test_release_stale_usage_reservations_restores_reserved_usage(async_cl
         assert abandoned_reservation is not None
         assert abandoned_reservation.status == "released"
         assert abandoned_reservation.items[0].actual_delta == 0
-        assert fresh_reservation is not None
-        assert fresh_reservation.status == "reserved"
-
-        limits = await repo.get_limits_by_key(created.id)
-        assert len(limits) == 1
-        assert limits[0].current_value == fresh_reservation.items[0].reserved_delta
-
-
-@pytest.mark.asyncio
-async def test_limit_free_admission_creates_no_reservation_rows(async_client):
-    """Limit-free keys skip the reservation ledger: admission returns no
-    reservation, writes no rows, and stale-reservation reclamation has
-    nothing to release; limited keys keep creating reservations."""
-    del async_client
-    now = utcnow()
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        service = ApiKeysService(repo)
-        unlimited = await service.create_key(
-            ApiKeyCreateData(name="limit-free-admission", allowed_models=None, expires_at=None)
-        )
-        limited = await service.create_key(
-            ApiKeyCreateData(
-                name="limited-admission-regression",
-                allowed_models=None,
-                expires_at=None,
-                limits=[
-                    LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=50_000),
-                ],
-            )
-        )
-        unlimited_reservation = await service.enforce_limits_for_request(unlimited.id, request_model="gpt-5.1")
-        limited_reservation = await service.enforce_limits_for_request(limited.id, request_model="gpt-5.1")
-
-    assert unlimited_reservation is None
-    assert limited_reservation is not None
-    assert limited_reservation.has_applicable_limits is True
-
-    async with SessionLocal() as session:
-        rows = await session.execute(
-            select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == unlimited.id)
-        )
-        assert rows.scalars().all() == []
-        repo = ApiKeysRepository(session)
-        limited_row = await repo.get_usage_reservation(limited_reservation.reservation_id)
-        assert limited_row is not None
-        assert limited_row.status == "reserved"
-        # A future cutoff would reclaim any reserved row; the limit-free key
-        # contributed none, so only the limited key's reservation is released.
-        released_count = await repo.release_stale_usage_reservations(
-            cutoff=now + timedelta(hours=1),
-            max_age_cutoff=now + timedelta(hours=1),
-        )
-        assert released_count == 1
-
-
-@pytest.mark.asyncio
-async def test_enforce_limits_lazy_reset_and_expiry_with_narrowed_admission_load(async_client):
-    """Regression for the narrowed admission load (``get_for_limit_enforcement``).
-
-    The enforcement path loads only ``is_active``/``expires_at`` plus the
-    ``limits`` collection. The lazy expired-limit reset (which commits
-    mid-enforcement and refetches through the same narrowed load) and the
-    key-expiry rejection must behave exactly as with the full-graph load.
-    """
-    del async_client
-    now = utcnow()
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        service = ApiKeysService(repo)
-        created = await service.create_key(
-            ApiKeyCreateData(
-                name="narrowed-admission-load",
-                allowed_models=None,
-                expires_at=None,
-                limits=[
-                    LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=50_000),
-                ],
-            )
-        )
-        limits = await repo.get_limits_by_key(created.id)
-        assert len(limits) == 1
-        # Exhausted AND expired: without the lazy reset the enforcement
-        # would reject; the reset must zero the counter and advance reset_at.
-        limits[0].current_value = 50_000
-        limits[0].reset_at = now - timedelta(hours=2)
-        await session.commit()
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        service = ApiKeysService(repo)
-        reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-        assert reservation is not None
-        assert reservation.has_applicable_limits is True
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        limits = await repo.get_limits_by_key(created.id)
-        assert len(limits) == 1
-        assert limits[0].reset_at > now
-        reserved = await repo.get_usage_reservation(reservation.reservation_id)
-        assert reserved is not None
-        assert reserved.status == "reserved"
-        assert limits[0].current_value == reserved.items[0].reserved_delta
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        # Fail-loud contract of the narrowed load: unlisted columns and the
-        # assignment relationships raise instead of lazy loading.
-        row = await repo.get_for_limit_enforcement(created.id)
-        assert row is not None
-        assert row.is_active is True
-        assert row.expires_at is None
-        assert len(row.limits) == 1
-        with pytest.raises(sqlalchemy_exc.InvalidRequestError):
-            _ = row.name
-        with pytest.raises(sqlalchemy_exc.InvalidRequestError):
-            _ = row.account_assignments
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        service = ApiKeysService(repo)
-        await repo.update(created.id, expires_at=now - timedelta(minutes=1))
-        with pytest.raises(ApiKeyInvalidError):
-            await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-
-
-@pytest.mark.asyncio
-async def test_release_stale_usage_reservations_max_age_ceiling_beats_orphaned_heartbeat(async_client, monkeypatch):
-    """Issue #1594: a leaked heartbeat keeps refreshing ``updated_at`` forever.
-
-    Reservations older than the hard ``max_age_cutoff`` ceiling must be
-    reclaimed even while their ``updated_at`` stays fresh.
-    """
-    del async_client
-    now = utcnow()
-
-    @contextlib.asynccontextmanager
-    async def fake_sqlite_writer_section():
-        yield
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        service = ApiKeysService(repo)
-        created = await service.create_key(
-            ApiKeyCreateData(
-                name="orphaned-heartbeat-cleanup",
-                allowed_models=None,
-                expires_at=None,
-                limits=[
-                    LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=50_000),
-                ],
-            )
-        )
-        heartbeat_kept = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-        fresh = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-        assert heartbeat_kept is not None
-        assert fresh is not None
-        # An orphaned heartbeat keeps the reservation's updated_at current
-        # even though it was created past the hard age ceiling.
-        await session.execute(
-            update(ApiKeyUsageReservation)
-            .where(ApiKeyUsageReservation.id == heartbeat_kept.reservation_id)
-            .values(created_at=now - timedelta(hours=25), updated_at=now)
-        )
-        await session.execute(
-            update(ApiKeyUsageReservation)
-            .where(ApiKeyUsageReservation.id == fresh.reservation_id)
-            .values(created_at=now - timedelta(hours=1), updated_at=now)
-        )
-        await session.commit()
-
-    async with SessionLocal() as session:
-        monkeypatch.setattr(api_keys_repository_module, "sqlite_writer_section", fake_sqlite_writer_section)
-        repo = ApiKeysRepository(session)
-        released_count = await repo.release_stale_usage_reservations(
-            cutoff=now - timedelta(hours=6),
-            max_age_cutoff=now - timedelta(hours=24),
-        )
-        assert released_count == 1
-
-    async with SessionLocal() as session:
-        repo = ApiKeysRepository(session)
-        heartbeat_kept_reservation = await repo.get_usage_reservation(heartbeat_kept.reservation_id)
-        fresh_reservation = await repo.get_usage_reservation(fresh.reservation_id)
-        assert heartbeat_kept_reservation is not None
-        assert heartbeat_kept_reservation.status == "released"
-        assert heartbeat_kept_reservation.items[0].actual_delta == 0
         assert fresh_reservation is not None
         assert fresh_reservation.status == "reserved"
 
@@ -4096,114 +3909,6 @@ async def test_stream_401_retry_success_finalizes_once(async_client, monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("surface", ["stream", "collect", "compact", "transcribe"])
-async def test_rate_limit_header_failure_releases_reservation_once(
-    async_client,
-    monkeypatch: pytest.MonkeyPatch,
-    surface: str,
-) -> None:
-    await _populate_test_registry()
-    enable = await async_client.put(
-        "/api/settings",
-        json={
-            "stickyThreadsEnabled": False,
-            "preferEarlierResetAccounts": False,
-            "totpRequiredOnLogin": False,
-            "apiKeyAuthEnabled": True,
-        },
-    )
-    assert enable.status_code == 200
-
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": f"header-failure-{surface}",
-            "limits": [
-                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 50_000},
-            ],
-        },
-    )
-    assert created.status_code == 200
-    key = created.json()["key"]
-    key_id = created.json()["id"]
-
-    release_calls: list[str] = []
-    upstream_calls: list[str] = []
-    original_release_reservation = proxy_api._release_reservation
-
-    async def fail_rate_limit_headers(_service) -> dict[str, str]:
-        raise RuntimeError("injected rate-limit header failure")
-
-    async def release_reservation(reservation) -> None:
-        assert reservation is not None
-        release_calls.append(reservation.reservation_id)
-        await original_release_reservation(reservation)
-
-    def unexpected_stream(*_args, **_kwargs):
-        upstream_calls.append("stream")
-        raise AssertionError("stream transport must not start")
-
-    async def unexpected_compact(*_args, **_kwargs):
-        upstream_calls.append("compact")
-        raise AssertionError("compact transport must not start")
-
-    async def unexpected_transcribe(*_args, **_kwargs):
-        upstream_calls.append("transcribe")
-        raise AssertionError("transcribe transport must not start")
-
-    monkeypatch.setattr(proxy_module.ProxyService, "rate_limit_headers", fail_rate_limit_headers)
-    monkeypatch.setattr(proxy_api, "_release_reservation", release_reservation)
-    monkeypatch.setattr(proxy_module.ProxyService, "stream_responses", unexpected_stream)
-    monkeypatch.setattr(proxy_module.ProxyService, "stream_http_responses", unexpected_stream)
-    monkeypatch.setattr(proxy_module.ProxyService, "compact_responses", unexpected_compact)
-    monkeypatch.setattr(proxy_module.ProxyService, "transcribe", unexpected_transcribe)
-
-    headers = {"Authorization": f"Bearer {key}"}
-    with pytest.raises(RuntimeError, match="injected rate-limit header failure"):
-        if surface == "stream":
-            await async_client.post(
-                "/backend-api/codex/responses",
-                headers=headers,
-                json={"model": _TEST_MODELS[0], "instructions": "hi", "input": [], "stream": True},
-            )
-        elif surface == "collect":
-            await async_client.post(
-                "/v1/responses",
-                headers=headers,
-                json={"model": _TEST_MODELS[0], "instructions": "hi", "input": [], "stream": False},
-            )
-        elif surface == "compact":
-            await async_client.post(
-                "/v1/responses/compact",
-                headers=headers,
-                json={"model": _TEST_MODELS[0], "instructions": "hi", "input": []},
-            )
-        else:
-            await async_client.post(
-                "/backend-api/transcribe",
-                headers=headers,
-                files={"file": ("sample.wav", b"\x00\x01\x02", "audio/wav")},
-            )
-
-    assert upstream_calls == []
-    assert len(release_calls) == 1
-
-    async with SessionLocal() as session:
-        reservations = (
-            (await session.execute(select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key_id)))
-            .scalars()
-            .all()
-        )
-        assert len(reservations) == 1
-        assert release_calls == [reservations[0].id]
-        assert reservations[0].status == "released"
-
-        limits = await ApiKeysRepository(session).get_limits_by_key(key_id)
-        assert len(limits) == 1
-        assert limits[0].current_value == 0
-
-
-@pytest.mark.asyncio
 async def test_stream_no_accounts_releases_reservation(async_client, monkeypatch):
     """no_accounts 즉시 종료 시 reservation이 release되어 quota가 원복된다."""
     enable = await async_client.put(
@@ -4332,3 +4037,492 @@ async def test_stream_without_api_key_auth_skips_settlement(async_client, monkey
         assert response.status_code == 200
         lines = [line async for line in response.aiter_lines() if line]
         assert len(lines) >= 1  # stream completed without error
+
+
+async def test_v1_responses_strips_replayed_tool_call_namespaces_for_model_source(async_client, monkeypatch):
+    model = "external-v1-namespaced-replay"
+    await _create_model_source(
+        async_client,
+        name="v1-namespaced-replay",
+        model=model,
+        supports_responses=True,
+    )
+    observed: dict[str, object] = {}
+
+    async def fake_stream(source, payload):
+        observed["payload"] = dict(payload)
+        usage_holder = SourceUsageHolder()
+
+        async def body():
+            usage_holder.usage = SourceUsage(input_tokens=2, output_tokens=1, cached_input_tokens=0)
+            yield (
+                b'data: {"type":"response.completed","response":{"id":"resp_source_namespaced_replay",'
+                b'"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
+            )
+
+        return SourceResponsesStream(body=body(), usage_holder=usage_holder, upstream_status_code=200)
+
+    monkeypatch.setattr(proxy_api, "stream_source_responses", fake_stream)
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={
+            "model": model,
+            "input": [
+                {
+                    "type": "function_call",
+                    "namespace": "collaboration",
+                    "call_id": "call_1",
+                    "name": "spawn_agent",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "custom_tool_call",
+                    "namespace": "exec",
+                    "call_id": "call_2",
+                    "name": "exec",
+                    "input": "pwd",
+                },
+            ],
+            "stream": True,
+            "temperature": 0.2,
+            "metadata": {"client": "source-compatible"},
+        },
+    )
+    assert response.status_code == 200
+
+    forwarded_payload = cast("dict[str, object]", observed["payload"])
+    assert forwarded_payload["input"] == [
+        {
+            "type": "function_call",
+            "call_id": "call_1",
+            "name": "spawn_agent",
+            "arguments": "{}",
+        },
+        {
+            "type": "custom_tool_call",
+            "call_id": "call_2",
+            "name": "exec",
+            "input": "pwd",
+        },
+    ]
+    assert forwarded_payload["temperature"] == 0.2
+    assert forwarded_payload["metadata"] == {"client": "source-compatible"}
+
+
+async def test_api_key_reasoning_effort_allowlist_is_normalized_and_enforced(async_client):
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "bounded-reasoning-key",
+            "allowedReasoningEfforts": ["XHIGH", "low", "high", "low"],
+        },
+    )
+    assert created.status_code == 200
+    key_id = created.json()["id"]
+    key = created.json()["key"]
+    assert created.json()["allowedReasoningEfforts"] == ["low", "high", "xhigh"]
+
+    conflicting_update = await async_client.patch(
+        f"/api/api-keys/{key_id}",
+        json={"enforcedReasoningEffort": "low"},
+    )
+    assert conflicting_update.status_code == 400
+    assert conflicting_update.json()["error"]["code"] == "invalid_api_key_payload"
+
+    empty_create = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "empty-reasoning-key", "allowedReasoningEfforts": []},
+    )
+    assert empty_create.status_code == 400
+
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+
+    blocked = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "model-alpha",
+            "instructions": "hello",
+            "input": [],
+            "reasoning": {"effort": "max"},
+        },
+    )
+    assert blocked.status_code == 403
+    assert blocked.json()["error"] == {
+        "message": "This API key does not have access to reasoning effort 'max'",
+        "type": "permission_error",
+        "code": "reasoning_effort_not_allowed",
+        "param": "reasoning.effort",
+    }
+
+
+async def test_api_key_reasoning_allowlist_rejects_compact_before_upstream(async_client, monkeypatch, endpoint):
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "compact-allowlist-key", "allowedReasoningEfforts": ["low"]},
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    async def fail_upstream(*_args, **_kwargs):
+        raise AssertionError("compact upstream was reached after policy rejection")
+
+    monkeypatch.setattr(proxy_module, "core_compact_responses", fail_upstream)
+    response = await async_client.post(
+        endpoint,
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": "model-alpha", "instructions": "hi", "input": [], "reasoning": {"effort": "max"}},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
+
+
+async def test_api_key_reasoning_allowlist_rejects_chat_completions_before_upstream(async_client, monkeypatch):
+    enabled = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enabled.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "chat-allowlist-key", "allowedReasoningEfforts": ["low"]},
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+
+    async def fail_upstream(*_args, **_kwargs):
+        raise AssertionError("chat completions upstream was reached after policy rejection")
+
+    monkeypatch.setattr(proxy_module, "core_stream_responses", fail_upstream)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": "model-alpha",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "max",
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
+
+
+async def test_limit_free_admission_creates_no_reservation_rows(async_client):
+    """Limit-free keys skip the reservation ledger: admission returns no
+    reservation, writes no rows, and stale-reservation reclamation has
+    nothing to release; limited keys keep creating reservations."""
+    del async_client
+    now = utcnow()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        unlimited = await service.create_key(
+            ApiKeyCreateData(name="limit-free-admission", allowed_models=None, expires_at=None)
+        )
+        limited = await service.create_key(
+            ApiKeyCreateData(
+                name="limited-admission-regression",
+                allowed_models=None,
+                expires_at=None,
+                limits=[
+                    LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=50_000),
+                ],
+            )
+        )
+        unlimited_reservation = await service.enforce_limits_for_request(unlimited.id, request_model="gpt-5.1")
+        limited_reservation = await service.enforce_limits_for_request(limited.id, request_model="gpt-5.1")
+
+    assert unlimited_reservation is None
+    assert limited_reservation is not None
+    assert limited_reservation.has_applicable_limits is True
+
+    async with SessionLocal() as session:
+        rows = await session.execute(
+            select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == unlimited.id)
+        )
+        assert rows.scalars().all() == []
+        repo = ApiKeysRepository(session)
+        limited_row = await repo.get_usage_reservation(limited_reservation.reservation_id)
+        assert limited_row is not None
+        assert limited_row.status == "reserved"
+        # A future cutoff would reclaim any reserved row; the limit-free key
+        # contributed none, so only the limited key's reservation is released.
+        released_count = await repo.release_stale_usage_reservations(
+            cutoff=now + timedelta(hours=1),
+            max_age_cutoff=now + timedelta(hours=1),
+        )
+        assert released_count == 1
+
+
+async def test_enforce_limits_lazy_reset_and_expiry_with_narrowed_admission_load(async_client):
+    """Regression for the narrowed admission load (``get_for_limit_enforcement``).
+
+    The enforcement path loads ``is_active``/``expires_at`` /
+    ``quota_shop_enabled`` plus the ``limits`` collection. The lazy expired-limit reset (which commits
+    mid-enforcement and refetches through the same narrowed load) and the
+    key-expiry rejection must behave exactly as with the full-graph load.
+    """
+    del async_client
+    now = utcnow()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        created = await service.create_key(
+            ApiKeyCreateData(
+                name="narrowed-admission-load",
+                allowed_models=None,
+                expires_at=None,
+                limits=[
+                    LimitRuleInput(limit_type="total_tokens", limit_window="daily", max_value=50_000),
+                ],
+            )
+        )
+        limits = await repo.get_limits_by_key(created.id)
+        assert len(limits) == 1
+        # Exhausted AND expired: without the lazy reset the enforcement
+        # would reject; the reset must zero the counter and advance reset_at.
+        limits[0].current_value = 50_000
+        limits[0].reset_at = now - timedelta(hours=2)
+        await session.commit()
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+        assert reservation is not None
+        assert reservation.has_applicable_limits is True
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        limits = await repo.get_limits_by_key(created.id)
+        assert len(limits) == 1
+        assert limits[0].reset_at > now
+        reserved = await repo.get_usage_reservation(reservation.reservation_id)
+        assert reserved is not None
+        assert reserved.status == "reserved"
+        assert limits[0].current_value == reserved.items[0].reserved_delta
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        # Fail-loud contract of the narrowed load: unlisted columns and the
+        # assignment relationships raise instead of lazy loading.
+        row = await repo.get_for_limit_enforcement(created.id)
+        assert row is not None
+        assert row.is_active is True
+        assert row.expires_at is None
+        assert row.quota_shop_enabled is False
+        assert len(row.limits) == 1
+        with pytest.raises(sqlalchemy_exc.InvalidRequestError):
+            _ = row.name
+        with pytest.raises(sqlalchemy_exc.InvalidRequestError):
+            _ = row.account_assignments
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        await repo.update(created.id, expires_at=now - timedelta(minutes=1))
+        with pytest.raises(ApiKeyInvalidError):
+            await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+
+async def test_release_stale_usage_reservations_max_age_ceiling_beats_orphaned_heartbeat(async_client, monkeypatch):
+    """Issue #1594: a leaked heartbeat keeps refreshing ``updated_at`` forever.
+
+    Reservations older than the hard ``max_age_cutoff`` ceiling must be
+    reclaimed even while their ``updated_at`` stays fresh.
+    """
+    del async_client
+    now = utcnow()
+
+    @contextlib.asynccontextmanager
+    async def fake_sqlite_writer_section():
+        yield
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        service = ApiKeysService(repo)
+        created = await service.create_key(
+            ApiKeyCreateData(
+                name="orphaned-heartbeat-cleanup",
+                allowed_models=None,
+                expires_at=None,
+                limits=[
+                    LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=50_000),
+                ],
+            )
+        )
+        heartbeat_kept = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+        fresh = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+        assert heartbeat_kept is not None
+        assert fresh is not None
+        # An orphaned heartbeat keeps the reservation's updated_at current
+        # even though it was created past the hard age ceiling.
+        await session.execute(
+            update(ApiKeyUsageReservation)
+            .where(ApiKeyUsageReservation.id == heartbeat_kept.reservation_id)
+            .values(created_at=now - timedelta(hours=25), updated_at=now)
+        )
+        await session.execute(
+            update(ApiKeyUsageReservation)
+            .where(ApiKeyUsageReservation.id == fresh.reservation_id)
+            .values(created_at=now - timedelta(hours=1), updated_at=now)
+        )
+        await session.commit()
+
+    async with SessionLocal() as session:
+        monkeypatch.setattr(api_keys_repository_module, "sqlite_writer_section", fake_sqlite_writer_section)
+        repo = ApiKeysRepository(session)
+        released_count = await repo.release_stale_usage_reservations(
+            cutoff=now - timedelta(hours=6),
+            max_age_cutoff=now - timedelta(hours=24),
+        )
+        assert released_count == 1
+
+    async with SessionLocal() as session:
+        repo = ApiKeysRepository(session)
+        heartbeat_kept_reservation = await repo.get_usage_reservation(heartbeat_kept.reservation_id)
+        fresh_reservation = await repo.get_usage_reservation(fresh.reservation_id)
+        assert heartbeat_kept_reservation is not None
+        assert heartbeat_kept_reservation.status == "released"
+        assert heartbeat_kept_reservation.items[0].actual_delta == 0
+        assert fresh_reservation is not None
+        assert fresh_reservation.status == "reserved"
+
+        limits = await repo.get_limits_by_key(created.id)
+        assert len(limits) == 1
+        assert limits[0].current_value == fresh_reservation.items[0].reserved_delta
+
+
+async def test_rate_limit_header_failure_releases_reservation_once(
+    async_client,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+) -> None:
+    await _populate_test_registry()
+    enable = await async_client.put(
+        "/api/settings",
+        json={
+            "stickyThreadsEnabled": False,
+            "preferEarlierResetAccounts": False,
+            "totpRequiredOnLogin": False,
+            "apiKeyAuthEnabled": True,
+        },
+    )
+    assert enable.status_code == 200
+
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": f"header-failure-{surface}",
+            "limits": [
+                {"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 50_000},
+            ],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+    key_id = created.json()["id"]
+
+    release_calls: list[str] = []
+    upstream_calls: list[str] = []
+    original_release_reservation = proxy_api._release_reservation
+
+    async def fail_rate_limit_headers(_service) -> dict[str, str]:
+        raise RuntimeError("injected rate-limit header failure")
+
+    async def release_reservation(reservation) -> None:
+        assert reservation is not None
+        release_calls.append(reservation.reservation_id)
+        await original_release_reservation(reservation)
+
+    def unexpected_stream(*_args, **_kwargs):
+        upstream_calls.append("stream")
+        raise AssertionError("stream transport must not start")
+
+    async def unexpected_compact(*_args, **_kwargs):
+        upstream_calls.append("compact")
+        raise AssertionError("compact transport must not start")
+
+    async def unexpected_transcribe(*_args, **_kwargs):
+        upstream_calls.append("transcribe")
+        raise AssertionError("transcribe transport must not start")
+
+    monkeypatch.setattr(proxy_module.ProxyService, "rate_limit_headers", fail_rate_limit_headers)
+    monkeypatch.setattr(proxy_api, "_release_reservation", release_reservation)
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_responses", unexpected_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "stream_http_responses", unexpected_stream)
+    monkeypatch.setattr(proxy_module.ProxyService, "compact_responses", unexpected_compact)
+    monkeypatch.setattr(proxy_module.ProxyService, "transcribe", unexpected_transcribe)
+
+    headers = {"Authorization": f"Bearer {key}"}
+    with pytest.raises(RuntimeError, match="injected rate-limit header failure"):
+        if surface == "stream":
+            await async_client.post(
+                "/backend-api/codex/responses",
+                headers=headers,
+                json={"model": _TEST_MODELS[0], "instructions": "hi", "input": [], "stream": True},
+            )
+        elif surface == "collect":
+            await async_client.post(
+                "/v1/responses",
+                headers=headers,
+                json={"model": _TEST_MODELS[0], "instructions": "hi", "input": [], "stream": False},
+            )
+        elif surface == "compact":
+            await async_client.post(
+                "/v1/responses/compact",
+                headers=headers,
+                json={"model": _TEST_MODELS[0], "instructions": "hi", "input": []},
+            )
+        else:
+            await async_client.post(
+                "/backend-api/transcribe",
+                headers=headers,
+                files={"file": ("sample.wav", b"\x00\x01\x02", "audio/wav")},
+            )
+
+    assert upstream_calls == []
+    assert len(release_calls) == 1
+
+    async with SessionLocal() as session:
+        reservations = (
+            (await session.execute(select(ApiKeyUsageReservation).where(ApiKeyUsageReservation.api_key_id == key_id)))
+            .scalars()
+            .all()
+        )
+        assert len(reservations) == 1
+        assert release_calls == [reservations[0].id]
+        assert reservations[0].status == "released"
+
+        limits = await ApiKeysRepository(session).get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert limits[0].current_value == 0

@@ -37,6 +37,7 @@ import type {
   LimitRuleCreate,
   LimitType,
   ReasoningEffortType,
+  RoutingMode,
   ServiceTierType,
   TrafficClass,
   TransportPolicyOverride,
@@ -99,15 +100,24 @@ type ApiKeyEditDraft = {
   usageSections: string;
   limitRules: LimitRuleCreate[];
   expiresAt: Date | null;
+  autoExtendExpiry: boolean;
+  autoExtendExpiryType: "total_tokens" | "cost_usd" | null;
+  autoExtendExpiryThreshold: number | null;
+  quotaShopEnabled: boolean;
+  quotaShopOptions: { limitType: string; limitWindow: string }[];
   applyToCodexModel: boolean;
   enforcedModel: string;
   enforcedReasoningEffort: string;
   enforcedServiceTier: string;
   trafficClass: TrafficClass;
   transportPolicyOverride: TransportPolicyOverride | null;
+  routingMode: RoutingMode;
 };
 
 function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
+  const autoExtendExpiryType = apiKey.autoExtendExpiry && apiKey.expiresAt
+    ? apiKey.autoExtendExpiryType ?? "total_tokens"
+    : apiKey.autoExtendExpiryType;
   return {
     selectedModels: apiKey.allowedModels || [],
     selectedAccountIds: apiKey.assignedAccountIds,
@@ -117,12 +127,18 @@ function createApiKeyEditDraft(apiKey: ApiKey): ApiKeyEditDraft {
     usageSections: apiKey.usageSections,
     limitRules: limitsToCreateRules(apiKey),
     expiresAt: parseDate(apiKey.expiresAt),
+    autoExtendExpiry: apiKey.autoExtendExpiry,
+    autoExtendExpiryType,
+    autoExtendExpiryThreshold: apiKey.autoExtendExpiryThreshold,
+    quotaShopEnabled: apiKey.quotaShopEnabled,
+    quotaShopOptions: apiKey.quotaShopOptions,
     applyToCodexModel: apiKey.applyToCodexModel,
     enforcedModel: apiKey.enforcedModel || "",
     enforcedReasoningEffort: apiKey.enforcedReasoningEffort || "none",
     enforcedServiceTier: apiKey.enforcedServiceTier || "none",
     trafficClass: apiKey.trafficClass || "foreground",
     transportPolicyOverride: apiKey.transportPolicyOverride,
+    routingMode: apiKey.routingMode,
   };
 }
 
@@ -168,6 +184,7 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
       name: values.name,
       allowedModels: draft.selectedModels.length > 0 ? draft.selectedModels : null,
       applyToCodexModel: draft.applyToCodexModel,
+      routingMode: draft.routingMode,
       enforcedModel: draft.enforcedModel.trim() ? draft.enforcedModel.trim() : null,
       enforcedReasoningEffort:
         draft.enforcedReasoningEffort === "none" ? null : draft.enforcedReasoningEffort as ReasoningEffortType,
@@ -180,6 +197,12 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
       transportPolicyOverride: draft.transportPolicyOverride,
       usageSections: draft.usageSections,
       expiresAt: draft.expiresAt?.toISOString() ?? null,
+      autoExtendExpiry: draft.expiresAt ? draft.autoExtendExpiry : false,
+      autoExtendExpiryType: draft.expiresAt && draft.autoExtendExpiry ? draft.autoExtendExpiryType ?? "total_tokens" : null,
+      autoExtendExpiryThreshold: draft.expiresAt && draft.autoExtendExpiry ? draft.autoExtendExpiryThreshold : null,
+      quotaShopEnabled: draft.quotaShopEnabled,
+      quotaShopMaxWindows: 1,
+      quotaShopOptions: draft.quotaShopOptions,
       isActive: values.isActive,
     };
     if (shouldSubmitAssignedAccountIds) {
@@ -235,6 +258,19 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
               <label htmlFor="edit-api-key-apply-to-codex-model" className="cursor-pointer">
                 {t("apiKeys.form.applyToCodexModel")}
               </label>
+            </div>
+
+            <div className="space-y-1">
+              <label className="text-sm font-medium">{t("apiKeys.form.routingMode")}</label>
+              <Select value={draft.routingMode} onValueChange={(routingMode) => updateDraft({ routingMode: routingMode as RoutingMode })}>
+                <SelectTrigger><SelectValue /></SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="balanced">{t("apiKeys.routing.balanced")}</SelectItem>
+                  <SelectItem value="account_first">{t("apiKeys.routing.accountFirst")}</SelectItem>
+                  <SelectItem value="provider_first">{t("apiKeys.routing.providerFirst")}</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t("apiKeys.routing.description")}</p>
             </div>
 
             <div className="space-y-1">
@@ -382,7 +418,34 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
 
             <div className="space-y-1">
               <div className="text-sm font-medium">{t("apiKeys.form.expiry")}</div>
-              <ExpiryPicker value={draft.expiresAt} onChange={(expiresAt) => updateDraft({ expiresAt })} />
+              <ExpiryPicker value={draft.expiresAt} onChange={(expiresAt) => updateDraft({ expiresAt, ...(expiresAt ? {} : { autoExtendExpiry: false }) })} />
+              {draft.expiresAt ? (
+                <div className="space-y-2 rounded-md border p-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm">Auto-extend expiry daily</span>
+                    <Switch
+                      checked={draft.autoExtendExpiry}
+                      onCheckedChange={(autoExtendExpiry) =>
+                        updateDraft({
+                          autoExtendExpiry,
+                          ...(autoExtendExpiry && !draft.autoExtendExpiryType
+                            ? { autoExtendExpiryType: "total_tokens" }
+                            : {}),
+                        })
+                      }
+                    />
+                  </div>
+                  {draft.autoExtendExpiry ? (
+                    <div className="grid grid-cols-2 gap-2">
+                      <Select value={draft.autoExtendExpiryType ?? "total_tokens"} onValueChange={(v) => updateDraft({ autoExtendExpiryType: v as "total_tokens" | "cost_usd" })}>
+                        <SelectTrigger><SelectValue /></SelectTrigger>
+                        <SelectContent><SelectItem value="total_tokens">Total tokens</SelectItem><SelectItem value="cost_usd">Cost (USD)</SelectItem></SelectContent>
+                      </Select>
+                      <Input type="number" min={1} step={draft.autoExtendExpiryType === "cost_usd" ? 0.01 : 1} value={draft.autoExtendExpiryType === "cost_usd" ? String((draft.autoExtendExpiryThreshold ?? 0) / 1_000_000) : String(draft.autoExtendExpiryThreshold ?? "")} onChange={(e) => updateDraft({ autoExtendExpiryThreshold: draft.autoExtendExpiryType === "cost_usd" ? Math.round(parseFloat(e.target.value || "0") * 1_000_000) : parseInt(e.target.value || "0", 10) })} placeholder="Threshold" />
+                    </div>
+                  ) : null}
+                </div>
+              ) : null}
             </div>
 
             <FormField
@@ -399,16 +462,16 @@ function ApiKeyEditForm({ apiKey, busy, onSubmit, onClose }: ApiKeyEditFormProps
 
           {/* Right column — Limits */}
           <div className="max-h-[55vh] space-y-3 overflow-y-auto overscroll-contain pl-1 pr-2 max-sm:mt-3 max-sm:border-t max-sm:pt-3">
-            <h4 className="sticky top-0 bg-background pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("apiKeys.form.limits")}</h4>
-            <LimitRulesEditor rules={draft.limitRules} onChange={(limitRules) => updateDraft({ limitRules })} />
-
+            <div className="rounded-md border p-3 space-y-3"><div className="flex items-center justify-between"><span className="text-sm font-medium">Quota Shop Mode</span><Switch checked={draft.quotaShopEnabled} onCheckedChange={(quotaShopEnabled) => updateDraft({ quotaShopEnabled, ...(quotaShopEnabled ? { limitRules: [] } : {}) })} /></div>{draft.quotaShopEnabled ? <div className="text-xs text-muted-foreground">Khách được chọn một window đúng một lần. Sau khi thanh toán thành công, mode tự tắt và limit đã chọn được giữ lại.</div> : null}</div>
+            {!draft.quotaShopEnabled ? <>
+              <h4 className="sticky top-0 bg-background pb-1 text-xs font-semibold uppercase tracking-wider text-muted-foreground">{t("apiKeys.form.limits")}</h4>
+              <LimitRulesEditor rules={draft.limitRules} onChange={(limitRules) => updateDraft({ limitRules })} />
+            </> : null}
             {apiKey.limits.length > 0 ? (
               <div className="space-y-1">
                 <div className="text-xs font-medium text-muted-foreground">{t("apiKeys.form.currentUsage")}</div>
                 <div className="space-y-1">
-                  {apiKey.limits.map((limit) => (
-                    <LimitUsageBar key={limit.id} limit={limit} />
-                  ))}
+                  {apiKey.limits.map((limit) => <LimitUsageBar key={limit.id} limit={limit} />)}
                 </div>
               </div>
             ) : null}

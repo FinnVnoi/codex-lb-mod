@@ -38,9 +38,15 @@ def _default_put_body() -> dict[str, Any]:
     ("payload_key", "new_value", "audit_field_name"),
     [
         ("stickyThreadsEnabled", False, "sticky_threads_enabled"),
+        ("globalApiRoutingOverride", "provider_first", "global_api_routing_override"),
+        ("providerFailurePolicy", "providers_before_accounts", "provider_failure_policy"),
+        ("accountFailurePolicy", "provider_after_first_failure", "account_failure_policy"),
+        ("providerMaxAttempts", 4, "provider_max_attempts"),
+        ("accountMaxAttempts", 4, "account_max_attempts"),
         ("upstreamStreamTransport", "websocket", "upstream_stream_transport"),
         ("prohibitFastMode", True, "prohibit_fast_mode"),
         ("preferEarlierResetAccounts", False, "prefer_earlier_reset_accounts"),
+        ("preferEarlierRenewalAccounts", True, "prefer_earlier_renewal_accounts"),
         ("showResetCreditBadges", False, "show_reset_credit_badges"),
         (
             "autoRedeemResetCreditsBeforeExpiry",

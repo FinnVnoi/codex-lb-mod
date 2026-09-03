@@ -3272,6 +3272,7 @@ class _WebSocketMixin:
             sticky_key_source=sticky_key_source,
             prompt_cache_key_set=_prompt_cache_key_from_request_model(responses_payload) is not None,
         )
+        _maybe_log_proxy_request_payload("websocket", responses_payload, headers)
         request_state.affinity_policy = affinity_policy
 
         # First-turn ``input_file.file_id`` references must land on the
@@ -3698,6 +3699,15 @@ class _WebSocketMixin:
         _ = proxy
         while True:
             try:
+                selection_kwargs: dict[str, Any] = {}
+                settings = await _facade().get_settings_cache().get()
+                if bool(getattr(settings, "prefer_unstarted_quota_accounts", False)):
+                    selection_kwargs["prefer_unstarted_quota_accounts"] = True
+                    selection_kwargs["prefer_unstarted_quota_window"] = getattr(
+                        settings, "prefer_unstarted_quota_window", "both"
+                    )
+                if bool(getattr(settings, "prefer_earlier_renewal_accounts", False)):
+                    selection_kwargs["prefer_earlier_renewal_accounts"] = True
                 selection = await proxy._select_account_with_budget_compatible(
                     deadline,
                     request_id=request_state.request_log_id or request_state.request_id,
@@ -3729,6 +3739,7 @@ class _WebSocketMixin:
                         request_state.request_usage_budget
                     ),
                     fallback_on_preferred_account_unavailable=not require_preferred_account,
+                    **selection_kwargs,
                 )
             except ProxyResponseError as exc:
                 if _facade()._is_proxy_budget_exhausted_error(exc):

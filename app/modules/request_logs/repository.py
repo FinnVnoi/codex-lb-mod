@@ -33,6 +33,7 @@ from app.db.models import (
     Account,
     AccountUsageRollupState,
     ApiKey,
+    ModelSource,
     RequestDemandQuarterRollup,
     RequestKind,
     RequestLog,
@@ -1575,6 +1576,15 @@ class RequestLogsRepository:
                 pairs.append((value, None))
         return pairs
 
+    async def get_model_source_names_by_ids(self, source_ids: list[str]) -> dict[str, str]:
+        unique_ids = sorted({source_id for source_id in source_ids if source_id})
+        if not unique_ids:
+            return {}
+        result = await self._session.execute(
+            select(ModelSource.id, ModelSource.name).where(ModelSource.id.in_(unique_ids))
+        )
+        return {source_id: name for source_id, name in result.all() if source_id and name}
+
     async def get_api_key_names_by_ids(self, api_key_ids: list[str]) -> dict[str, str]:
         unique_ids = sorted({key_id for key_id in api_key_ids if key_id})
         if not unique_ids:
@@ -1671,6 +1681,8 @@ class RequestLogsRepository:
                 RequestLog.model.ilike(search_pattern),
                 RequestLog.reasoning_effort.ilike(search_pattern),
                 RequestLog.source.ilike(search_pattern),
+                RequestLog.model_source_id.ilike(search_pattern),
+                ModelSource.name.ilike(search_pattern),
                 RequestLog.status.ilike(search_pattern),
                 RequestLog.error_code.ilike(search_pattern),
                 RequestLog.error_message.ilike(search_pattern),
@@ -1692,9 +1704,10 @@ class RequestLogsRepository:
     def _apply_related_search_joins(self, stmt, include_related_search_joins: bool):
         if not include_related_search_joins:
             return stmt
-        return stmt.outerjoin(Account, Account.id == RequestLog.account_id).outerjoin(
-            ApiKey,
-            ApiKey.id == RequestLog.api_key_id,
+        return (
+            stmt.outerjoin(Account, Account.id == RequestLog.account_id)
+            .outerjoin(ApiKey, ApiKey.id == RequestLog.api_key_id)
+            .outerjoin(ModelSource, ModelSource.id == RequestLog.model_source_id)
         )
 
 

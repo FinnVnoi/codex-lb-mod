@@ -187,6 +187,9 @@ class _TranscribeMixin:
 
         settings = await _service_get_settings_cache().get()
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
+        prefer_unstarted_quota = bool(getattr(settings, "prefer_unstarted_quota_accounts", False))
+        prefer_unstarted_quota_window = getattr(settings, "prefer_unstarted_quota_window", "both")
+        prefer_earlier_renewal = bool(getattr(settings, "prefer_earlier_renewal_accounts", False))
         routing_strategy = _routing_strategy(settings)
         try:
             selection = await proxy._select_account_with_budget(
@@ -195,6 +198,9 @@ class _TranscribeMixin:
                 kind="transcribe",
                 api_key=api_key,
                 prefer_earlier_reset_accounts=prefer_earlier_reset,
+                prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                 prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                 routing_strategy=routing_strategy,
                 model=None,
@@ -261,6 +267,9 @@ class _TranscribeMixin:
                     kind="transcribe",
                     api_key=api_key,
                     prefer_earlier_reset_accounts=prefer_earlier_reset,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                     routing_strategy=routing_strategy,
                     model=None,
                     exclude_account_ids=excluded_account_ids,
@@ -363,6 +372,9 @@ class _TranscribeMixin:
                             kind="transcribe",
                             api_key=api_key,
                             prefer_earlier_reset_accounts=prefer_earlier_reset,
+                            prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                            prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                             prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                             routing_strategy=routing_strategy,
                             model=None,

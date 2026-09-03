@@ -49,6 +49,8 @@ from app.core.openai.parsing import (
 from app.core.openai.requests import (
     ResponsesRequest,
 )
+from app.core.openai.tool_call_safety import is_downstream_side_effect_tool_call_item
+from app.core.types import JsonValue
 from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteError
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
@@ -946,6 +948,12 @@ class _StreamingMixin(_StreamingRetryMixin):
                 settlement.downstream_visible = True
                 if event_type in _facade()._TEXT_DELTA_EVENT_TYPES:
                     settlement.downstream_text_visible = True
+                if isinstance(event_payload, Mapping):
+                    item = event_payload.get("item")
+                    if isinstance(item, Mapping) and is_downstream_side_effect_tool_call_item(
+                        cast(Mapping[str, JsonValue], item)
+                    ):
+                        settlement.downstream_side_effect_visible = True
                 if event_type in {"response.completed", "response.failed", "response.incomplete", "error"}:
                     terminal_event_seen = True
                 yield line

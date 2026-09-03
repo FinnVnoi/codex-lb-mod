@@ -21,6 +21,7 @@ from app.core.balancer import (
     RoutingStrategy,
     SelectionResult,
     TrafficClass,
+    UnstartedQuotaPreferenceWindow,
     select_account,
 )
 from app.core.utils.time import utcnow
@@ -95,6 +96,7 @@ class StickySelectionOwner(Protocol):
         *,
         required_account_id: str | None,
         redact_sensitive_details: bool,
+        include_renewal: bool = False,
     ) -> tuple[list[AccountState], dict[str, Account]]: ...
 
     def _sync_runtime_state(
@@ -143,11 +145,14 @@ class StickySelectionOwner(Protocol):
         *,
         prefer_earlier_reset: bool,
         prefer_earlier_reset_window: ResetPreferenceWindow,
+        prefer_unstarted_quota_accounts: bool = False,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
         routing_strategy: RoutingStrategy,
         relative_availability_power: float,
         relative_availability_top_k: int,
         traffic_class: TrafficClass,
         routing_costs_by_account_id: RoutingCostsByAccount | None,
+        prefer_earlier_renewal_accounts: bool = False,
     ) -> ProbeReservation | None: ...
 
     def _probe_reservation_current_locked(self, reservation: ProbeReservation | None) -> bool: ...
@@ -183,6 +188,9 @@ class StickySelectionOwner(Protocol):
         secondary_budget_threshold_pct: float,
         prefer_earlier_reset_accounts: bool,
         prefer_earlier_reset_window: ResetPreferenceWindow,
+        prefer_unstarted_quota_accounts: bool,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow,
+        prefer_earlier_renewal_accounts: bool,
         routing_strategy: RoutingStrategy,
         relative_availability_power: float,
         relative_availability_top_k: int,
@@ -219,6 +227,9 @@ class StickySelectionRequest(Generic[SelectionInputsT]):
     sticky_max_age_seconds: int | None
     prefer_earlier_reset_accounts: bool
     prefer_earlier_reset_window: ResetPreferenceWindow
+    prefer_unstarted_quota_accounts: bool
+    prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow
+    prefer_earlier_renewal_accounts: bool
     routing_strategy: RoutingStrategy
     relative_availability_power: float
     relative_availability_top_k: int
@@ -296,6 +307,9 @@ async def run_sticky_selection_path(
     sticky_max_age_seconds = request.sticky_max_age_seconds
     prefer_earlier_reset_accounts = request.prefer_earlier_reset_accounts
     prefer_earlier_reset_window = request.prefer_earlier_reset_window
+    prefer_unstarted_quota_accounts = request.prefer_unstarted_quota_accounts
+    prefer_unstarted_quota_window = request.prefer_unstarted_quota_window
+    prefer_earlier_renewal_accounts = request.prefer_earlier_renewal_accounts
     routing_strategy = request.routing_strategy
     relative_availability_power = request.relative_availability_power
     relative_availability_top_k = request.relative_availability_top_k
@@ -419,6 +433,7 @@ async def run_sticky_selection_path(
                 selection_inputs,
                 required_account_id=required_account_id,
                 redact_sensitive_details=redact_sensitive_details,
+                include_renewal=prefer_earlier_renewal_accounts,
             )
             if retired_legacy_owner_account_ids:
                 # Retirement is authoritative even when this selector loaded a
@@ -634,6 +649,9 @@ async def run_sticky_selection_path(
                 selection_states,
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
+                prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+                prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                prefer_earlier_renewal=prefer_earlier_renewal_accounts,
                 routing_strategy=routing_strategy,
                 relative_availability_power=relative_availability_power,
                 relative_availability_top_k=relative_availability_top_k,
@@ -671,6 +689,9 @@ async def run_sticky_selection_path(
                         secondary_budget_threshold_pct=secondary_budget_threshold_pct,
                         prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
+                        prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                        prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                        prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                         routing_strategy=routing_strategy,
                         relative_availability_power=relative_availability_power,
                         relative_availability_top_k=relative_availability_top_k,
@@ -742,6 +763,9 @@ async def run_sticky_selection_path(
                     selection_states,
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     relative_availability_power=relative_availability_power,
                     relative_availability_top_k=relative_availability_top_k,
@@ -1156,6 +1180,9 @@ async def _select_with_stickiness(
     secondary_budget_threshold_pct: float = 100.0,
     prefer_earlier_reset_accounts: bool,
     prefer_earlier_reset_window: ResetPreferenceWindow,
+    prefer_unstarted_quota_accounts: bool,
+    prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow,
+    prefer_earlier_renewal_accounts: bool,
     routing_strategy: RoutingStrategy,
     relative_availability_power: float = 2.0,
     relative_availability_top_k: int = 5,
@@ -1176,6 +1203,9 @@ async def _select_with_stickiness(
                 states,
                 prefer_earlier_reset=prefer_earlier_reset_accounts,
                 prefer_earlier_reset_window=prefer_earlier_reset_window,
+                prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+                prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                prefer_earlier_renewal=prefer_earlier_renewal_accounts,
                 routing_strategy=routing_strategy,
                 relative_availability_power=relative_availability_power,
                 relative_availability_top_k=relative_availability_top_k,
@@ -1318,6 +1348,9 @@ async def _select_with_stickiness(
                     [pinned],
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     allow_backoff_fallback=False,
                     relative_availability_power=relative_availability_power,
@@ -1347,6 +1380,9 @@ async def _select_with_stickiness(
                         states,
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
+                        prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+                        prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                        prefer_earlier_renewal=prefer_earlier_renewal_accounts,
                         routing_strategy=routing_strategy,
                         relative_availability_power=relative_availability_power,
                         relative_availability_top_k=relative_availability_top_k,
@@ -1401,6 +1437,9 @@ async def _select_with_stickiness(
                     now=time.time() + _STICKY_GRACE_PERIOD_SECONDS,
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     allow_backoff_fallback=False,
                     relative_availability_power=relative_availability_power,
@@ -1438,6 +1477,9 @@ async def _select_with_stickiness(
         states,
         prefer_earlier_reset=prefer_earlier_reset_accounts,
         prefer_earlier_reset_window=prefer_earlier_reset_window,
+        prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+        prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+        prefer_earlier_renewal=prefer_earlier_renewal_accounts,
         routing_strategy=routing_strategy,
         relative_availability_power=relative_availability_power,
         relative_availability_top_k=relative_availability_top_k,
@@ -1683,6 +1725,9 @@ def _select_account_preferring_budget_safe(
     *,
     prefer_earlier_reset: bool,
     prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
+    prefer_unstarted_quota: bool = False,
+    prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
+    prefer_earlier_renewal: bool = False,
     routing_strategy: RoutingStrategy,
     relative_availability_power: float = 2.0,
     relative_availability_top_k: int = 5,
@@ -1705,6 +1750,9 @@ def _select_account_preferring_budget_safe(
             state_list,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
             deterministic_probe=deterministic_probe,
@@ -1739,6 +1787,9 @@ def _select_account_preferring_budget_safe(
             budget_safe_states or state_list,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
             deterministic_probe=deterministic_probe,
@@ -1758,6 +1809,9 @@ def _select_account_preferring_budget_safe(
             burn_first_states,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=False,
             deterministic_probe=deterministic_probe,
@@ -1783,6 +1837,9 @@ def _select_account_preferring_budget_safe(
             selection_pool,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
             deterministic_probe=deterministic_probe,
@@ -1803,6 +1860,9 @@ def _select_account_preferring_budget_safe(
             state_list,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal,
             routing_strategy=routing_strategy,
             allow_backoff_fallback=allow_backoff_fallback,
             deterministic_probe=deterministic_probe,
@@ -1817,6 +1877,9 @@ def _select_account_preferring_budget_safe(
         state_list,
         prefer_earlier_reset=prefer_earlier_reset,
         prefer_earlier_reset_window=prefer_earlier_reset_window,
+        prefer_unstarted_quota=prefer_unstarted_quota,
+        prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+        prefer_earlier_renewal=prefer_earlier_renewal,
         routing_strategy=routing_strategy,
         allow_backoff_fallback=allow_backoff_fallback,
         deterministic_probe=deterministic_probe,

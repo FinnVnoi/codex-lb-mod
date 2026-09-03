@@ -2117,6 +2117,45 @@ class DurableBridgeRepository:
             await self._session.commit()
         return bool(getattr(result, "rowcount", 0))
 
+    async def quarantine_session(
+        self,
+        *,
+        session_id: str,
+        instance_id: str,
+        owner_epoch: int,
+    ) -> DurableBridgeSessionSnapshot | None:
+        """Fence and clear a lineage that never produced an upstream event."""
+
+        now = utcnow()
+        async with sqlite_writer_section():
+            updated = await self._session.execute(
+                update(HttpBridgeSessionRecord)
+                .where(
+                    HttpBridgeSessionRecord.id == session_id,
+                    HttpBridgeSessionRecord.owner_instance_id == instance_id,
+                    HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                )
+                .values(
+                    owner_instance_id=None,
+                    lease_expires_at=now,
+                    state=HttpBridgeSessionState.CLOSED,
+                    account_id=None,
+                    latest_turn_state=None,
+                    latest_response_id=None,
+                    latest_input_item_count=None,
+                    latest_input_full_fingerprint=None,
+                    latest_pending_tool_calls_json=None,
+                    last_seen_at=now,
+                    closed_at=now,
+                )
+                .returning(HttpBridgeSessionRecord.id)
+            )
+            if updated.scalar_one_or_none() is not None:
+                await self._clear_aliases_for_session(session_id)
+            await self._session.commit()
+        current = await self._session.get(HttpBridgeSessionRecord, session_id, populate_existing=True)
+        return _to_snapshot(current)
+
     async def _execute_fenced_session_update(
         self,
         *,

@@ -67,6 +67,7 @@ from app.core.openai.parsing import (
 from app.core.openai.requests import (
     ResponsesCompactRequest,
     ResponsesRequest,
+    strip_invalid_native_input_item_ids,
     validate_compact_input_wire_budget,
 )
 from app.core.resilience.circuit_breaker import (
@@ -4058,6 +4059,7 @@ class _CompactCommandTransport:
         payload_dict = _responses_compact_payload_for_responses_endpoint(self.payload)
         payload_dict["store"] = False
         payload_dict["stream"] = True
+        strip_invalid_native_input_item_ids(payload_dict)
         if settings.image_inline_fetch_enabled:
             payload_dict = await _inline_input_image_urls(
                 payload_dict,

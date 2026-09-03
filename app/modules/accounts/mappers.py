@@ -114,6 +114,7 @@ def _account_to_summary(
 ) -> AccountSummary:
     plan_type = coerce_account_plan_type(account.plan_type, DEFAULT_PLAN)
     auth_status = _build_auth_status(account, encryptor) if include_auth else None
+    subscription_active_start, subscription_active_until = subscription_window(account, encryptor)
     effective_primary_usage, effective_secondary_usage = _effective_usage_windows(
         primary_usage,
         secondary_usage,
@@ -263,6 +264,8 @@ def _account_to_summary(
         workspace_label=account.workspace_label,
         seat_type=account.seat_type,
         plan_type=plan_type,
+        subscription_active_start=subscription_active_start,
+        subscription_active_until=subscription_active_until,
         status=effective_status.value,
         routing_policy=_normalize_account_routing_policy(account.routing_policy),
         security_work_authorized=bool(account.security_work_authorized),
@@ -463,6 +466,37 @@ def _build_auth_status(account: Account, encryptor: TokenEncryptor) -> AccountAu
         refresh=AccountTokenStatus(state=refresh_state),
         id_token=AccountTokenStatus(state=id_state),
     )
+
+
+def subscription_window(account: Account, encryptor: TokenEncryptor) -> tuple[datetime | None, datetime | None]:
+    """Read the current ChatGPT subscription cycle directly from token claims.
+
+    Prefer the ID token, matching CPA's account metadata endpoint, then fill
+    missing values from the access token. Reading the encrypted tokens here
+    keeps the dashboard in sync after an OAuth refresh without duplicating
+    entitlement timestamps into the database.
+    """
+    active_start: datetime | None = None
+    active_until: datetime | None = None
+    for encrypted_token in (account.id_token_encrypted, account.access_token_encrypted):
+        token = _decrypt_token(encryptor, encrypted_token)
+        if not token:
+            continue
+        claims = extract_id_token_claims(token)
+        auth_claims = claims.auth
+        active_start = (
+            active_start
+            or (auth_claims.chatgpt_subscription_active_start if auth_claims else None)
+            or claims.chatgpt_subscription_active_start
+        )
+        active_until = (
+            active_until
+            or (auth_claims.chatgpt_subscription_active_until if auth_claims else None)
+            or claims.chatgpt_subscription_active_until
+        )
+        if active_start is not None and active_until is not None:
+            break
+    return active_start, active_until
 
 
 def _decrypt_token(encryptor: TokenEncryptor, encrypted: bytes | None) -> str | None:

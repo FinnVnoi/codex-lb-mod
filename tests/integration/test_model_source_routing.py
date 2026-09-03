@@ -4,7 +4,9 @@ import asyncio
 import socket
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from tempfile import SpooledTemporaryFile
+from types import SimpleNamespace
 from typing import TypeAlias, cast
+from unittest.mock import MagicMock
 
 import pytest
 import starlette.formparsers as starlette_formparsers
@@ -12,6 +14,7 @@ from aiohttp import web
 from aiohttp.multipart import BodyPartReader
 from sqlalchemy import select
 
+from app.core.openai.requests import ResponsesRequest
 from app.core.utils.time import utcnow
 from app.db.models import ApiKeyUsageReservation, RequestLog
 from app.db.session import SessionLocal
@@ -33,6 +36,7 @@ async def _create_model_source(
     name: str,
     model: str,
     base_url: str,
+    upstream_model: str | None = None,
     input_per_1m: float | None = None,
     cached_input_per_1m: float | None = None,
     output_per_1m: float | None = None,
@@ -42,6 +46,7 @@ async def _create_model_source(
     supports_streaming: bool = True,
     supports_audio_transcriptions: bool = False,
     supports_embeddings: bool = False,
+    estimate_missing_stream_usage: bool = False,
 ) -> str:
     model_entry: dict[str, object] = {
         "model": model,
@@ -51,6 +56,8 @@ async def _create_model_source(
         "supportsStreaming": supports_streaming,
         "supportsTools": True,
     }
+    if upstream_model is not None:
+        model_entry["upstreamModel"] = upstream_model
     if raw_metadata_json is not None:
         model_entry["rawMetadataJson"] = raw_metadata_json
     if input_per_1m is not None:
@@ -71,6 +78,7 @@ async def _create_model_source(
             "supportsResponses": supports_responses,
             "supportsAudioTranscriptions": supports_audio_transcriptions,
             "supportsEmbeddings": supports_embeddings,
+            "estimateMissingStreamUsage": estimate_missing_stream_usage,
             "models": [model_entry],
         },
     )
@@ -237,6 +245,52 @@ async def test_source_audio_transcription_routes_multipart_and_settles_usage(
         assert log.input_tokens == 37
         assert log.output_tokens == 0
         assert log.status == "success"
+
+
+@pytest.mark.asyncio
+async def test_source_audio_transcription_retries_other_provider_when_model_is_unavailable(
+    async_client, source_upstream
+):
+    hits: list[str] = []
+    model = "whisper-provider-fallback"
+
+    async def missing_model(_request: web.Request) -> web.Response:
+        hits.append("missing")
+        return web.json_response(
+            {"error": {"message": "model not found", "code": "model_not_found"}},
+            status=404,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response({"text": "fallback transcript", "usage": {"prompt_tokens": 4, "completion_tokens": 0}})
+
+    missing_url = await source_upstream(missing_model)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(
+        async_client,
+        name="audio-fallback-a-missing",
+        model=model,
+        base_url=missing_url,
+        supports_audio_transcriptions=True,
+    )
+    await _create_model_source(
+        async_client,
+        name="audio-fallback-b-healthy",
+        model=model,
+        base_url=healthy_url,
+        supports_audio_transcriptions=True,
+    )
+
+    response = await async_client.post(
+        "/v1/audio/transcriptions",
+        data={"model": model},
+        files={"file": ("sample.wav", b"\x01\x02", "audio/wav")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["text"] == "fallback transcript"
+    assert hits == ["missing", "healthy"]
 
 
 @pytest.mark.asyncio
@@ -474,6 +528,29 @@ async def test_source_unreachable_returns_error_envelope_and_releases_reservatio
 
 
 @pytest.mark.asyncio
+async def test_model_source_collection_accepts_slashless_list_and_create(async_client):
+    listed = await async_client.get("/api/model-sources")
+    assert listed.status_code == 200
+    assert listed.json() == {"sources": []}
+
+    created = await async_client.post(
+        "/api/model-sources",
+        json={
+            "name": "slashless-source",
+            "baseUrl": "http://127.0.0.1:9/v1",
+            "apiKey": "token-slashless-source",
+            "models": [],
+        },
+    )
+    assert created.status_code == 200
+    assert created.json()["name"] == "slashless-source"
+
+    listed_with_slash = await async_client.get("/api/model-sources/")
+    assert listed_with_slash.status_code == 200
+    assert [row["id"] for row in listed_with_slash.json()["sources"]] == [created.json()["id"]]
+
+
+@pytest.mark.asyncio
 async def test_patch_model_source_returns_updated_model_list(async_client):
     source_id = await _create_model_source(
         async_client,
@@ -529,78 +606,122 @@ async def test_responses_source_selector_can_require_streaming(async_client):
 
 
 @pytest.mark.asyncio
-async def test_responses_model_is_source_owned_detects_streaming_source(async_client):
-    from app.modules.model_sources.selection import responses_model_is_source_owned
+async def test_anthropic_messages_routes_to_responses_model_source(async_client, source_upstream):
+    seen: dict[str, object] = {}
 
-    model = "ws-guard-streaming-model"
+    async def responses_source(request: web.Request) -> web.StreamResponse:
+        seen["path"] = request.path
+        seen["payload"] = await request.json()
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n')
+        await response.write(
+            b'data: {"type":"response.completed","response":{"id":"resp_source_messages",'
+            b'"usage":{"input_tokens":3,"output_tokens":1,"total_tokens":4}}}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(responses_source)
+    model = "anthropic-source-model"
     await _create_model_source(
         async_client,
-        name="ws-guard-streaming",
+        name="anthropic-responses-source",
         model=model,
-        base_url="http://127.0.0.1:9/v1",
+        base_url=base_url,
         supports_responses=True,
-        supports_streaming=True,
     )
 
-    assert await responses_model_is_source_owned(model, None) is True
-    # A subscription model must stay on the WebSocket path.
-    assert await responses_model_is_source_owned("gpt-5.6-sol", None) is False
-    assert await responses_model_is_source_owned(None, None) is False
+    response = await async_client.post(
+        "/v1/messages",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": False,
+            "max_tokens": 32,
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "message"
+    assert body["content"] == [{"type": "text", "text": "hello"}]
+    assert seen["path"] == "/v1/responses"
+    seen_payload = seen["payload"]
+    assert isinstance(seen_payload, dict)
+    assert seen_payload.get("model") == model
 
 
 @pytest.mark.asyncio
-async def test_responses_model_is_source_owned_requires_streaming(async_client):
-    """The guard mirrors the HTTP selector, which requires a streaming source."""
-    from app.modules.model_sources.selection import responses_model_is_source_owned
+async def test_source_responses_drops_codex_reasoning_history_before_tool_output(async_client, source_upstream):
+    seen_input: list[object] = []
 
-    model = "ws-guard-non-streaming-model"
+    async def responses_source(request: web.Request) -> web.StreamResponse:
+        body = await request.json()
+        seen_input.extend(body["input"])
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            b'data: {"type":"response.completed","response":{"id":"resp_continuation",'
+            b'"output":[],"usage":{"input_tokens":4,"output_tokens":1,"total_tokens":5}}}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(responses_source)
+    model = "responses-continuation-source"
     await _create_model_source(
         async_client,
-        name="ws-guard-non-streaming",
+        name="responses-continuation",
         model=model,
-        base_url="http://127.0.0.1:9/v1",
+        base_url=base_url,
+        raw_metadata_json='{"supports_reasoning":true}',
         supports_responses=True,
-        supports_streaming=False,
     )
 
-    assert await responses_model_is_source_owned(model, None) is False
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        json={
+            "model": model,
+            "stream": True,
+            "input": [
+                {
+                    "type": "reasoning",
+                    "id": "rs_123",
+                    "summary": [],
+                    "encrypted_content": "opaque-provider-state",
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_123",
+                    "name": "shell",
+                    "arguments": "{}",
+                },
+                {
+                    "type": "function_call_output",
+                    "call_id": "call_123",
+                    "output": "ok",
+                },
+            ],
+        },
+    ) as response:
+        assert response.status_code == 200
+        _ = [line async for line in response.aiter_lines()]
 
-
-@pytest.mark.asyncio
-async def test_responses_model_is_source_owned_honors_enforced_model(async_client):
-    """An API key that forces a source-owned model must also be caught.
-
-    The HTTP handlers build their candidate list from the enforced model as
-    well as the requested one; the WebSocket guard has to match or an enforced
-    source model would fall through to subscription-account selection.
-    """
-    from app.modules.model_sources.selection import responses_model_is_source_owned
-
-    model = "ws-guard-enforced-model"
-    await _create_model_source(
-        async_client,
-        name="ws-guard-enforced",
-        model=model,
-        base_url="http://127.0.0.1:9/v1",
-        supports_responses=True,
-        supports_streaming=True,
-    )
-    enforcing_key = ApiKeyData(
-        id="key_ws_guard_enforced",
-        name="ws guard enforced",
-        key_prefix="sk-test-ws-enforced",
-        allowed_models=[],
-        enforced_model=model,
-        enforced_reasoning_effort=None,
-        enforced_service_tier=None,
-        expires_at=None,
-        is_active=True,
-        created_at=utcnow(),
-        last_used_at=None,
-    )
-
-    # The client asked for a subscription model, but the key forces the source.
-    assert await responses_model_is_source_owned("gpt-5.6-sol", enforcing_key) is True
+    assert seen_input == [
+        {
+            "type": "function_call",
+            "call_id": "call_123",
+            "name": "shell",
+            "arguments": "{}",
+        },
+        {
+            "type": "function_call_output",
+            "call_id": "call_123",
+            "output": "ok",
+        },
+    ]
 
 
 @pytest.mark.asyncio
@@ -655,50 +776,9 @@ async def test_responses_source_raw_alias_lookup_requires_exact_allowlist(async_
 
     assert canonical_selection is None
     assert exact_selection is not None
-    source, selected_model = exact_selection
-    assert source.name == "responses-alias-like-allowlist-source"
+    sources, selected_model = exact_selection
+    assert [source.name for source in sources] == ["responses-alias-like-allowlist-source"]
     assert selected_model == model
-
-
-@pytest.mark.asyncio
-async def test_responses_model_is_source_owned_prefers_the_raw_alias(async_client):
-    """WebSocket parity for the raw-alias candidate (see the HTTP test above).
-
-    Request preparation normalizes ``gpt-5-high`` to ``gpt-5`` before the
-    WebSocket guards run, so the guard helper must accept the client's raw
-    model and offer it to source selection ahead of the normalized one — the
-    HTTP path routes the identical request via ``raw_source_model``.
-    """
-    from app.modules.model_sources.selection import responses_model_is_source_owned
-
-    model = "gpt-5-high"
-    await _create_model_source(
-        async_client,
-        name="ws-guard-raw-alias",
-        model=model,
-        base_url="http://127.0.0.1:9/v1",
-        supports_responses=True,
-        supports_streaming=True,
-    )
-    exact_key = ApiKeyData(
-        id="key_ws_raw_alias",
-        name="ws raw alias",
-        key_prefix="sk-test-ws-raw-alias",
-        allowed_models=[model],
-        enforced_model=None,
-        enforced_reasoning_effort=None,
-        enforced_service_tier=None,
-        expires_at=None,
-        is_active=True,
-        created_at=utcnow(),
-        last_used_at=None,
-    )
-
-    assert await responses_model_is_source_owned("gpt-5", exact_key, raw_model=model) is True
-    # Without the raw candidate the exact allowlist hides the source. This is
-    # the pre-fix WebSocket behaviour; keeping it false proves the assertion
-    # above matched through the raw candidate, not some other fallback.
-    assert await responses_model_is_source_owned("gpt-5", exact_key) is False
 
 
 @pytest.mark.asyncio
@@ -978,6 +1058,65 @@ async def test_limited_key_settles_usage_from_crlf_stream(async_client, source_u
 
 
 @pytest.mark.asyncio
+async def test_limited_key_estimates_missing_stream_usage_when_source_opted_in(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    frames = (
+        b'data: {"id":"chatcmpl_est","object":"chat.completion.chunk","choices":'
+        b'[{"index":0,"delta":{"content":"estimated output"},"finish_reason":null}]}\n\n'
+        b'data: {"id":"chatcmpl_est","object":"chat.completion.chunk","choices":'
+        b'[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    async def stream_handler(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(frames)
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(stream_handler)
+    model = "source-estimated-usage-model"
+    source_id = await _create_model_source(
+        async_client,
+        name="estimated-usage",
+        model=model,
+        base_url=base_url,
+        estimate_missing_stream_usage=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "estimated-source-key",
+            "assignedSourceIds": [source_id],
+            "limits": [{"limitType": "total_tokens", "limitWindow": "weekly", "maxValue": 1_000}],
+        },
+    )
+    assert created.status_code == 200
+    key = created.json()["key"]
+    key_id = created.json()["id"]
+
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hello input"}], "stream": True},
+    ) as response:
+        assert response.status_code == 200
+        body = b"".join([chunk async for chunk in response.aiter_bytes()])
+        assert b"estimated output" in body
+
+    async with SessionLocal() as session:
+        limits = await ApiKeysRepository(session).get_limits_by_key(key_id)
+        assert len(limits) == 1
+        assert 2 <= limits[0].current_value < 1_000
+        log = (await session.execute(select(RequestLog).where(RequestLog.model_source_id == source_id))).scalars().one()
+        assert log.status == "success"
+        assert log.input_tokens > 0
+        assert log.output_tokens > 0
+
+
+@pytest.mark.asyncio
 async def test_source_invalid_json_2xx_maps_to_error_response(async_client, source_upstream):
     async def html_response(_request: web.Request) -> web.Response:
         return web.Response(status=200, text="<html>gateway page</html>", content_type="text/html")
@@ -1063,741 +1202,6 @@ async def test_cancelled_buffered_stream_releases_reservation(async_client, monk
 
 
 @pytest.mark.asyncio
-async def test_cancelled_buffered_stream_releases_reservation_when_close_fails(async_client, monkeypatch):
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceUsageHolder
-
-    released: list[object] = []
-
-    async def record_release(reservation: object) -> None:
-        released.append(reservation)
-
-    async def fail_close(_stream: object) -> None:
-        raise RuntimeError("close failed")
-
-    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
-    monkeypatch.setattr(proxy_api, "_aclose_stream", fail_close)
-
-    async def cancelled_stream() -> AsyncIterator[bytes]:
-        yield b"data: partial\n\n"
-        raise asyncio.CancelledError()
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_cancelled_close_fails",
-        name="cancelled-close-fails",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_cancelled_close_fails",
-        key_id="key_cancelled_close_fails",
-        model="cancelled-model",
-    )
-
-    with pytest.raises(RuntimeError, match="close failed"):
-        await proxy_api._buffered_limited_source_chat_stream_response(
-            request,
-            source=source,
-            api_key=None,
-            model="cancelled-model",
-            reservation=reservation,
-            stream=cancelled_stream(),
-            usage_holder=SourceUsageHolder(),
-            rate_limit_headers={},
-        )
-
-    assert released == [reservation]
-
-
-@pytest.mark.asyncio
-async def test_cancelled_buffered_stream_finishes_usage_settlement(async_client, monkeypatch):
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceUsage, SourceUsageHolder
-
-    settlement_started = asyncio.Event()
-    settlement_can_finish = asyncio.Event()
-    settled: list[object] = []
-    logs: list[dict[str, object]] = []
-
-    async def settle(reservation: object, **_kwargs: object) -> bool:
-        settlement_started.set()
-        await settlement_can_finish.wait()
-        settled.append(reservation)
-        return True
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(kwargs)
-
-    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    async def complete_stream() -> AsyncIterator[bytes]:
-        yield b"data: done\n\n"
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_settlement_cancelled",
-        name="settlement-cancelled",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_settlement_cancelled",
-        key_id="key_settlement_cancelled",
-        model="cancelled-model",
-    )
-    usage_holder = SourceUsageHolder(usage=SourceUsage(input_tokens=3, output_tokens=5))
-
-    task = asyncio.create_task(
-        proxy_api._buffered_limited_source_chat_stream_response(
-            request,
-            source=source,
-            api_key=None,
-            model="cancelled-model",
-            reservation=reservation,
-            stream=complete_stream(),
-            usage_holder=usage_holder,
-            rate_limit_headers={},
-        )
-    )
-    await asyncio.wait_for(settlement_started.wait(), timeout=1)
-    task.cancel()
-    settlement_can_finish.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert settled == [reservation]
-    assert logs[-1]["status"] == "cancelled"
-    assert logs[-1]["error_code"] == "client_disconnected"
-    assert logs[-1]["usage"] == usage_holder.usage
-
-
-@pytest.mark.asyncio
-async def test_cancelled_buffered_stream_logs_disconnect(async_client, monkeypatch):
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceUsageHolder
-
-    released: list[object] = []
-    logs: list[dict[str, object]] = []
-
-    async def record_release(reservation: object) -> None:
-        released.append(reservation)
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(kwargs)
-
-    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    async def cancelled_stream() -> AsyncIterator[bytes]:
-        yield b"data: partial\n\n"
-        raise asyncio.CancelledError()
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_buffered_cancelled_log",
-        name="buffered-cancelled-log",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_buffered_cancelled_log",
-        key_id="key_buffered_cancelled_log",
-        model="cancelled-model",
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        await proxy_api._buffered_limited_source_chat_stream_response(
-            request,
-            source=source,
-            api_key=None,
-            model="cancelled-model",
-            reservation=reservation,
-            stream=cancelled_stream(),
-            usage_holder=SourceUsageHolder(),
-            rate_limit_headers={},
-        )
-
-    assert released == [reservation]
-    assert logs[-1]["status"] == "cancelled"
-    assert logs[-1]["error_code"] == "client_disconnected"
-    assert logs[-1]["error_message"] == "client disconnected during source stream buffering"
-
-
-@pytest.mark.asyncio
-async def test_source_completion_success_log_finishes_after_cancellation(async_client, monkeypatch):
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.core.openai.chat_requests import ChatCompletionsRequest
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceChatCompletion, SourceUsage
-
-    log_started = asyncio.Event()
-    allow_log_finish = asyncio.Event()
-    logs: list[dict[str, object]] = []
-
-    async def fake_forward(*_args: object, **_kwargs: object) -> SourceChatCompletion:
-        return SourceChatCompletion(
-            payload={"id": "chatcmpl_cancelled_after_settlement"},
-            usage=SourceUsage(input_tokens=3, output_tokens=5),
-            timings=None,
-            upstream_status_code=200,
-        )
-
-    async def settle(*_args: object, **_kwargs: object) -> bool:
-        return True
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(kwargs)
-        log_started.set()
-        await allow_log_finish.wait()
-
-    monkeypatch.setattr(proxy_api, "forward_chat_completion", fake_forward)
-    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_completion_cancelled_log",
-        name="completion-cancelled-log",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    payload = ChatCompletionsRequest.model_validate(
-        {
-            "model": "completion-cancelled-log",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": False,
-        }
-    )
-
-    task = asyncio.create_task(
-        proxy_api._source_chat_completion_response(
-            request,
-            payload,
-            source=source,
-            model="completion-cancelled-log",
-            api_key=None,
-            reservation=None,
-            rate_limit_headers={},
-        )
-    )
-    await asyncio.wait_for(log_started.wait(), timeout=1)
-    task.cancel()
-    allow_log_finish.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert logs[-1]["status"] == "success"
-    assert logs[-1]["usage"] == SourceUsage(input_tokens=3, output_tokens=5)
-
-
-@pytest.mark.asyncio
-async def test_source_stream_setup_cancellation_logs_visible_error_even_if_release_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.core.openai.chat_requests import ChatCompletionsRequest
-    from app.db.models import ModelSource
-
-    logs: list[dict[str, object]] = []
-    release_attempts: list[object] = []
-
-    async def cancel_during_open(*_args: object, **_kwargs: object) -> object:
-        raise asyncio.CancelledError
-
-    async def fail_release(reservation: object) -> None:
-        release_attempts.append(reservation)
-        raise RuntimeError("sqlite busy")
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(dict(kwargs))
-
-    monkeypatch.setattr(proxy_api, "stream_source_chat_completion", cancel_during_open)
-    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", fail_release)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_stream_setup_cancel",
-        name="stream-setup-cancel",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_stream_setup_cancel",
-        key_id="key_stream_setup_cancel",
-        model="stream-setup-cancel",
-    )
-    payload = ChatCompletionsRequest.model_validate(
-        {
-            "model": "stream-setup-cancel",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": True,
-        }
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        await proxy_api._source_chat_completion_response(
-            request,
-            payload,
-            source=source,
-            model="stream-setup-cancel",
-            api_key=None,
-            reservation=reservation,
-            rate_limit_headers={},
-        )
-
-    assert release_attempts == [reservation]
-    assert logs == [
-        {
-            "source": source,
-            "api_key": None,
-            "model": "stream-setup-cancel",
-            "status": "cancelled",
-            "error_code": "client_disconnected",
-            "error_message": "client disconnected during source stream setup",
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_source_request_setup_cancellation_logs_disconnect_even_if_release_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.core.openai.chat_requests import ChatCompletionsRequest
-    from app.db.models import ModelSource
-
-    logs: list[dict[str, object]] = []
-    release_attempts: list[object] = []
-
-    async def cancel_during_forward(*_args: object, **_kwargs: object) -> object:
-        raise asyncio.CancelledError
-
-    async def fail_release(reservation: object) -> None:
-        release_attempts.append(reservation)
-        raise RuntimeError("sqlite busy")
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(dict(kwargs))
-
-    monkeypatch.setattr(proxy_api, "forward_chat_completion", cancel_during_forward)
-    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", fail_release)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_request_setup_cancel_release_fail",
-        name="request-setup-cancel-release-fail",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_request_setup_cancel_release_fail",
-        key_id="key_request_setup_cancel_release_fail",
-        model="request-setup-cancel-release-fail",
-    )
-    payload = ChatCompletionsRequest.model_validate(
-        {
-            "model": "request-setup-cancel-release-fail",
-            "messages": [{"role": "user", "content": "hello"}],
-            "stream": False,
-        }
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        await proxy_api._source_chat_completion_response(
-            request,
-            payload,
-            source=source,
-            model="request-setup-cancel-release-fail",
-            api_key=None,
-            reservation=reservation,
-            rate_limit_headers={},
-        )
-
-    assert release_attempts == [reservation]
-    assert logs == [
-        {
-            "source": source,
-            "api_key": None,
-            "model": "request-setup-cancel-release-fail",
-            "status": "cancelled",
-            "error_code": "client_disconnected",
-            "error_message": "client disconnected during source request setup",
-        }
-    ]
-
-
-@pytest.mark.asyncio
-async def test_buffered_stream_cancellation_logs_disconnect_even_if_release_fails(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceUsageHolder
-
-    logs: list[dict[str, object]] = []
-    release_attempts: list[object] = []
-
-    async def fail_release(reservation: object) -> None:
-        release_attempts.append(reservation)
-        raise RuntimeError("sqlite busy")
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(dict(kwargs))
-
-    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", fail_release)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    async def cancelled_stream() -> AsyncIterator[bytes]:
-        yield b"data: partial\n\n"
-        raise asyncio.CancelledError()
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_buffered_cancel_release_fail",
-        name="buffered-cancel-release-fail",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_buffered_cancel_release_fail",
-        key_id="key_buffered_cancel_release_fail",
-        model="buffered-cancel-release-fail",
-    )
-
-    with pytest.raises(asyncio.CancelledError):
-        await proxy_api._buffered_limited_source_chat_stream_response(
-            request,
-            source=source,
-            api_key=None,
-            model="buffered-cancel-release-fail",
-            reservation=reservation,
-            stream=cancelled_stream(),
-            usage_holder=SourceUsageHolder(),
-            rate_limit_headers={},
-        )
-
-    assert release_attempts == [reservation]
-    assert logs[-1]["status"] == "cancelled"
-    assert logs[-1]["error_code"] == "client_disconnected"
-    assert logs[-1]["error_message"] == "client disconnected during source stream buffering"
-
-
-@pytest.mark.asyncio
-async def test_source_stream_body_teardown_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPatch):
-    from contextlib import AsyncExitStack
-
-    import app.modules.model_sources.forwarding as forwarding_module
-    from app.db.models import ModelSource
-
-    stream_blocked = asyncio.Event()
-    release_started = asyncio.Event()
-    allow_release = asyncio.Event()
-    release_finished = asyncio.Event()
-
-    class _SlowLease:
-        async def __aenter__(self) -> None:
-            return None
-
-        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
-            release_started.set()
-            await allow_release.wait()
-            release_finished.set()
-            return False
-
-    stack = AsyncExitStack()
-    await stack.enter_async_context(_SlowLease())
-
-    class _FakeContent:
-        def iter_chunked(self, _size: int) -> AsyncIterator[bytes]:
-            async def gen() -> AsyncIterator[bytes]:
-                yield b"data: chunk\n\n"
-                stream_blocked.set()
-                await asyncio.Event().wait()
-
-            return gen()
-
-    class _FakeResponse:
-        status = 200
-        content = _FakeContent()
-
-    async def fake_open(*_args: object, **_kwargs: object) -> object:
-        return stack, _FakeResponse()
-
-    monkeypatch.setattr(forwarding_module, "_open_source_stream", fake_open)
-
-    source = ModelSource(
-        id="src_body_teardown_repeated_cancel",
-        name="body-teardown-repeated-cancel",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    stream = await forwarding_module.stream_chat_completion(source, {"model": "body-teardown"})
-
-    async def consume() -> None:
-        async for _chunk in stream.body:
-            pass
-
-    task = asyncio.create_task(consume())
-    await asyncio.wait_for(stream_blocked.wait(), timeout=1)
-    await asyncio.sleep(0)
-
-    task.cancel()
-    await asyncio.wait_for(release_started.wait(), timeout=1)
-    # Second cancellation delivery while the exit stack is unwinding: teardown
-    # must still return the pooled HTTP lease.
-    task.cancel()
-    await asyncio.sleep(0)
-    allow_release.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await asyncio.wait_for(task, timeout=1)
-
-    assert release_finished.is_set()
-
-
-@pytest.mark.asyncio
-async def test_open_source_stream_cleanup_finishes_after_cancellation(monkeypatch: pytest.MonkeyPatch):
-    import app.modules.model_sources.forwarding as forwarding_module
-    from app.db.models import ModelSource
-
-    cleanup_started = asyncio.Event()
-    allow_cleanup_finish = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-
-    class _FailingPostContext:
-        async def __aenter__(self):
-            raise asyncio.CancelledError()
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            del exc_type, exc, tb
-            return False
-
-    class _Session:
-        def post(self, *_args: object, **_kwargs: object) -> _FailingPostContext:
-            return _FailingPostContext()
-
-    class _SessionLease:
-        async def __aenter__(self) -> _Session:
-            return _Session()
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            del exc_type, exc, tb
-            cleanup_started.set()
-            await allow_cleanup_finish.wait()
-            cleanup_finished.set()
-            return False
-
-    monkeypatch.setattr(forwarding_module, "lease_http_session", lambda: _SessionLease())
-
-    source = ModelSource(
-        id="src_open_cancelled_cleanup",
-        name="open-cancelled-cleanup",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-
-    task = asyncio.create_task(
-        forwarding_module._open_source_stream(
-            source,
-            "/chat/completions",
-            {"model": "open-cancelled-cleanup"},
-            encryptor=None,
-        )
-    )
-    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
-    task.cancel()
-    allow_cleanup_finish.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert cleanup_finished.is_set() is True
-
-
-@pytest.mark.asyncio
-async def test_forward_chat_completion_cleanup_finishes_after_cancellation(monkeypatch: pytest.MonkeyPatch):
-    import app.modules.model_sources.forwarding as forwarding_module
-    from app.db.models import ModelSource
-
-    cleanup_started = asyncio.Event()
-    allow_cleanup_finish = asyncio.Event()
-    cleanup_finished = asyncio.Event()
-
-    class _Response:
-        status = 200
-
-        async def json(self, content_type=None):
-            del content_type
-            return {
-                "id": "chatcmpl_forward_cancelled_cleanup",
-                "usage": {"prompt_tokens": 3, "completion_tokens": 5},
-            }
-
-    class _PostContext:
-        async def __aenter__(self) -> _Response:
-            return _Response()
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            del exc_type, exc, tb
-            return False
-
-    class _Session:
-        def post(self, *_args: object, **_kwargs: object) -> _PostContext:
-            return _PostContext()
-
-    class _SessionLease:
-        async def __aenter__(self) -> _Session:
-            return _Session()
-
-        async def __aexit__(self, exc_type, exc, tb) -> bool:
-            del exc_type, exc, tb
-            cleanup_started.set()
-            await allow_cleanup_finish.wait()
-            cleanup_finished.set()
-            return False
-
-    monkeypatch.setattr(forwarding_module, "lease_http_session", lambda: _SessionLease())
-
-    source = ModelSource(
-        id="src_forward_cancelled_cleanup",
-        name="forward-cancelled-cleanup",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-
-    task = asyncio.create_task(
-        forwarding_module.forward_chat_completion(
-            source,
-            {"model": "forward-cancelled-cleanup", "messages": [{"role": "user", "content": "hello"}]},
-        )
-    )
-    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
-    task.cancel()
-    allow_cleanup_finish.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert cleanup_finished.is_set() is True
-
-
-@pytest.mark.asyncio
 async def test_downstream_disconnect_closes_source_stream(async_client, monkeypatch):
     from starlette.requests import Request
 
@@ -1867,167 +1271,6 @@ async def test_downstream_disconnect_closes_source_stream(async_client, monkeypa
 
     assert released == [reservation]
     assert stream_closed is True
-
-
-@pytest.mark.asyncio
-async def test_source_stream_disconnect_logs_cancelled_not_error(async_client, db_setup, monkeypatch):
-    """Regression for #1552: a downstream disconnect mid-stream on a
-    model-source route is a normal client-side terminal — recorded as
-    status=cancelled (like the main proxy path), counted in cancelled_count,
-    and excluded from the error rate and top_error."""
-    from datetime import timedelta
-
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceUsageHolder
-    from app.modules.request_logs.repository import RequestLogsRepository
-
-    async def record_release(reservation: object) -> None:
-        del reservation
-
-    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
-
-    async def source_stream() -> AsyncIterator[bytes]:
-        yield b"data: partial\n\n"
-        await asyncio.sleep(60)
-
-    request = Request(
-        {
-            "type": "http",
-            "method": "POST",
-            "path": "/v1/chat/completions",
-            "headers": [],
-            "client": ("127.0.0.1", 1234),
-            "query_string": b"",
-        }
-    )
-    source = ModelSource(
-        id="src_cx_log",
-        name="cx-log",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    response_stream = cast(
-        AsyncGenerator[bytes, None],
-        proxy_api._source_chat_stream_with_settlement(
-            source_stream(),
-            usage_holder=SourceUsageHolder(),
-            request=request,
-            source=source,
-            api_key=None,
-            model="cx-log-model",
-            reservation=None,
-        ),
-    )
-
-    assert await anext(response_stream) == b"data: partial\n\n"
-    await response_stream.aclose()
-
-    async with SessionLocal() as session:
-        row = (await session.execute(select(RequestLog).where(RequestLog.model_source_id == "src_cx_log"))).scalar_one()
-        assert row.status == "cancelled"
-        assert row.error_code == "client_disconnected"
-
-        # The status classification is what every metric surface keys on:
-        # the disconnect must not join the error numerator or top_error.
-        aggregate = await RequestLogsRepository(session).aggregate_usage_metrics_since(utcnow() - timedelta(minutes=5))
-        assert aggregate.request_count == 1
-        assert aggregate.error_count == 0
-        assert aggregate.cancelled_count == 1
-        assert aggregate.top_error is None
-
-
-@pytest.mark.asyncio
-async def test_source_stream_settlement_cancellation_logs_cancelled_not_success(monkeypatch: pytest.MonkeyPatch):
-    from starlette.requests import Request
-
-    import app.modules.proxy.api as proxy_api
-    from app.db.models import ModelSource
-    from app.modules.model_sources.forwarding import SourceUsage, SourceUsageHolder
-
-    settle_started = asyncio.Event()
-    allow_settle_finish = asyncio.Event()
-    released: list[object] = []
-    logs: list[dict[str, object]] = []
-
-    async def settle(*_args: object, **_kwargs: object) -> bool:
-        settle_started.set()
-        await allow_settle_finish.wait()
-        return True
-
-    async def record_release(reservation: object) -> None:
-        released.append(reservation)
-
-    async def record_log(*_args: object, **kwargs: object) -> None:
-        logs.append(dict(kwargs))
-
-    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
-    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
-    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
-
-    async def source_stream() -> AsyncIterator[bytes]:
-        yield b"data: partial\n\n"
-
-    request = Request(
-        {
-            "type": "http",
-            "http_version": "1.1",
-            "method": "POST",
-            "scheme": "http",
-            "path": "/v1/chat/completions",
-            "raw_path": b"/v1/chat/completions",
-            "query_string": b"",
-            "headers": [],
-            "client": ("127.0.0.1", 0),
-            "server": ("testserver", 80),
-        }
-    )
-    source = ModelSource(
-        id="src_stream_settlement_cancel",
-        name="stream-settlement-cancel",
-        kind="openai_compatible",
-        base_url="http://127.0.0.1:9/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=False,
-    )
-    reservation = ApiKeyUsageReservationData(
-        reservation_id="resv_stream_settlement_cancel",
-        key_id="key_stream_settlement_cancel",
-        model="stream-settlement-cancel",
-    )
-    usage_holder = SourceUsageHolder(usage=SourceUsage(input_tokens=3, output_tokens=5))
-
-    async def consume_stream() -> None:
-        async for _chunk in proxy_api._source_chat_stream_with_settlement(
-            source_stream(),
-            usage_holder=usage_holder,
-            request=request,
-            source=source,
-            api_key=None,
-            model="stream-settlement-cancel",
-            reservation=reservation,
-        ):
-            pass
-
-    task = asyncio.create_task(consume_stream())
-    await asyncio.wait_for(settle_started.wait(), timeout=1)
-    task.cancel()
-    allow_settle_finish.set()
-
-    with pytest.raises(asyncio.CancelledError):
-        await task
-
-    assert released == []
-    assert logs[-1]["status"] == "cancelled"
-    assert logs[-1]["error_code"] == "client_disconnected"
-    assert logs[-1]["error_message"] == "client disconnected during source usage settlement"
-    assert logs[-1]["usage"] == usage_holder.usage
 
 
 @pytest.mark.asyncio
@@ -2293,6 +1536,143 @@ async def test_source_chat_prefers_raw_alias_like_model_slug(async_client, sourc
 
 
 @pytest.mark.asyncio
+async def test_source_chat_forwards_configured_upstream_model_alias(async_client, source_upstream):
+    captured: dict[str, object] = {}
+
+    async def capture(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(_chat_completion_body("vendor/real-model"))
+
+    base_url = await source_upstream(capture)
+    public_model = "gpt-5.5"
+    upstream_model = "vendor/real-model"
+    source_id = await _create_model_source(
+        async_client,
+        name="renamed-source",
+        model=public_model,
+        upstream_model=upstream_model,
+        base_url=base_url,
+    )
+    await _enable_api_key_auth(async_client)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "renamed-source-key",
+            "assignedSourceIds": [source_id],
+            "allowedModels": [public_model],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={"model": public_model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert captured["model"] == upstream_model
+
+
+@pytest.mark.asyncio
+async def test_native_model_routing_modes_choose_account_provider_and_balanced(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "gpt-5.6-sol"
+    await _create_model_source(
+        async_client,
+        name="native-overlap-provider",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+    )
+
+    def key(mode: str) -> ApiKeyData:
+        return ApiKeyData(
+            id=f"key_{mode}",
+            name=mode,
+            key_prefix="***",
+            allowed_models=[model],
+            enforced_model=None,
+            enforced_reasoning_effort=None,
+            enforced_service_tier=None,
+            expires_at=None,
+            is_active=True,
+            created_at=utcnow(),
+            last_used_at=None,
+            routing_mode=mode,
+        )
+
+    assert await proxy_api._select_chat_model_source(model, key("account_first")) is None
+    assert await proxy_api._select_chat_model_source(model, key("provider_first")) is not None
+    balanced_first = await proxy_api._select_chat_model_source(model, key("balanced"))
+    balanced_second = await proxy_api._select_chat_model_source(model, key("balanced"))
+    assert (balanced_first is None) != (balanced_second is None)
+
+
+@pytest.mark.asyncio
+async def test_chat_source_selector_sticks_to_prompt_cache_key(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "sticky-source-model"
+    first_id = await _create_model_source(async_client, name="sticky-a", model=model, base_url="http://127.0.0.1:9/v1")
+    second_id = await _create_model_source(
+        async_client, name="sticky-b", model=model, base_url="http://127.0.0.1:10/v1"
+    )
+    key = ApiKeyData(
+        id="key_sticky_source",
+        name="sticky",
+        key_prefix="sk-sticky",
+        allowed_models=[model],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+        routing_mode="provider_first",
+    )
+    payload = ResponsesRequest.model_validate(
+        {"model": model, "instructions": "", "input": "same session", "prompt_cache_key": "cache-key-1"}
+    )
+    first = await proxy_api._select_chat_model_source(model, key, payload=payload)
+    assert first is not None
+    selected = first[0][0]
+    proxy_api._remember_sticky_source(f"{key.id}:{model}:cache-key-1", selected)
+    second = await proxy_api._select_chat_model_source(model, key, payload=payload)
+    assert second is not None
+    assert second[0][0].id == selected.id
+    assert {source.id for source in second[0]} == {first_id, second_id}
+
+
+@pytest.mark.asyncio
+async def test_chat_source_selector_round_robins_eligible_providers(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "round-robin-source-model"
+    await _create_model_source(
+        async_client,
+        name="round-robin-a",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+    )
+    await _create_model_source(
+        async_client,
+        name="round-robin-b",
+        model=model,
+        base_url="http://127.0.0.1:10/v1",
+    )
+
+    first = await proxy_api._select_chat_model_source(model, None)
+    second = await proxy_api._select_chat_model_source(model, None)
+
+    assert first is not None
+    assert second is not None
+    assert [source.name for source in first[0]] == ["round-robin-a", "round-robin-b"]
+    assert [source.name for source in second[0]] == ["round-robin-b", "round-robin-a"]
+
+
+@pytest.mark.asyncio
 async def test_source_chat_raw_alias_lookup_requires_exact_allowlist(async_client):
     import app.modules.proxy.api as proxy_api
 
@@ -2343,8 +1723,8 @@ async def test_source_chat_raw_alias_lookup_requires_exact_allowlist(async_clien
 
     assert canonical_selection is None
     assert exact_selection is not None
-    source, selected_model = exact_selection
-    assert source.name == "alias-like-allowlist-source"
+    sources, selected_model = exact_selection
+    assert [source.name for source in sources] == ["alias-like-allowlist-source"]
     assert selected_model == model
 
 
@@ -2370,34 +1750,6 @@ async def test_v1_models_metadata_reflects_reasoning_optin(async_client):
 
     assert by_id["reasoning-metadata-model"]["supports_reasoning"] is True
     assert by_id["plain-metadata-model"]["supports_reasoning"] is False
-
-
-@pytest.mark.asyncio
-async def test_v1_models_context_window_override_applies_to_source_model(async_client, monkeypatch):
-    # Source-catalog models synthesize `max_context_window == context_window`
-    # purely so Codex clients can parse the entry; that parseability default
-    # must not clamp an operator raise override to the un-raised window.
-    await _create_model_source(
-        async_client,
-        name="override-source",
-        model="override-source-model",
-        base_url="http://127.0.0.1:9/v1",
-    )
-
-    from app.core.config.settings import get_settings
-    from app.modules.proxy import api as proxy_api_module
-
-    patched = get_settings().model_copy(update={"model_context_window_overrides": {"override-source-model": 32_768}})
-    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: patched)
-
-    response = await async_client.get("/v1/models")
-    assert response.status_code == 200
-    item = next(m for m in response.json()["data"] if m["id"] == "override-source-model")
-    assert item["metadata"]["context_window"] == 32_768
-    assert item["metadata"]["input_context_window"] == 32_768
-    assert item["capabilities"]["context_length"] == 32_768
-    assert item["contextLength"] == 32_768
-    assert item["context_length"] == 32_768
 
 
 @pytest.mark.asyncio
@@ -2432,6 +1784,9 @@ async def test_source_chat_payload_keeps_reasoning_toggles_for_optin_model(async
     assert captured["include_reasoning"] is True
     assert captured["reasoning_effort"] == "high"
     assert "tools" not in captured
+    async with SessionLocal() as session:
+        log = (await session.execute(select(RequestLog).where(RequestLog.model == model))).scalar_one()
+        assert log.reasoning_effort == "high"
 
 
 @pytest.mark.asyncio
@@ -2478,6 +1833,9 @@ async def test_source_chat_payload_overrides_enforced_reasoning_object(async_cli
     assert response.status_code == 200
     assert captured["reasoning"] == {"effort": "high", "summary": "auto"}
     assert captured["reasoning_effort"] == "high"
+    async with SessionLocal() as session:
+        log = (await session.execute(select(RequestLog).where(RequestLog.model == model))).scalar_one()
+        assert log.reasoning_effort == "high"
 
 
 @pytest.mark.asyncio
@@ -2534,566 +1892,6 @@ async def test_allowlisted_source_model_routes_through(async_client, source_upst
         json={"model": "some-other-model", "messages": [{"role": "user", "content": "hi"}]},
     )
     assert denied.status_code == 403
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "reasoning_controls",
-    [
-        {"reasoning_effort": "max"},
-        {"thinking": "minimal"},
-        {"reasoning_effort": "max", "reasoning": {"summary": "auto"}},
-        {"thinking": False, "enable_thinking": True},
-        {"thinking": "disabled", "enable_thinking": True},
-        {"thinking": {"summary": "auto", "enabled": True}},
-        {"thinking": {"summary": "auto"}, "enable_thinking": True},
-    ],
-)
-async def test_source_chat_reasoning_allowlist_rejects_before_source_dispatch(
-    async_client,
-    source_upstream,
-    reasoning_controls,
-):
-    await _enable_api_key_auth(async_client)
-    source_hits = 0
-
-    async def completion(_request: web.Request) -> web.Response:
-        nonlocal source_hits
-        source_hits += 1
-        return web.json_response(_chat_completion_body("source-reasoning-policy"))
-
-    base_url = await source_upstream(completion)
-    model = "source-reasoning-policy"
-    source_id = await _create_model_source(async_client, name="source-reasoning-policy", model=model, base_url=base_url)
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "source-reasoning-policy-key",
-            "assignedSourceIds": [source_id],
-            "allowedReasoningEfforts": ["low"],
-        },
-    )
-    assert created.status_code == 200
-
-    response = await async_client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            **reasoning_controls,
-        },
-    )
-
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
-    assert source_hits == 0
-
-
-@pytest.mark.asyncio
-async def test_source_chat_reasoning_allowlist_preserves_client_plane_effort(async_client, source_upstream):
-    await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def completion(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(_chat_completion_body("source-client-plane-reasoning"))
-
-    base_url = await source_upstream(completion)
-    model = "source-client-plane-reasoning"
-    source_id = await _create_model_source(
-        async_client,
-        name="source-client-plane-reasoning",
-        model=model,
-        base_url=base_url,
-        raw_metadata_json='{"supports_reasoning": true}',
-    )
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "source-client-plane-reasoning-key",
-            "assignedSourceIds": [source_id],
-            "allowedReasoningEfforts": ["minimal"],
-        },
-    )
-    assert created.status_code == 200
-
-    response = await async_client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "reasoning_effort": "minimal",
-            "thinking": {
-                "effort": "minimal",
-                "type": "disabled",
-                "enabled": False,
-                "vendor_hint": "keep",
-            },
-        },
-    )
-
-    assert response.status_code == 200
-    assert captured["reasoning_effort"] == "minimal"
-    assert captured["thinking"] == {"effort": "minimal", "vendor_hint": "keep"}
-    assert "reasoning" not in captured
-
-
-@pytest.mark.asyncio
-async def test_source_chat_reasoning_allowlist_preserves_enable_thinking(async_client, source_upstream):
-    await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def completion(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(_chat_completion_body("source-enable-thinking"))
-
-    base_url = await source_upstream(completion)
-    model = "source-enable-thinking"
-    source_id = await _create_model_source(
-        async_client,
-        name="source-enable-thinking",
-        model=model,
-        base_url=base_url,
-        raw_metadata_json='{"supports_reasoning": true}',
-    )
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "source-enable-thinking-key",
-            "assignedSourceIds": [source_id],
-            "allowedReasoningEfforts": ["medium"],
-        },
-    )
-    assert created.status_code == 200
-
-    response = await async_client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json={
-            "model": model,
-            "messages": [{"role": "user", "content": "hi"}],
-            "enable_thinking": True,
-        },
-    )
-
-    assert response.status_code == 200
-    assert captured["enable_thinking"] is True
-    assert "reasoning" not in captured
-    assert "reasoning_effort" not in captured
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("thinking", "enable_thinking", "expected_thinking"),
-    [
-        (
-            {"type": "enabled", "budget_tokens": 2048},
-            False,
-            {"type": "enabled", "budget_tokens": 2048},
-        ),
-        (
-            {"enabled": True, "summary": "auto", "vendor_hint": "keep"},
-            False,
-            {"enabled": True, "summary": "auto", "vendor_hint": "keep"},
-        ),
-        (
-            {"effort": " ", "enabled": True, "budget_tokens": 2048, "vendor_hint": "keep"},
-            False,
-            {"enabled": True, "budget_tokens": 2048, "vendor_hint": "keep"},
-        ),
-        ({"enabled": False}, True, None),
-        ({"type": "disabled"}, True, None),
-    ],
-)
-async def test_source_chat_reasoning_allowlist_preserves_implicit_thinking_object(
-    async_client,
-    source_upstream,
-    thinking,
-    enable_thinking,
-    expected_thinking,
-):
-    await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def completion(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(_chat_completion_body("source-implicit-thinking"))
-
-    base_url = await source_upstream(completion)
-    model = "source-implicit-thinking"
-    source_id = await _create_model_source(
-        async_client,
-        name=model,
-        model=model,
-        base_url=base_url,
-        raw_metadata_json='{"supports_reasoning": true}',
-    )
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "source-implicit-thinking-key",
-            "assignedSourceIds": [source_id],
-            "allowedReasoningEfforts": ["medium"],
-        },
-    )
-    assert created.status_code == 200
-
-    request_payload = {
-        "model": model,
-        "messages": [{"role": "user", "content": "hi"}],
-        "thinking": thinking,
-    }
-    if enable_thinking:
-        request_payload["enable_thinking"] = True
-    response = await async_client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json=request_payload,
-    )
-
-    assert response.status_code == 200
-    if expected_thinking is None:
-        assert "thinking" not in captured
-    else:
-        assert captured["thinking"] == expected_thinking
-    if enable_thinking:
-        assert captured["enable_thinking"] is True
-    assert "reasoning" not in captured
-    assert "reasoning_effort" not in captured
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("alias_source", ["requested", "enforced"])
-async def test_source_chat_reasoning_allowlist_materializes_canonicalized_model_alias_effort(
-    async_client,
-    source_upstream,
-    alias_source,
-):
-    await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def completion(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(_chat_completion_body("gpt-5.6-sol"))
-
-    base_url = await source_upstream(completion)
-    model = "gpt-5.6-sol"
-    source_id = await _create_model_source(
-        async_client,
-        name="source-canonical-model-alias-effort",
-        model=model,
-        base_url=base_url,
-        raw_metadata_json='{"supports_reasoning": true}',
-    )
-    key_payload = {
-        "name": "source-canonical-model-alias-effort-key",
-        "assignedSourceIds": [source_id],
-        "allowedReasoningEfforts": ["xhigh"],
-    }
-    if alias_source == "enforced":
-        key_payload["enforcedModel"] = f"{model}-xhigh"
-    created = await async_client.post("/api/api-keys/", json=key_payload)
-    assert created.status_code == 200
-
-    response = await async_client.post(
-        "/v1/chat/completions",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json={
-            "model": f"{model}-xhigh" if alias_source == "requested" else model,
-            "messages": [{"role": "user", "content": "hi"}],
-        },
-    )
-
-    assert response.status_code == 200
-    assert captured["model"] == model
-    assert captured["reasoning_effort"] == "xhigh"
-    assert "reasoning" not in captured
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("with_allowlist", "reasoning", "enable_thinking", "thinking_effort"),
-    [
-        (False, None, False, None),
-        (True, None, False, None),
-        (True, {"effort": "low"}, False, None),
-        (True, {"effort": "low"}, True, None),
-        (True, {"effort": "low"}, False, " "),
-    ],
-)
-async def test_source_responses_preserves_effortless_provider_thinking_object(
-    async_client,
-    source_upstream,
-    with_allowlist,
-    reasoning,
-    enable_thinking,
-    thinking_effort,
-):
-    if with_allowlist:
-        await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def responses(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(
-            {
-                "id": "resp_provider_thinking",
-                "object": "response",
-                "status": "completed",
-                "model": "source-provider-thinking",
-                "output": [],
-            }
-        )
-
-    base_url = await source_upstream(responses)
-    model = "source-provider-thinking"
-    source_id = await _create_model_source(
-        async_client,
-        name="source-provider-thinking",
-        model=model,
-        base_url=base_url,
-        supports_responses=True,
-    )
-    thinking = {"type": "adaptive", "budget": 4096, "budget_tokens": 2048, "vendor_hint": "keep"}
-    if thinking_effort is not None:
-        thinking["effort"] = thinking_effort
-    headers: dict[str, str] = {}
-    if with_allowlist:
-        created = await async_client.post(
-            "/api/api-keys/",
-            json={
-                "name": "source-provider-thinking-key",
-                "assignedSourceIds": [source_id],
-                "allowedReasoningEfforts": ["low"],
-            },
-        )
-        assert created.status_code == 200
-        headers["Authorization"] = f"Bearer {created.json()['key']}"
-
-    request_payload = {
-        "model": model,
-        "instructions": "hi",
-        "input": [],
-        "thinking": thinking,
-    }
-    if reasoning is not None:
-        request_payload["reasoning"] = reasoning
-    if enable_thinking:
-        request_payload["enable_thinking"] = True
-
-    response = await async_client.post("/v1/responses", headers=headers, json=request_payload)
-
-    assert response.status_code == 200
-    expected_thinking = {key: value for key, value in thinking.items() if key != "effort"}
-    assert captured["thinking"] == expected_thinking
-    if reasoning is None:
-        assert "reasoning" not in captured
-    else:
-        assert captured["reasoning"] == reasoning
-    if enable_thinking:
-        assert "enable_thinking" not in captured
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("key_policy", "reasoning_control", "expected_control"),
-    [
-        ("none", {"thinking": "minimal"}, {"thinking": "minimal"}),
-        ("unrestricted", {"thinking": "minimal"}, {"thinking": "minimal"}),
-        ("allowlisted", {"thinking": "minimal"}, {"reasoning": {"effort": "minimal"}}),
-        ("enforced", {"thinking": "low"}, {"reasoning": {"effort": "minimal"}}),
-        ("none", {"reasoning": {"effort": "minimal"}}, {"reasoning": {"effort": "minimal"}}),
-        ("allowlisted", {"reasoning": {"effort": "minimal"}}, {"reasoning": {"effort": "minimal"}}),
-    ],
-)
-async def test_source_responses_preserves_client_plane_reasoning_effort(
-    async_client,
-    source_upstream,
-    key_policy,
-    reasoning_control,
-    expected_control,
-):
-    if key_policy != "none":
-        await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def responses(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(
-            {
-                "id": "resp_provider_reasoning_alias",
-                "object": "response",
-                "status": "completed",
-                "model": "source-provider-reasoning-alias",
-                "output": [],
-            }
-        )
-
-    base_url = await source_upstream(responses)
-    model = "source-provider-reasoning-alias"
-    source_id = await _create_model_source(
-        async_client,
-        name=model,
-        model=model,
-        base_url=base_url,
-        supports_responses=True,
-    )
-    headers: dict[str, str] = {}
-    if key_policy != "none":
-        key_payload = {
-            "name": "source-provider-reasoning-alias-key",
-            "assignedSourceIds": [source_id],
-        }
-        if key_policy == "allowlisted":
-            key_payload["allowedReasoningEfforts"] = ["minimal"]
-        elif key_policy == "enforced":
-            key_payload["enforcedReasoningEffort"] = "minimal"
-        created = await async_client.post(
-            "/api/api-keys/",
-            json=key_payload,
-        )
-        assert created.status_code == 200
-        headers["Authorization"] = f"Bearer {created.json()['key']}"
-
-    response = await async_client.post(
-        "/v1/responses",
-        headers=headers,
-        json={
-            "model": model,
-            "instructions": "hi",
-            "input": [],
-            **reasoning_control,
-        },
-    )
-
-    assert response.status_code == 200
-    for field in ("thinking", "reasoning"):
-        if field in expected_control:
-            assert captured[field] == expected_control[field]
-        else:
-            assert field not in captured
-
-
-@pytest.mark.asyncio
-async def test_source_responses_reasoning_allowlist_strips_conflicting_aliases(async_client, source_upstream):
-    await _enable_api_key_auth(async_client)
-    captured: dict[str, object] = {}
-
-    async def responses(request: web.Request) -> web.Response:
-        captured.update(await request.json())
-        return web.json_response(
-            {
-                "id": "resp_reasoning_policy",
-                "object": "response",
-                "status": "completed",
-                "model": "source-responses-reasoning-policy",
-                "output": [],
-            }
-        )
-
-    base_url = await source_upstream(responses)
-    model = "source-responses-reasoning-policy"
-    source_id = await _create_model_source(
-        async_client,
-        name="source-responses-reasoning-policy",
-        model=model,
-        base_url=base_url,
-        supports_responses=True,
-    )
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "source-responses-reasoning-policy-key",
-            "assignedSourceIds": [source_id],
-            "allowedReasoningEfforts": ["low"],
-        },
-    )
-    assert created.status_code == 200
-
-    response = await async_client.post(
-        "/v1/responses",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json={
-            "model": model,
-            "instructions": "hi",
-            "input": [],
-            "reasoning": {"effort": "low"},
-            "thinking": "max",
-        },
-    )
-
-    assert response.status_code == 200
-    assert captured["reasoning"] == {"effort": "low"}
-    assert "thinking" not in captured
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "reasoning_controls",
-    [
-        {"reasoningEffort": " ", "thinking": "max"},
-        {"thinking": False, "enable_thinking": True},
-        {"thinking": "disabled", "enable_thinking": True},
-        {"thinking": {"summary": "auto", "enabled": True}},
-        {"thinking": {"summary": "auto"}, "enable_thinking": True},
-    ],
-)
-async def test_source_responses_reasoning_allowlist_rejects_effort_hidden_by_inactive_alias(
-    async_client,
-    source_upstream,
-    reasoning_controls,
-):
-    await _enable_api_key_auth(async_client)
-    source_hits = 0
-
-    async def responses(_request: web.Request) -> web.Response:
-        nonlocal source_hits
-        source_hits += 1
-        return web.json_response(
-            {
-                "id": "resp_blank_reasoning_alias",
-                "object": "response",
-                "status": "completed",
-                "model": "source-blank-reasoning-alias",
-                "output": [],
-            }
-        )
-
-    base_url = await source_upstream(responses)
-    model = "source-blank-reasoning-alias"
-    source_id = await _create_model_source(
-        async_client,
-        name="source-blank-reasoning-alias",
-        model=model,
-        base_url=base_url,
-        supports_responses=True,
-    )
-    created = await async_client.post(
-        "/api/api-keys/",
-        json={
-            "name": "source-blank-reasoning-alias-key",
-            "assignedSourceIds": [source_id],
-            "allowedReasoningEfforts": ["low"],
-        },
-    )
-    assert created.status_code == 200
-
-    response = await async_client.post(
-        "/v1/responses",
-        headers={"Authorization": f"Bearer {created.json()['key']}"},
-        json={
-            "model": model,
-            "instructions": "hi",
-            "input": [],
-            **reasoning_controls,
-        },
-    )
-
-    assert response.status_code == 403
-    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
-    assert source_hits == 0
 
 
 @pytest.mark.asyncio
@@ -3240,6 +2038,2699 @@ async def test_source_stream_success_passes_through_sse(async_client, source_ups
 
 
 @pytest.mark.asyncio
+async def test_source_chat_retries_other_provider_when_model_is_unavailable(async_client, source_upstream):
+    hits: list[str] = []
+
+    async def missing_model(_request: web.Request) -> web.Response:
+        hits.append("missing")
+        return web.json_response(
+            {"error": {"message": "model not found on this provider", "code": "model_not_found"}},
+            status=404,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(_chat_completion_body("provider-fallback-model"))
+
+    model = "provider-fallback-model"
+    missing_url = await source_upstream(missing_model)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(async_client, name="fallback-a-missing", model=model, base_url=missing_url)
+    await _create_model_source(async_client, name="fallback-b-healthy", model=model, base_url=healthy_url)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert hits == ["missing", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_source_responses_stream_is_not_checked_as_chat_completion_sse(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    model = "gpt-5.4"
+
+    async def responses_stream(request: web.Request) -> web.StreamResponse:
+        assert request.path == "/v1/responses"
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"type":"response.output_text.delta","delta":"hello"}\n\n')
+        await response.write(
+            b'data: {"type":"response.completed","response":{"id":"resp_visible",'
+            b'"usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}}\n\n'
+        )
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(responses_stream)
+    source_id = await _create_model_source(
+        async_client,
+        name="responses-visible-stream-source",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "responses-visible-stream-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hi", "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "response.output_text.delta" in response.text
+    assert '"delta":"hello"' in response.text
+    assert "empty_assistant_response" not in response.text
+
+
+@pytest.mark.asyncio
+async def test_source_responses_retries_other_provider_when_model_is_unavailable(async_client, source_upstream):
+    hits: list[str] = []
+    model = "responses-provider-fallback-model"
+
+    async def missing_model(_request: web.Request) -> web.Response:
+        hits.append("missing")
+        return web.json_response(
+            {"error": {"message": "deployment not found", "code": "deployment_not_found"}},
+            status=404,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(
+            {
+                "id": "resp_provider_fallback",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    missing_url = await source_upstream(missing_model)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(
+        async_client,
+        name="responses-fallback-a-missing",
+        model=model,
+        base_url=missing_url,
+        supports_responses=True,
+    )
+    await _create_model_source(
+        async_client,
+        name="responses-fallback-b-healthy",
+        model=model,
+        base_url=healthy_url,
+        supports_responses=True,
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": model, "input": "hi", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_provider_fallback"
+    assert hits == ["missing", "healthy"]
+
+
+@pytest.mark.asyncio
+async def test_source_responses_retries_provider_rejecting_valid_input_shape(async_client, source_upstream):
+    hits: list[str] = []
+    model = "responses-input-shape-fallback-model"
+
+    async def incompatible(_request: web.Request) -> web.Response:
+        hits.append("incompatible")
+        return web.json_response(
+            {
+                "error": {
+                    "message": "input must be a string or array (ID: provider-error-id)",
+                    "code": "invalid_request_error",
+                }
+            },
+            status=400,
+        )
+
+    async def healthy(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(
+            {
+                "id": "resp_after_input_shape_fallback",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    incompatible_url = await source_upstream(incompatible)
+    healthy_url = await source_upstream(healthy)
+    await _create_model_source(
+        async_client,
+        name="responses-input-shape-incompatible",
+        model=model,
+        base_url=incompatible_url,
+        supports_responses=True,
+    )
+    await _create_model_source(
+        async_client,
+        name="responses-input-shape-healthy",
+        model=model,
+        base_url=healthy_url,
+        supports_responses=True,
+    )
+
+    response = await async_client.post(
+        "/v1/responses",
+        json={"model": model, "input": [{"role": "user", "content": "hi"}], "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_after_input_shape_fallback"
+    # Model-source selection is round-robin, so retry the route until the
+    # incompatible source is selected first. The regression is that such a
+    # request still reaches the healthy source instead of exposing the 400.
+    for _ in range(4):
+        if "incompatible" in hits:
+            break
+        response = await async_client.post(
+            "/v1/responses",
+            json={"model": model, "input": [{"role": "user", "content": "hi"}], "stream": False},
+        )
+        assert response.status_code == 200
+        assert response.json()["id"] == "resp_after_input_shape_fallback"
+    assert "incompatible" in hits
+    incompatible_index = hits.index("incompatible")
+    assert hits[incompatible_index + 1] == "healthy"
+
+
+@pytest.mark.asyncio
+async def test_source_chat_does_not_retry_generic_client_payload_error(async_client, source_upstream):
+    hits: list[str] = []
+
+    async def invalid_payload(_request: web.Request) -> web.Response:
+        hits.append("invalid")
+        return web.json_response(
+            {"error": {"message": "messages[0].content is required", "code": "invalid_request_error"}},
+            status=400,
+        )
+
+    async def should_not_run(_request: web.Request) -> web.Response:
+        hits.append("healthy")
+        return web.json_response(_chat_completion_body("provider-no-retry-model"))
+
+    model = "provider-no-retry-model"
+    invalid_url = await source_upstream(invalid_payload)
+    healthy_url = await source_upstream(should_not_run)
+    await _create_model_source(async_client, name="no-retry-a-invalid", model=model, base_url=invalid_url)
+    await _create_model_source(async_client, name="no-retry-b-healthy", model=model, base_url=healthy_url)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 400
+    assert hits == ["invalid"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_provider_failover_is_capped_at_three(async_client, source_upstream):
+    hits: list[str] = []
+    model = "provider-three-attempt-cap-model"
+
+    def failing_handler(name: str):
+        async def handler(_request: web.Request) -> web.Response:
+            hits.append(name)
+            return web.json_response(
+                {"error": {"message": "model not found", "code": "model_not_found"}},
+                status=404,
+            )
+
+        return handler
+
+    for name in ("cap-a", "cap-b", "cap-c", "cap-d"):
+        base_url = await source_upstream(failing_handler(name))
+        await _create_model_source(async_client, name=name, model=model, base_url=base_url)
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 404
+    assert hits == ["cap-a", "cap-b", "cap-c"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_error_falls_back_to_account_branch(async_client, source_upstream, monkeypatch):
+    await _enable_api_key_auth(async_client)
+
+    async def completion(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.4"
+    source_id = await _create_model_source(async_client, name="provider-down", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "provider-fallback-key", "assignedSourceIds": [source_id]},
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_account_fallback", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_account_fallback"
+
+
+@pytest.mark.asyncio
+async def test_source_chat_with_tools_prefers_account_before_next_provider(async_client, source_upstream, monkeypatch):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_provider(_request: web.Request) -> web.Response:
+        hits.append("provider-1")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    async def provider_two(_request: web.Request) -> web.Response:
+        hits.append("provider-2")
+        return web.json_response(_chat_completion_body(model))
+
+    first_url = await source_upstream(failed_provider)
+    second_url = await source_upstream(provider_two)
+    first_id = await _create_model_source(async_client, name="account-first-a-failed", model=model, base_url=first_url)
+    second_id = await _create_model_source(
+        async_client, name="account-first-b-provider", model=model, base_url=second_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [first_id, second_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_account_first", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "description": "Look up a value",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl_sanitized"
+    assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+async def test_providers_before_accounts_defers_fallback_only_until_account_fails(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    settings = await async_client.put(
+        "/api/settings",
+        json={
+            "providerFailurePolicy": "providers_before_accounts",
+            "providerMaxAttempts": 2,
+        },
+    )
+    assert settings.status_code == 200
+
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_regular_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    async def fallback_only_provider(_request: web.Request) -> web.Response:
+        hits.append("fallback")
+        return web.json_response(_chat_completion_body(model))
+
+    regular_url = await source_upstream(failed_regular_provider)
+    fallback_url = await source_upstream(fallback_only_provider)
+    regular_id = await _create_model_source(
+        async_client,
+        name="providers-before-account-regular",
+        model=model,
+        base_url=regular_url,
+    )
+    fallback_id = await _create_model_source(
+        async_client,
+        name="providers-before-account-fallback",
+        model=model,
+        base_url=fallback_url,
+    )
+    updated = await async_client.patch(
+        f"/api/model-sources/{fallback_id}",
+        json={"routingPolicy": "fallback_only"},
+    )
+    assert updated.status_code == 200
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "providers-before-account-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [regular_id, fallback_id],
+        },
+    )
+    key = created.json()["key"]
+
+    account_calls = 0
+
+    async def fake_collect(*_args, **_kwargs):
+        nonlocal account_calls
+        account_calls += 1
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            status_code=503,
+        )
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert account_calls == 1
+    assert hits == ["provider", "provider", "account", "fallback"]
+
+
+@pytest.mark.asyncio
+async def test_codex_responses_with_tools_falls_back_from_provider_to_account(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    base_url = await source_upstream(failed_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="codex-tools-account-fallback-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "codex-tools-account-fallback-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    from fastapi.responses import StreamingResponse
+
+    async def fallback_body():
+        yield 'data: {"type":"response.completed","response":{"id":"resp_codex_tools_account"}}\n\n'
+
+    async def fake_stream(*_args, **_kwargs):
+        hits.append("account")
+        return StreamingResponse(fallback_body(), media_type="text/event-stream")
+
+    monkeypatch.setattr("app.modules.proxy.api._stream_responses", fake_stream)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "stream": True,
+            "input": "hi",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "lookup",
+                    "description": "Look up a value",
+                    "parameters": {"type": "object", "properties": {}},
+                }
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert "resp_codex_tools_account" in response.text
+    assert hits == ["provider", "account"]
+
+
+@pytest.mark.asyncio
+async def test_source_chat_tries_next_provider_after_account_pool_unavailable(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def failed_provider(_request: web.Request) -> web.Response:
+        hits.append("provider-1")
+        return web.json_response(
+            {"error": {"message": "provider down", "type": "server_error", "code": "upstream_error"}},
+            status=503,
+        )
+
+    async def provider_two(_request: web.Request) -> web.Response:
+        hits.append("provider-2")
+        return web.json_response(_chat_completion_body(model))
+
+    first_url = await source_upstream(failed_provider)
+    second_url = await source_upstream(provider_two)
+    first_id = await _create_model_source(async_client, name="account-empty-a-failed", model=model, base_url=first_url)
+    second_id = await _create_model_source(
+        async_client, name="account-empty-b-provider", model=model, base_url=second_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-empty-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [first_id, second_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            status_code=503,
+        )
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+async def test_source_reasoning_only_response_falls_back_to_account_then_next_provider(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def reasoning_only(_request: web.Request) -> web.Response:
+        hits.append("provider-1")
+        return web.json_response(
+            {
+                "id": "chatcmpl_reasoning_only",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "", "reasoning_content": "internal"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13},
+            }
+        )
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider-2")
+        return web.json_response(_chat_completion_body(model))
+
+    first_url = await source_upstream(reasoning_only)
+    second_url = await source_upstream(healthy_provider)
+    first_id = await _create_model_source(async_client, name="semantic-empty-provider", model=model, base_url=first_url)
+    second_id = await _create_model_source(
+        async_client, name="semantic-visible-provider", model=model, base_url=second_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "semantic-empty-key",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [first_id, second_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def empty_account(*_args, **_kwargs):
+        hits.append("account")
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_empty", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", empty_account)
+    from app.modules.proxy import api as proxy_api
+
+    proxy_api._SOURCE_ROUTE_CURSOR.clear()
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["choices"][0]["message"]["content"] == "4"
+    assert hits == ["provider-1", "account", "provider-2"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"role": "assistant", "content": "visible"},
+        {"role": "assistant", "content": None, "refusal": "cannot comply"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": "{}"},
+                }
+            ],
+        },
+    ],
+)
+async def test_source_semantic_success_accepts_text_refusal_and_tool_calls(async_client, source_upstream, message):
+    await _enable_api_key_auth(async_client)
+    model = "gpt-5.4"
+
+    async def completion(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "id": "chatcmpl_semantic_success",
+                "object": "chat.completion",
+                "created": 1,
+                "model": model,
+                "choices": [{"index": 0, "message": message, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 2, "completion_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    base_url = await source_upstream(completion)
+    source_id = await _create_model_source(
+        async_client, name=f"semantic-success-{len(str(message))}", model=model, base_url=base_url
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": f"semantic-success-key-{len(str(message))}",
+            "routingMode": "provider_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "chatcmpl_semantic_success"
+
+
+@pytest.mark.asyncio
+async def test_source_zero_token_response_falls_back_to_account_branch(async_client, source_upstream, monkeypatch):
+    await _enable_api_key_auth(async_client)
+
+    async def completion(_request: web.Request) -> web.Response:
+        return web.json_response(
+            {
+                "id": "chatcmpl_zero",
+                "object": "chat.completion",
+                "created": 1,
+                "model": "gpt-5.4",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": ""}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            }
+        )
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.4"
+    source_id = await _create_model_source(async_client, name="provider-zero", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "provider-zero-key", "assignedSourceIds": [source_id]},
+    )
+    key = created.json()["key"]
+
+    async def fake_collect(*_args, **_kwargs):
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse({"id": "resp_zero_fallback", "object": "response", "model": model, "output": []})
+
+    monkeypatch.setattr("app.modules.proxy.api._collect_responses", fake_collect)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_zero_fallback"
+
+
+@pytest.mark.asyncio
+async def test_source_stream_error_before_downstream_bytes_falls_back_to_account(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+
+    async def completion(request: web.Request) -> web.StreamResponse:
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        request.transport.close()
+        return response
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.4"
+    source_id = await _create_model_source(async_client, name="provider-stream-down", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={"name": "provider-stream-fallback-key", "assignedSourceIds": [source_id]},
+    )
+    key = created.json()["key"]
+
+    from fastapi.responses import StreamingResponse
+
+    async def fallback_body():
+        yield 'data: {"type":"response.completed","response":{"id":"resp_stream_fallback"}}\n\n'
+
+    async def fake_stream(*_args, **_kwargs):
+        return StreamingResponse(fallback_body(), media_type="text/event-stream")
+
+    monkeypatch.setattr("app.modules.proxy.api._stream_responses", fake_stream)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    )
+
+    assert response.status_code == 200
+    assert "resp_stream_fallback" in response.text
+
+
+@pytest.mark.asyncio
+async def test_account_first_chat_no_accounts_falls_back_to_provider(async_client, source_upstream, monkeypatch):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(_chat_completion_body(model))
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-first-chat-provider",
+        model=model,
+        base_url=base_url,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-chat-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["model"] == model
+    assert hits == ["provider"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("upstream_code", ["usage_limit_reached", "insufficient_quota"])
+async def test_account_first_responses_account_quota_falls_back_to_provider(
+    async_client, source_upstream, monkeypatch, upstream_code
+):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {
+                "id": "resp_account_quota_to_provider",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name=f"account-quota-{upstream_code}",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": f"account-quota-key-{upstream_code}",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                429,
+                {"error": {"message": "The selected account has exhausted its quota", "code": upstream_code}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hi", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_account_quota_to_provider"
+    # One configured provider fills all three configured provider attempt slots.
+    assert hits == ["provider", "provider", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_account_first_codex_stream_quota_event_falls_back_to_provider(
+    async_client, source_upstream, monkeypatch
+):
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(request: web.Request) -> web.StreamResponse:
+        hits.append("provider")
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            (
+                'data: {"type":"response.completed","response":{"id":"resp_provider_after_quota",'
+                f'"object":"response","model":"{model}","output":[],"usage":{{"input_tokens":2,'
+                '"output_tokens":1,"total_tokens":3}}}}\n\n'
+            ).encode()
+        )
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-stream-quota-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-stream-quota-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    async def failed_account_response(*_args, **_kwargs):
+        from fastapi.responses import StreamingResponse
+
+        async def body():
+            yield 'data: {"type":"response.created","response":{"id":"resp_account_quota"}}\n\n'
+            yield (
+                'data: {"type":"response.failed","response":{"id":"resp_account_quota",'
+                '"error":{"message":"The usage limit has been reached",'
+                '"type":"rate_limit_error","code":"usage_limit_reached"}}}\n\n'
+            )
+
+        return StreamingResponse(body(), media_type="text/event-stream")
+
+    monkeypatch.setattr("app.modules.proxy.api._stream_responses", failed_account_response)
+    async with async_client.stream(
+        "POST",
+        "/backend-api/codex/responses",
+        headers={"Authorization": f"Bearer {key}", "User-Agent": "codex-tui/0.151.0"},
+        json={"model": model, "input": "hi", "stream": True},
+    ) as response:
+        body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    assert response.status_code == 200
+    assert b"resp_provider_after_quota" in body
+    assert b"usage_limit_reached" not in body
+    assert hits == ["provider", "provider", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_account_first_responses_no_accounts_falls_back_to_provider(async_client, source_upstream, monkeypatch):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response(
+            {
+                "id": "resp_account_to_provider",
+                "object": "response",
+                "model": model,
+                "output": [],
+                "usage": {"input_tokens": 2, "output_tokens": 1, "total_tokens": 3},
+            }
+        )
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-first-responses-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-responses-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "input": "hi", "stream": False},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["id"] == "resp_account_to_provider"
+    assert hits == ["provider", "provider", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_account_first_responses_continuation_does_not_switch_provider(
+    async_client, source_upstream, monkeypatch
+):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def provider_must_not_run(_request: web.Request) -> web.Response:
+        hits.append("provider")
+        return web.json_response({"id": "unsafe"})
+
+    base_url = await source_upstream(provider_must_not_run)
+    source_id = await _create_model_source(
+        async_client,
+        name="continuation-no-provider",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "continuation-no-provider-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "Owner unavailable", "code": "previous_response_owner_unavailable"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {key}"},
+        json={
+            "model": model,
+            "input": "continue",
+            "previous_response_id": "resp_owner_state",
+            "stream": False,
+        },
+    )
+
+    assert response.status_code in {502, 503}
+    assert hits == []
+
+
+@pytest.mark.asyncio
+async def test_account_first_streaming_chat_no_accounts_falls_back_before_client_bytes(
+    async_client, source_upstream, monkeypatch
+):
+    from app.core.clients.proxy import ProxyResponseError
+
+    await _enable_api_key_auth(async_client)
+    hits: list[str] = []
+    model = "gpt-5.4"
+
+    async def healthy_provider(request: web.Request) -> web.StreamResponse:
+        hits.append("provider")
+        response = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(
+            (
+                'data: {"id":"chatcmpl_provider","object":"chat.completion.chunk",'
+                '"model":"gpt-5.4","choices":[{"index":0,"delta":{"content":"ok"},'
+                '"finish_reason":null}]}\n\n'
+            ).encode()
+        )
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    base_url = await source_upstream(healthy_provider)
+    source_id = await _create_model_source(
+        async_client,
+        name="account-first-stream-provider",
+        model=model,
+        base_url=base_url,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "account-first-stream-key",
+            "routingMode": "account_first",
+            "assignedSourceIds": [source_id],
+        },
+    )
+    key = created.json()["key"]
+
+    def failed_account_stream(*_args, **_kwargs):
+        async def body():
+            raise ProxyResponseError(
+                503,
+                {"error": {"message": "No active accounts available", "code": "no_accounts"}},
+            )
+            yield ""  # pragma: no cover
+
+        return body()
+
+    monkeypatch.setattr("app.modules.proxy.service.ProxyService.stream_responses", failed_account_stream)
+    async with async_client.stream(
+        "POST",
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {key}"},
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}], "stream": True},
+    ) as response:
+        body = b"".join([chunk async for chunk in response.aiter_bytes()])
+
+    assert response.status_code == 200
+    assert b'"content":"ok"' in body
+    assert b"no_accounts" not in body
+    assert hits == ["provider", "provider", "provider"]
+
+
+@pytest.mark.asyncio
+async def test_balanced_route_decision_is_stable_within_one_request(async_client):
+    import app.modules.proxy.api as proxy_api
+
+    model = "gpt-5.6-sol"
+    await _create_model_source(
+        async_client,
+        name="stable-request-provider",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+    )
+    key = ApiKeyData(
+        id="key_balanced_request_stable",
+        name="balanced stable",
+        key_prefix="sk-stable",
+        allowed_models=[model],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+        routing_mode="balanced",
+    )
+    request = MagicMock()
+    request.state = SimpleNamespace()
+    proxy_api._SOURCE_ROUTE_CURSOR.pop(f"mixed:{key.id}:{model}", None)
+
+    first = await proxy_api._select_chat_model_source(model, key, request=request)
+    repeated = await proxy_api._select_responses_model_source(model, key, request=request)
+    next_request = MagicMock()
+    next_request.state = SimpleNamespace()
+    next_selection = await proxy_api._select_chat_model_source(model, key, request=next_request)
+
+    assert first is not None
+    assert repeated is not None
+    assert next_selection is None
+    assert proxy_api._SOURCE_ROUTE_CURSOR[f"mixed:{key.id}:{model}"] == 2
+
+
+async def test_responses_model_is_source_owned_detects_streaming_source(async_client):
+    from app.modules.model_sources.selection import responses_model_is_source_owned
+
+    model = "ws-guard-streaming-model"
+    await _create_model_source(
+        async_client,
+        name="ws-guard-streaming",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+        supports_streaming=True,
+    )
+
+    assert await responses_model_is_source_owned(model, None) is True
+    # A subscription model must stay on the WebSocket path.
+    assert await responses_model_is_source_owned("gpt-5.6-sol", None) is False
+    assert await responses_model_is_source_owned(None, None) is False
+
+
+async def test_responses_model_is_source_owned_requires_streaming(async_client):
+    """The guard mirrors the HTTP selector, which requires a streaming source."""
+    from app.modules.model_sources.selection import responses_model_is_source_owned
+
+    model = "ws-guard-non-streaming-model"
+    await _create_model_source(
+        async_client,
+        name="ws-guard-non-streaming",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+        supports_streaming=False,
+    )
+
+    assert await responses_model_is_source_owned(model, None) is False
+
+
+async def test_responses_model_is_source_owned_honors_enforced_model(async_client):
+    """An API key that forces a source-owned model must also be caught.
+
+    The HTTP handlers build their candidate list from the enforced model as
+    well as the requested one; the WebSocket guard has to match or an enforced
+    source model would fall through to subscription-account selection.
+    """
+    from app.modules.model_sources.selection import responses_model_is_source_owned
+
+    model = "ws-guard-enforced-model"
+    await _create_model_source(
+        async_client,
+        name="ws-guard-enforced",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+        supports_streaming=True,
+    )
+    enforcing_key = ApiKeyData(
+        id="key_ws_guard_enforced",
+        name="ws guard enforced",
+        key_prefix="sk-test-ws-enforced",
+        allowed_models=[],
+        enforced_model=model,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    # The client asked for a subscription model, but the key forces the source.
+    assert await responses_model_is_source_owned("gpt-5.6-sol", enforcing_key) is True
+
+
+async def test_responses_model_is_source_owned_prefers_the_raw_alias(async_client):
+    """WebSocket parity for the raw-alias candidate (see the HTTP test above).
+
+    Request preparation normalizes ``gpt-5-high`` to ``gpt-5`` before the
+    WebSocket guards run, so the guard helper must accept the client's raw
+    model and offer it to source selection ahead of the normalized one — the
+    HTTP path routes the identical request via ``raw_source_model``.
+    """
+    from app.modules.model_sources.selection import responses_model_is_source_owned
+
+    model = "gpt-5-high"
+    await _create_model_source(
+        async_client,
+        name="ws-guard-raw-alias",
+        model=model,
+        base_url="http://127.0.0.1:9/v1",
+        supports_responses=True,
+        supports_streaming=True,
+    )
+    exact_key = ApiKeyData(
+        id="key_ws_raw_alias",
+        name="ws raw alias",
+        key_prefix="sk-test-ws-raw-alias",
+        allowed_models=[model],
+        enforced_model=None,
+        enforced_reasoning_effort=None,
+        enforced_service_tier=None,
+        expires_at=None,
+        is_active=True,
+        created_at=utcnow(),
+        last_used_at=None,
+    )
+
+    assert await responses_model_is_source_owned("gpt-5", exact_key, raw_model=model) is True
+    # Without the raw candidate the exact allowlist hides the source. This is
+    # the pre-fix WebSocket behaviour; keeping it false proves the assertion
+    # above matched through the raw candidate, not some other fallback.
+    assert await responses_model_is_source_owned("gpt-5", exact_key) is False
+
+
+async def test_cancelled_buffered_stream_releases_reservation_when_close_fails(async_client, monkeypatch):
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsageHolder
+
+    released: list[object] = []
+
+    async def record_release(reservation: object) -> None:
+        released.append(reservation)
+
+    async def fail_close(_stream: object) -> None:
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
+    monkeypatch.setattr(proxy_api, "_aclose_stream", fail_close)
+
+    async def cancelled_stream() -> AsyncIterator[bytes]:
+        yield b"data: partial\n\n"
+        raise asyncio.CancelledError()
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_cancelled_close_fails",
+        name="cancelled-close-fails",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_cancelled_close_fails",
+        key_id="key_cancelled_close_fails",
+        model="cancelled-model",
+    )
+
+    with pytest.raises(RuntimeError, match="close failed"):
+        await proxy_api._buffered_limited_source_chat_stream_response(
+            request,
+            source=source,
+            api_key=None,
+            model="cancelled-model",
+            reservation=reservation,
+            stream=cancelled_stream(),
+            usage_holder=SourceUsageHolder(),
+            rate_limit_headers={},
+        )
+
+    assert released == [reservation]
+
+
+async def test_cancelled_buffered_stream_finishes_usage_settlement(async_client, monkeypatch):
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsage, SourceUsageHolder
+
+    settlement_started = asyncio.Event()
+    settlement_can_finish = asyncio.Event()
+    settled: list[object] = []
+    logs: list[dict[str, object]] = []
+
+    async def settle(reservation: object, **_kwargs: object) -> bool:
+        settlement_started.set()
+        await settlement_can_finish.wait()
+        settled.append(reservation)
+        return True
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(kwargs)
+
+    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    async def complete_stream() -> AsyncIterator[bytes]:
+        yield b"data: done\n\n"
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_settlement_cancelled",
+        name="settlement-cancelled",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_settlement_cancelled",
+        key_id="key_settlement_cancelled",
+        model="cancelled-model",
+    )
+    usage_holder = SourceUsageHolder(usage=SourceUsage(input_tokens=3, output_tokens=5))
+
+    task = asyncio.create_task(
+        proxy_api._buffered_limited_source_chat_stream_response(
+            request,
+            source=source,
+            api_key=None,
+            model="cancelled-model",
+            reservation=reservation,
+            stream=complete_stream(),
+            usage_holder=usage_holder,
+            rate_limit_headers={},
+        )
+    )
+    await asyncio.wait_for(settlement_started.wait(), timeout=1)
+    task.cancel()
+    settlement_can_finish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert settled == [reservation]
+    assert logs[-1]["status"] == "cancelled"
+    assert logs[-1]["error_code"] == "client_disconnected"
+    assert logs[-1]["usage"] == usage_holder.usage
+
+
+async def test_cancelled_buffered_stream_logs_disconnect(async_client, monkeypatch):
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsageHolder
+
+    released: list[object] = []
+    logs: list[dict[str, object]] = []
+
+    async def record_release(reservation: object) -> None:
+        released.append(reservation)
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(kwargs)
+
+    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    async def cancelled_stream() -> AsyncIterator[bytes]:
+        yield b"data: partial\n\n"
+        raise asyncio.CancelledError()
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_buffered_cancelled_log",
+        name="buffered-cancelled-log",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_buffered_cancelled_log",
+        key_id="key_buffered_cancelled_log",
+        model="cancelled-model",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy_api._buffered_limited_source_chat_stream_response(
+            request,
+            source=source,
+            api_key=None,
+            model="cancelled-model",
+            reservation=reservation,
+            stream=cancelled_stream(),
+            usage_holder=SourceUsageHolder(),
+            rate_limit_headers={},
+        )
+
+    assert released == [reservation]
+    assert logs[-1]["status"] == "cancelled"
+    assert logs[-1]["error_code"] == "client_disconnected"
+    assert logs[-1]["error_message"] == "client disconnected during source stream buffering"
+
+
+async def test_source_completion_success_log_finishes_after_cancellation(async_client, monkeypatch):
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.core.openai.chat_requests import ChatCompletionsRequest
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceChatCompletion, SourceUsage
+
+    log_started = asyncio.Event()
+    allow_log_finish = asyncio.Event()
+    logs: list[dict[str, object]] = []
+
+    async def fake_forward(*_args: object, **_kwargs: object) -> SourceChatCompletion:
+        return SourceChatCompletion(
+            payload={"id": "chatcmpl_cancelled_after_settlement"},
+            usage=SourceUsage(input_tokens=3, output_tokens=5),
+            timings=None,
+            upstream_status_code=200,
+        )
+
+    async def settle(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(kwargs)
+        log_started.set()
+        await allow_log_finish.wait()
+
+    monkeypatch.setattr(proxy_api, "forward_chat_completion", fake_forward)
+    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_completion_cancelled_log",
+        name="completion-cancelled-log",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    payload = ChatCompletionsRequest.model_validate(
+        {
+            "model": "completion-cancelled-log",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+    )
+
+    task = asyncio.create_task(
+        proxy_api._source_chat_completion_response(
+            request,
+            payload,
+            source=source,
+            model="completion-cancelled-log",
+            api_key=None,
+            reservation=None,
+            rate_limit_headers={},
+        )
+    )
+    await asyncio.wait_for(log_started.wait(), timeout=1)
+    task.cancel()
+    allow_log_finish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert logs[-1]["status"] == "success"
+    assert logs[-1]["usage"] == SourceUsage(input_tokens=3, output_tokens=5)
+
+
+async def test_source_stream_setup_cancellation_logs_visible_error_even_if_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.core.openai.chat_requests import ChatCompletionsRequest
+    from app.db.models import ModelSource
+
+    logs: list[dict[str, object]] = []
+    release_attempts: list[object] = []
+
+    async def cancel_during_open(*_args: object, **_kwargs: object) -> object:
+        raise asyncio.CancelledError
+
+    async def fail_release(reservation: object) -> None:
+        release_attempts.append(reservation)
+        raise RuntimeError("sqlite busy")
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(dict(kwargs))
+
+    monkeypatch.setattr(proxy_api, "stream_source_chat_completion", cancel_during_open)
+    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", fail_release)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_stream_setup_cancel",
+        name="stream-setup-cancel",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_stream_setup_cancel",
+        key_id="key_stream_setup_cancel",
+        model="stream-setup-cancel",
+    )
+    payload = ChatCompletionsRequest.model_validate(
+        {
+            "model": "stream-setup-cancel",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": True,
+        }
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy_api._source_chat_completion_response(
+            request,
+            payload,
+            source=source,
+            model="stream-setup-cancel",
+            api_key=None,
+            reservation=reservation,
+            rate_limit_headers={},
+        )
+
+    assert release_attempts == [reservation]
+    assert logs == [
+        {
+            "source": source,
+            "api_key": None,
+            "model": "stream-setup-cancel",
+            "status": "cancelled",
+            "error_code": "client_disconnected",
+            "error_message": "client disconnected during source stream setup",
+        }
+    ]
+
+
+async def test_source_request_setup_cancellation_logs_disconnect_even_if_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.core.openai.chat_requests import ChatCompletionsRequest
+    from app.db.models import ModelSource
+
+    logs: list[dict[str, object]] = []
+    release_attempts: list[object] = []
+
+    async def cancel_during_forward(*_args: object, **_kwargs: object) -> object:
+        raise asyncio.CancelledError
+
+    async def fail_release(reservation: object) -> None:
+        release_attempts.append(reservation)
+        raise RuntimeError("sqlite busy")
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(dict(kwargs))
+
+    monkeypatch.setattr(proxy_api, "forward_chat_completion", cancel_during_forward)
+    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", fail_release)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_request_setup_cancel_release_fail",
+        name="request-setup-cancel-release-fail",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_request_setup_cancel_release_fail",
+        key_id="key_request_setup_cancel_release_fail",
+        model="request-setup-cancel-release-fail",
+    )
+    payload = ChatCompletionsRequest.model_validate(
+        {
+            "model": "request-setup-cancel-release-fail",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": False,
+        }
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy_api._source_chat_completion_response(
+            request,
+            payload,
+            source=source,
+            model="request-setup-cancel-release-fail",
+            api_key=None,
+            reservation=reservation,
+            rate_limit_headers={},
+        )
+
+    assert release_attempts == [reservation]
+    assert logs == [
+        {
+            "source": source,
+            "api_key": None,
+            "model": "request-setup-cancel-release-fail",
+            "status": "cancelled",
+            "error_code": "client_disconnected",
+            "error_message": "client disconnected during source request setup",
+        }
+    ]
+
+
+async def test_buffered_stream_cancellation_logs_disconnect_even_if_release_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsageHolder
+
+    logs: list[dict[str, object]] = []
+    release_attempts: list[object] = []
+
+    async def fail_release(reservation: object) -> None:
+        release_attempts.append(reservation)
+        raise RuntimeError("sqlite busy")
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(dict(kwargs))
+
+    monkeypatch.setattr(proxy_api, "_release_reservation_deferring_cancellation", fail_release)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    async def cancelled_stream() -> AsyncIterator[bytes]:
+        yield b"data: partial\n\n"
+        raise asyncio.CancelledError()
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_buffered_cancel_release_fail",
+        name="buffered-cancel-release-fail",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_buffered_cancel_release_fail",
+        key_id="key_buffered_cancel_release_fail",
+        model="buffered-cancel-release-fail",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await proxy_api._buffered_limited_source_chat_stream_response(
+            request,
+            source=source,
+            api_key=None,
+            model="buffered-cancel-release-fail",
+            reservation=reservation,
+            stream=cancelled_stream(),
+            usage_holder=SourceUsageHolder(),
+            rate_limit_headers={},
+        )
+
+    assert release_attempts == [reservation]
+    assert logs[-1]["status"] == "cancelled"
+    assert logs[-1]["error_code"] == "client_disconnected"
+    assert logs[-1]["error_message"] == "client disconnected during source stream buffering"
+
+
+async def test_source_stream_body_teardown_survives_repeated_cancellation(monkeypatch: pytest.MonkeyPatch):
+    from contextlib import AsyncExitStack
+
+    import app.modules.model_sources.forwarding as forwarding_module
+    from app.db.models import ModelSource
+
+    stream_blocked = asyncio.Event()
+    release_started = asyncio.Event()
+    allow_release = asyncio.Event()
+    release_finished = asyncio.Event()
+
+    class _SlowLease:
+        async def __aenter__(self) -> None:
+            return None
+
+        async def __aexit__(self, exc_type: object, exc: object, tb: object) -> bool:
+            release_started.set()
+            await allow_release.wait()
+            release_finished.set()
+            return False
+
+    stack = AsyncExitStack()
+    await stack.enter_async_context(_SlowLease())
+
+    class _FakeContent:
+        def iter_chunked(self, _size: int) -> AsyncIterator[bytes]:
+            async def gen() -> AsyncIterator[bytes]:
+                yield b"data: chunk\n\n"
+                stream_blocked.set()
+                await asyncio.Event().wait()
+
+            return gen()
+
+    class _FakeResponse:
+        status = 200
+        content = _FakeContent()
+
+    async def fake_open(*_args: object, **_kwargs: object) -> object:
+        return stack, _FakeResponse()
+
+    monkeypatch.setattr(forwarding_module, "_open_source_stream", fake_open)
+
+    source = ModelSource(
+        id="src_body_teardown_repeated_cancel",
+        name="body-teardown-repeated-cancel",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    stream = await forwarding_module.stream_chat_completion(source, {"model": "body-teardown"})
+
+    async def consume() -> None:
+        async for _chunk in stream.body:
+            pass
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(stream_blocked.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    task.cancel()
+    await asyncio.wait_for(release_started.wait(), timeout=1)
+    # Second cancellation delivery while the exit stack is unwinding: teardown
+    # must still return the pooled HTTP lease.
+    task.cancel()
+    await asyncio.sleep(0)
+    allow_release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(task, timeout=1)
+
+    assert release_finished.is_set()
+
+
+async def test_open_source_stream_cleanup_finishes_after_cancellation(monkeypatch: pytest.MonkeyPatch):
+    import app.modules.model_sources.forwarding as forwarding_module
+    from app.db.models import ModelSource
+
+    cleanup_started = asyncio.Event()
+    allow_cleanup_finish = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    class _FailingPostContext:
+        async def __aenter__(self):
+            raise asyncio.CancelledError()
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            return False
+
+    class _Session:
+        def post(self, *_args: object, **_kwargs: object) -> _FailingPostContext:
+            return _FailingPostContext()
+
+    class _SessionLease:
+        async def __aenter__(self) -> _Session:
+            return _Session()
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            cleanup_started.set()
+            await allow_cleanup_finish.wait()
+            cleanup_finished.set()
+            return False
+
+    monkeypatch.setattr(forwarding_module, "lease_http_session", lambda: _SessionLease())
+
+    source = ModelSource(
+        id="src_open_cancelled_cleanup",
+        name="open-cancelled-cleanup",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+
+    task = asyncio.create_task(
+        forwarding_module._open_source_stream(
+            source,
+            "/chat/completions",
+            {"model": "open-cancelled-cleanup"},
+            encryptor=None,
+        )
+    )
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    task.cancel()
+    allow_cleanup_finish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cleanup_finished.is_set() is True
+
+
+async def test_forward_chat_completion_cleanup_finishes_after_cancellation(monkeypatch: pytest.MonkeyPatch):
+    import app.modules.model_sources.forwarding as forwarding_module
+    from app.db.models import ModelSource
+
+    cleanup_started = asyncio.Event()
+    allow_cleanup_finish = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+
+    class _Response:
+        status = 200
+
+        async def json(self, content_type=None):
+            del content_type
+            return {
+                "id": "chatcmpl_forward_cancelled_cleanup",
+                "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+            }
+
+    class _PostContext:
+        async def __aenter__(self) -> _Response:
+            return _Response()
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            return False
+
+    class _Session:
+        def post(self, *_args: object, **_kwargs: object) -> _PostContext:
+            return _PostContext()
+
+    class _SessionLease:
+        async def __aenter__(self) -> _Session:
+            return _Session()
+
+        async def __aexit__(self, exc_type, exc, tb) -> bool:
+            del exc_type, exc, tb
+            cleanup_started.set()
+            await allow_cleanup_finish.wait()
+            cleanup_finished.set()
+            return False
+
+    monkeypatch.setattr(forwarding_module, "lease_http_session", lambda: _SessionLease())
+
+    source = ModelSource(
+        id="src_forward_cancelled_cleanup",
+        name="forward-cancelled-cleanup",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+
+    task = asyncio.create_task(
+        forwarding_module.forward_chat_completion(
+            source,
+            {"model": "forward-cancelled-cleanup", "messages": [{"role": "user", "content": "hello"}]},
+        )
+    )
+    await asyncio.wait_for(cleanup_started.wait(), timeout=1)
+    task.cancel()
+    allow_cleanup_finish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cleanup_finished.is_set() is True
+
+
+async def test_source_stream_disconnect_logs_cancelled_not_error(async_client, db_setup, monkeypatch):
+    """Regression for #1552: a downstream disconnect mid-stream on a
+    model-source route is a normal client-side terminal — recorded as
+    status=cancelled (like the main proxy path), counted in cancelled_count,
+    and excluded from the error rate and top_error."""
+    from datetime import timedelta
+
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsageHolder
+    from app.modules.request_logs.repository import RequestLogsRepository
+
+    async def record_release(reservation: object) -> None:
+        del reservation
+
+    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
+
+    async def source_stream() -> AsyncIterator[bytes]:
+        yield b"data: partial\n\n"
+        await asyncio.sleep(60)
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/chat/completions",
+            "headers": [],
+            "client": ("127.0.0.1", 1234),
+            "query_string": b"",
+        }
+    )
+    source = ModelSource(
+        id="src_cx_log",
+        name="cx-log",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    response_stream = cast(
+        AsyncGenerator[bytes, None],
+        proxy_api._source_chat_stream_with_settlement(
+            source_stream(),
+            usage_holder=SourceUsageHolder(),
+            request=request,
+            source=source,
+            api_key=None,
+            model="cx-log-model",
+            reservation=None,
+        ),
+    )
+
+    assert await anext(response_stream) == b"data: partial\n\n"
+    await response_stream.aclose()
+
+    async with SessionLocal() as session:
+        row = (await session.execute(select(RequestLog).where(RequestLog.model_source_id == "src_cx_log"))).scalar_one()
+        assert row.status == "cancelled"
+        assert row.error_code == "client_disconnected"
+
+        # The status classification is what every metric surface keys on:
+        # the disconnect must not join the error numerator or top_error.
+        aggregate = await RequestLogsRepository(session).aggregate_usage_metrics_since(utcnow() - timedelta(minutes=5))
+        assert aggregate.request_count == 1
+        assert aggregate.error_count == 0
+        assert aggregate.cancelled_count == 1
+        assert aggregate.top_error is None
+
+
+async def test_source_stream_settlement_cancellation_logs_cancelled_not_success(monkeypatch: pytest.MonkeyPatch):
+    from starlette.requests import Request
+
+    import app.modules.proxy.api as proxy_api
+    from app.db.models import ModelSource
+    from app.modules.model_sources.forwarding import SourceUsage, SourceUsageHolder
+
+    settle_started = asyncio.Event()
+    allow_settle_finish = asyncio.Event()
+    released: list[object] = []
+    logs: list[dict[str, object]] = []
+
+    async def settle(*_args: object, **_kwargs: object) -> bool:
+        settle_started.set()
+        await allow_settle_finish.wait()
+        return True
+
+    async def record_release(reservation: object) -> None:
+        released.append(reservation)
+
+    async def record_log(*_args: object, **kwargs: object) -> None:
+        logs.append(dict(kwargs))
+
+    monkeypatch.setattr(proxy_api, "_settle_source_reservation", settle)
+    monkeypatch.setattr(proxy_api, "_release_reservation", record_release)
+    monkeypatch.setattr(proxy_api, "_log_source_chat_completion", record_log)
+
+    async def source_stream() -> AsyncIterator[bytes]:
+        yield b"data: partial\n\n"
+
+    request = Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": "/v1/chat/completions",
+            "raw_path": b"/v1/chat/completions",
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 0),
+            "server": ("testserver", 80),
+        }
+    )
+    source = ModelSource(
+        id="src_stream_settlement_cancel",
+        name="stream-settlement-cancel",
+        kind="openai_compatible",
+        base_url="http://127.0.0.1:9/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=False,
+    )
+    reservation = ApiKeyUsageReservationData(
+        reservation_id="resv_stream_settlement_cancel",
+        key_id="key_stream_settlement_cancel",
+        model="stream-settlement-cancel",
+    )
+    usage_holder = SourceUsageHolder(usage=SourceUsage(input_tokens=3, output_tokens=5))
+
+    async def consume_stream() -> None:
+        async for _chunk in proxy_api._source_chat_stream_with_settlement(
+            source_stream(),
+            usage_holder=usage_holder,
+            request=request,
+            source=source,
+            api_key=None,
+            model="stream-settlement-cancel",
+            reservation=reservation,
+        ):
+            pass
+
+    task = asyncio.create_task(consume_stream())
+    await asyncio.wait_for(settle_started.wait(), timeout=1)
+    task.cancel()
+    allow_settle_finish.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert released == []
+    assert logs[-1]["status"] == "cancelled"
+    assert logs[-1]["error_code"] == "client_disconnected"
+    assert logs[-1]["error_message"] == "client disconnected during source usage settlement"
+    assert logs[-1]["usage"] == usage_holder.usage
+
+
+async def test_v1_models_context_window_override_applies_to_source_model(async_client, monkeypatch):
+    # Source-catalog models synthesize `max_context_window == context_window`
+    # purely so Codex clients can parse the entry; that parseability default
+    # must not clamp an operator raise override to the un-raised window.
+    await _create_model_source(
+        async_client,
+        name="override-source",
+        model="override-source-model",
+        base_url="http://127.0.0.1:9/v1",
+    )
+
+    from app.core.config.settings import get_settings
+    from app.modules.proxy import api as proxy_api_module
+
+    patched = get_settings().model_copy(update={"model_context_window_overrides": {"override-source-model": 32_768}})
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: patched)
+
+    response = await async_client.get("/v1/models")
+    assert response.status_code == 200
+    item = next(m for m in response.json()["data"] if m["id"] == "override-source-model")
+    assert item["metadata"]["context_window"] == 32_768
+    assert item["metadata"]["input_context_window"] == 32_768
+    assert item["capabilities"]["context_length"] == 32_768
+    assert item["contextLength"] == 32_768
+    assert item["context_length"] == 32_768
+
+
+async def test_source_chat_reasoning_allowlist_rejects_before_source_dispatch(
+    async_client,
+    source_upstream,
+    reasoning_controls,
+):
+    await _enable_api_key_auth(async_client)
+    source_hits = 0
+
+    async def completion(_request: web.Request) -> web.Response:
+        nonlocal source_hits
+        source_hits += 1
+        return web.json_response(_chat_completion_body("source-reasoning-policy"))
+
+    base_url = await source_upstream(completion)
+    model = "source-reasoning-policy"
+    source_id = await _create_model_source(async_client, name="source-reasoning-policy", model=model, base_url=base_url)
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "source-reasoning-policy-key",
+            "assignedSourceIds": [source_id],
+            "allowedReasoningEfforts": ["low"],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            **reasoning_controls,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
+    assert source_hits == 0
+
+
+async def test_source_chat_reasoning_allowlist_preserves_client_plane_effort(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def completion(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(_chat_completion_body("source-client-plane-reasoning"))
+
+    base_url = await source_upstream(completion)
+    model = "source-client-plane-reasoning"
+    source_id = await _create_model_source(
+        async_client,
+        name="source-client-plane-reasoning",
+        model=model,
+        base_url=base_url,
+        raw_metadata_json='{"supports_reasoning": true}',
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "source-client-plane-reasoning-key",
+            "assignedSourceIds": [source_id],
+            "allowedReasoningEfforts": ["minimal"],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "minimal",
+            "thinking": {
+                "effort": "minimal",
+                "type": "disabled",
+                "enabled": False,
+                "vendor_hint": "keep",
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["reasoning_effort"] == "minimal"
+    assert captured["thinking"] == {"effort": "minimal", "vendor_hint": "keep"}
+    assert "reasoning" not in captured
+
+
+async def test_source_chat_reasoning_allowlist_preserves_enable_thinking(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def completion(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(_chat_completion_body("source-enable-thinking"))
+
+    base_url = await source_upstream(completion)
+    model = "source-enable-thinking"
+    source_id = await _create_model_source(
+        async_client,
+        name="source-enable-thinking",
+        model=model,
+        base_url=base_url,
+        raw_metadata_json='{"supports_reasoning": true}',
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "source-enable-thinking-key",
+            "assignedSourceIds": [source_id],
+            "allowedReasoningEfforts": ["medium"],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "hi"}],
+            "enable_thinking": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["enable_thinking"] is True
+    assert "reasoning" not in captured
+    assert "reasoning_effort" not in captured
+
+
+async def test_source_chat_reasoning_allowlist_preserves_implicit_thinking_object(
+    async_client,
+    source_upstream,
+    thinking,
+    enable_thinking,
+    expected_thinking,
+):
+    await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def completion(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(_chat_completion_body("source-implicit-thinking"))
+
+    base_url = await source_upstream(completion)
+    model = "source-implicit-thinking"
+    source_id = await _create_model_source(
+        async_client,
+        name=model,
+        model=model,
+        base_url=base_url,
+        raw_metadata_json='{"supports_reasoning": true}',
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "source-implicit-thinking-key",
+            "assignedSourceIds": [source_id],
+            "allowedReasoningEfforts": ["medium"],
+        },
+    )
+    assert created.status_code == 200
+
+    request_payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": "hi"}],
+        "thinking": thinking,
+    }
+    if enable_thinking:
+        request_payload["enable_thinking"] = True
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json=request_payload,
+    )
+
+    assert response.status_code == 200
+    if expected_thinking is None:
+        assert "thinking" not in captured
+    else:
+        assert captured["thinking"] == expected_thinking
+    if enable_thinking:
+        assert captured["enable_thinking"] is True
+    assert "reasoning" not in captured
+    assert "reasoning_effort" not in captured
+
+
+async def test_source_chat_reasoning_allowlist_materializes_canonicalized_model_alias_effort(
+    async_client,
+    source_upstream,
+    alias_source,
+):
+    await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def completion(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(_chat_completion_body("gpt-5.6-sol"))
+
+    base_url = await source_upstream(completion)
+    model = "gpt-5.6-sol"
+    source_id = await _create_model_source(
+        async_client,
+        name="source-canonical-model-alias-effort",
+        model=model,
+        base_url=base_url,
+        raw_metadata_json='{"supports_reasoning": true}',
+    )
+    key_payload = {
+        "name": "source-canonical-model-alias-effort-key",
+        "assignedSourceIds": [source_id],
+        "allowedReasoningEfforts": ["xhigh"],
+    }
+    if alias_source == "enforced":
+        key_payload["enforcedModel"] = f"{model}-xhigh"
+    created = await async_client.post("/api/api-keys/", json=key_payload)
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/chat/completions",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={
+            "model": f"{model}-xhigh" if alias_source == "requested" else model,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["model"] == model
+    assert captured["reasoning_effort"] == "xhigh"
+    assert "reasoning" not in captured
+
+
+async def test_source_responses_preserves_effortless_provider_thinking_object(
+    async_client,
+    source_upstream,
+    with_allowlist,
+    reasoning,
+    enable_thinking,
+    thinking_effort,
+):
+    if with_allowlist:
+        await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def responses(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(
+            {
+                "id": "resp_provider_thinking",
+                "object": "response",
+                "status": "completed",
+                "model": "source-provider-thinking",
+                "output": [],
+            }
+        )
+
+    base_url = await source_upstream(responses)
+    model = "source-provider-thinking"
+    source_id = await _create_model_source(
+        async_client,
+        name="source-provider-thinking",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    thinking = {"type": "adaptive", "budget": 4096, "budget_tokens": 2048, "vendor_hint": "keep"}
+    if thinking_effort is not None:
+        thinking["effort"] = thinking_effort
+    headers: dict[str, str] = {}
+    if with_allowlist:
+        created = await async_client.post(
+            "/api/api-keys/",
+            json={
+                "name": "source-provider-thinking-key",
+                "assignedSourceIds": [source_id],
+                "allowedReasoningEfforts": ["low"],
+            },
+        )
+        assert created.status_code == 200
+        headers["Authorization"] = f"Bearer {created.json()['key']}"
+
+    request_payload = {
+        "model": model,
+        "instructions": "hi",
+        "input": [],
+        "thinking": thinking,
+    }
+    if reasoning is not None:
+        request_payload["reasoning"] = reasoning
+    if enable_thinking:
+        request_payload["enable_thinking"] = True
+
+    response = await async_client.post("/v1/responses", headers=headers, json=request_payload)
+
+    assert response.status_code == 200
+    expected_thinking = {key: value for key, value in thinking.items() if key != "effort"}
+    assert captured["thinking"] == expected_thinking
+    if reasoning is None:
+        assert "reasoning" not in captured
+    else:
+        assert captured["reasoning"] == reasoning
+    if enable_thinking:
+        assert "enable_thinking" not in captured
+
+
+async def test_source_responses_preserves_client_plane_reasoning_effort(
+    async_client,
+    source_upstream,
+    key_policy,
+    reasoning_control,
+    expected_control,
+):
+    if key_policy != "none":
+        await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def responses(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(
+            {
+                "id": "resp_provider_reasoning_alias",
+                "object": "response",
+                "status": "completed",
+                "model": "source-provider-reasoning-alias",
+                "output": [],
+            }
+        )
+
+    base_url = await source_upstream(responses)
+    model = "source-provider-reasoning-alias"
+    source_id = await _create_model_source(
+        async_client,
+        name=model,
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    headers: dict[str, str] = {}
+    if key_policy != "none":
+        key_payload = {
+            "name": "source-provider-reasoning-alias-key",
+            "assignedSourceIds": [source_id],
+        }
+        if key_policy == "allowlisted":
+            key_payload["allowedReasoningEfforts"] = ["minimal"]
+        elif key_policy == "enforced":
+            key_payload["enforcedReasoningEffort"] = "minimal"
+        created = await async_client.post(
+            "/api/api-keys/",
+            json=key_payload,
+        )
+        assert created.status_code == 200
+        headers["Authorization"] = f"Bearer {created.json()['key']}"
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers=headers,
+        json={
+            "model": model,
+            "instructions": "hi",
+            "input": [],
+            **reasoning_control,
+        },
+    )
+
+    assert response.status_code == 200
+    for field in ("thinking", "reasoning"):
+        if field in expected_control:
+            assert captured[field] == expected_control[field]
+        else:
+            assert field not in captured
+
+
+async def test_source_responses_reasoning_allowlist_strips_conflicting_aliases(async_client, source_upstream):
+    await _enable_api_key_auth(async_client)
+    captured: dict[str, object] = {}
+
+    async def responses(request: web.Request) -> web.Response:
+        captured.update(await request.json())
+        return web.json_response(
+            {
+                "id": "resp_reasoning_policy",
+                "object": "response",
+                "status": "completed",
+                "model": "source-responses-reasoning-policy",
+                "output": [],
+            }
+        )
+
+    base_url = await source_upstream(responses)
+    model = "source-responses-reasoning-policy"
+    source_id = await _create_model_source(
+        async_client,
+        name="source-responses-reasoning-policy",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "source-responses-reasoning-policy-key",
+            "assignedSourceIds": [source_id],
+            "allowedReasoningEfforts": ["low"],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={
+            "model": model,
+            "instructions": "hi",
+            "input": [],
+            "reasoning": {"effort": "low"},
+            "thinking": "max",
+        },
+    )
+
+    assert response.status_code == 200
+    assert captured["reasoning"] == {"effort": "low"}
+    assert "thinking" not in captured
+
+
+async def test_source_responses_reasoning_allowlist_rejects_effort_hidden_by_inactive_alias(
+    async_client,
+    source_upstream,
+    reasoning_controls,
+):
+    await _enable_api_key_auth(async_client)
+    source_hits = 0
+
+    async def responses(_request: web.Request) -> web.Response:
+        nonlocal source_hits
+        source_hits += 1
+        return web.json_response(
+            {
+                "id": "resp_blank_reasoning_alias",
+                "object": "response",
+                "status": "completed",
+                "model": "source-blank-reasoning-alias",
+                "output": [],
+            }
+        )
+
+    base_url = await source_upstream(responses)
+    model = "source-blank-reasoning-alias"
+    source_id = await _create_model_source(
+        async_client,
+        name="source-blank-reasoning-alias",
+        model=model,
+        base_url=base_url,
+        supports_responses=True,
+    )
+    created = await async_client.post(
+        "/api/api-keys/",
+        json={
+            "name": "source-blank-reasoning-alias-key",
+            "assignedSourceIds": [source_id],
+            "allowedReasoningEfforts": ["low"],
+        },
+    )
+    assert created.status_code == 200
+
+    response = await async_client.post(
+        "/v1/responses",
+        headers={"Authorization": f"Bearer {created.json()['key']}"},
+        json={
+            "model": model,
+            "instructions": "hi",
+            "input": [],
+            **reasoning_controls,
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "reasoning_effort_not_allowed"
+    assert source_hits == 0
+
+
 async def test_source_responses_payload_restores_declared_minimal_effort(async_client, source_upstream):
     """The minimal rewrite must be undone for a source that declared the effort.
 
@@ -3280,7 +4771,6 @@ async def test_source_responses_payload_restores_declared_minimal_effort(async_c
     assert reasoning["effort"] == "minimal"
 
 
-@pytest.mark.asyncio
 async def test_codex_responses_payload_restores_declared_minimal_effort(async_client, source_upstream):
     """The codex-native route must thread the replaced effort too.
 
@@ -3330,7 +4820,6 @@ async def test_codex_responses_payload_restores_declared_minimal_effort(async_cl
     assert reasoning["effort"] == "minimal"
 
 
-@pytest.mark.asyncio
 async def test_source_embeddings_routes_payload_and_settles_usage(async_client, source_upstream) -> None:
     await _enable_api_key_auth(async_client)
     captured: dict[str, object] = {}
@@ -3401,7 +4890,6 @@ async def test_source_embeddings_routes_payload_and_settles_usage(async_client, 
         assert log.status == "success"
 
 
-@pytest.mark.asyncio
 async def test_source_embeddings_unknown_model_returns_model_not_found(async_client) -> None:
     await _enable_api_key_auth(async_client)
     created = await async_client.post("/api/api-keys/", json={"name": "embeddings-404-key"})
@@ -3424,7 +4912,6 @@ async def test_source_embeddings_unknown_model_returns_model_not_found(async_cli
         assert result.scalars().all() == []
 
 
-@pytest.mark.asyncio
 async def test_source_embeddings_transport_failure_logs_without_upstream_status(async_client) -> None:
     await _enable_api_key_auth(async_client)
     model = "unreachable-embedder"
@@ -3462,7 +4949,6 @@ async def test_source_embeddings_transport_failure_logs_without_upstream_status(
         assert log.upstream_status_code is None
 
 
-@pytest.mark.asyncio
 async def test_source_embeddings_upstream_error_passes_through_and_logs(async_client, source_upstream) -> None:
     await _enable_api_key_auth(async_client)
 
@@ -3504,7 +4990,6 @@ async def test_source_embeddings_upstream_error_passes_through_and_logs(async_cl
         assert log.model_source_id == source_id
 
 
-@pytest.mark.asyncio
 async def test_source_embeddings_without_usage_fails_closed_for_limited_key(async_client, source_upstream) -> None:
     await _enable_api_key_auth(async_client)
 

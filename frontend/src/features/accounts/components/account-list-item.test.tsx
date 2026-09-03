@@ -143,6 +143,16 @@ describe("AccountListItem", () => {
     expect(screen.getByTestId("mini-quota-track-weekly-fill")).toHaveStyle({ width: "73%" });
   });
 
+  it("renders subscription renewal beside the quota reset line", () => {
+    const account = createAccountSummary({
+      subscriptionActiveUntil: "2026-01-11T12:00:00.000Z",
+    });
+
+    render(<AccountListItem account={account} selected={false} onSelect={vi.fn()} />);
+
+    expect(screen.getByText("Renewal 01/11/2026 · 10d")).toBeInTheDocument();
+  });
+
   it("marks burn-first accounts in the list", () => {
     const account = createAccountSummary({ routingPolicy: "burn_first" });
 

@@ -8,13 +8,21 @@ import pytest
 from app.core.crypto import TokenEncryptor
 from app.db.models import ModelSource
 from app.modules.model_sources.repository import ModelSourcesRepository
-from app.modules.model_sources.schemas import ModelSourceCreateRequest, ModelSourceModelInput, ModelSourceUpdateRequest
+from app.modules.model_sources.schemas import (
+    ModelSourceCreateRequest,
+    ModelSourceModelInput,
+    ModelSourceProbeRequest,
+    ModelSourceUpdateRequest,
+)
 from app.modules.model_sources.service import ModelSourcesService, ModelSourceValidationError
 
 
 class _FakeEncryptor:
     def encrypt(self, token: str) -> bytes:
         return f"encrypted:{token}".encode()
+
+    def decrypt(self, token: bytes) -> str:
+        return token.decode().removeprefix("encrypted:")
 
 
 class _FakeRepository:
@@ -161,3 +169,43 @@ async def test_update_source_clears_nullable_fields_when_null_is_sent() -> None:
     assert repo.created.max_concurrency is None
     assert updated.timeout_seconds is None
     assert updated.max_concurrency is None
+
+@pytest.mark.asyncio
+async def test_probe_source_uses_stored_api_key_without_returning_it(monkeypatch) -> None:
+    repo = _FakeRepository()
+    service = ModelSourcesService(_as_repository(repo), encryptor=_fake_encryptor())
+    created = await service.create_source(
+        ModelSourceCreateRequest(
+            name="Probe",
+            base_url="https://example.test/v1",
+            api_key="secret",
+            models=[ModelSourceModelInput(model="public", upstream_model="vendor/model")],
+        )
+    )
+
+    class _Response:
+        status = 200
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_args): return None
+        async def text(self): return '{"choices":[]}'
+
+    class _Session:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *_args): return None
+        def post(self, url, *, headers, json):
+            assert url == "https://example.test/v1/chat/completions"
+            assert headers["Authorization"] == "Bearer secret"
+            assert json["model"] == "vendor/model"
+            return _Response()
+
+    monkeypatch.setattr("app.modules.model_sources.service.aiohttp.ClientSession", lambda **_kwargs: _Session())
+    result = await service.probe_source(
+        ModelSourceProbeRequest(
+            source_id=created.id,
+            base_url="https://example.test/v1",
+            model="public",
+            upstream_model="vendor/model",
+        )
+    )
+    assert result.ok is True
+    assert "secret" not in result.message

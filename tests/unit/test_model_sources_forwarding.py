@@ -11,8 +11,10 @@ from app.modules.model_sources.forwarding import (
     SourceStreamUsageParser,
     SourceUsageHolder,
     _audio_seconds_from_body,
+    _error_payload,
     _error_payload_from_body,
     _redact_source_error_payload,
+    _stream_request_input_chars,
     _timings_from_audio_body,
     _timings_from_metrics,
     _timings_from_payload,
@@ -70,6 +72,30 @@ def test_chat_stream_usage_parser_handles_crlf_split_across_chunks() -> None:
     assert holder.usage.output_tokens == 1
 
 
+def test_chat_stream_usage_parser_flushes_final_frame_at_eof() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="chat")
+
+    parser.feed(b'data: {"usage":{"prompt_tokens":12,"completion_tokens":5}}\n')
+    assert holder.usage is None
+
+    parser.finish()
+
+    assert holder.usage is not None
+    assert holder.usage.input_tokens == 12
+    assert holder.usage.output_tokens == 5
+
+
+def test_chat_stream_usage_parser_finish_ignores_done_frame() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="chat")
+
+    parser.feed(b"data: [DONE]\n")
+    parser.finish()
+
+    assert holder.usage is None
+
+
 def test_stream_usage_parser_bounds_buffer_without_frame_boundaries() -> None:
     holder = SourceUsageHolder()
     parser = SourceStreamUsageParser(holder, response_shape="chat")
@@ -78,6 +104,37 @@ def test_stream_usage_parser_bounds_buffer_without_frame_boundaries() -> None:
         parser.feed(b"x" * 4096)
 
     assert len(parser._buffer) <= SourceStreamUsageParser._MAX_BUFFER_CHARS
+
+
+def test_stream_usage_estimator_does_not_charge_full_opaque_payloads() -> None:
+    payload: dict[str, JsonValue] = {
+        "model": "test-model",
+        "input": [
+            {"type": "reasoning", "encrypted_content": "x" * 14_000_000},
+            {"type": "input_image", "image_url": "data:image/png;base64," + "A" * 2_000_000},
+            {"type": "input_text", "text": "hello world"},
+        ],
+    }
+
+    estimated_chars = _stream_request_input_chars(payload)
+
+    assert 8_000 <= estimated_chars < 10_000
+
+
+def test_stream_usage_estimator_caps_fallback_at_model_context_window() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(
+        holder,
+        response_shape="responses",
+        request_payload={"input": "x" * 100_000},
+        max_estimated_input_tokens=10_000,
+    )
+
+    parser.finish()
+
+    assert holder.estimated_usage is not None
+    assert holder.estimated_usage.input_tokens == 10_000
+    assert holder.estimated_usage.output_tokens == 1
 
 
 def test_chat_stream_usage_parser_rejects_negative_tokens() -> None:
@@ -109,6 +166,23 @@ def test_responses_stream_usage_parser_handles_split_sse_frame() -> None:
     assert holder.usage.input_tokens == 7
     assert holder.usage.output_tokens == 4
     assert holder.usage.cached_input_tokens == 2
+
+
+def test_responses_stream_usage_parser_flushes_final_crlf_frame_at_eof() -> None:
+    holder = SourceUsageHolder()
+    parser = SourceStreamUsageParser(holder, response_shape="responses")
+
+    parser.feed(
+        b'data: {"type":"response.completed","response":{"usage":'
+        b'{"input_tokens":7,"output_tokens":4}}}\r\n'
+    )
+    assert holder.usage is None
+
+    parser.finish()
+
+    assert holder.usage is not None
+    assert holder.usage.input_tokens == 7
+    assert holder.usage.output_tokens == 4
 
 
 def test_audio_usage_parser_accepts_total_tokens_only_json() -> None:
@@ -144,6 +218,40 @@ def test_audio_seconds_ignores_nonpositive_and_nonjson() -> None:
     assert _audio_seconds_from_body(b'{"duration":-4}', "application/json") is None
     assert _audio_seconds_from_body(b"plain text", "text/plain") is None
     assert _audio_seconds_from_body(b'{"duration":true}', "application/json") is None
+
+
+def test_source_error_payload_normalizes_flat_gateway_error() -> None:
+    payload = _error_payload(
+        {
+            "code": "INVALID_API_KEY",
+            "message": "Invalid API key",
+        }
+    )
+    error = cast(dict[str, object], payload["error"])
+
+    assert error == {
+        "code": "INVALID_API_KEY",
+        "message": "Invalid API key",
+        "type": "upstream_error",
+    }
+
+
+def test_source_error_payload_preserves_nested_openai_error() -> None:
+    payload = _error_payload(
+        {
+            "error": {
+                "code": "billing_hard_limit_reached",
+                "message": "Billing hard limit reached",
+                "type": "insufficient_quota",
+            }
+        }
+    )
+
+    assert payload["error"] == {
+        "code": "billing_hard_limit_reached",
+        "message": "Billing hard limit reached",
+        "type": "insufficient_quota",
+    }
 
 
 def test_audio_error_payload_preserves_text_body() -> None:

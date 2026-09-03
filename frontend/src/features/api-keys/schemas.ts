@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const LIMIT_TYPES = ["total_tokens", "input_tokens", "output_tokens", "cost_usd", "credits"] as const;
-export const LIMIT_WINDOWS = ["daily", "weekly", "monthly", "5h", "7d"] as const;
+export const LIMIT_WINDOWS = ["1h", "5h", "daily", "7d", "weekly", "monthly", "lifetime"] as const;
 
 export type LimitType = (typeof LIMIT_TYPES)[number];
 export type LimitWindowType = (typeof LIMIT_WINDOWS)[number];
@@ -13,7 +13,7 @@ const LimitRuleSchema = z.object({
   maxValue: z.number(),
   currentValue: z.number(),
   modelFilter: z.string().nullable(),
-  resetAt: z.iso.datetime({ offset: true }),
+  resetAt: z.iso.datetime({ offset: true }).nullable(),
 });
 
 export const LimitRuleCreateSchema = z.object({
@@ -33,6 +33,8 @@ const ApiKeyUsageSummarySchema = z.object({
 const SERVICE_TIERS = ["auto", "default", "priority", "flex", "ultrafast"] as const;
 export type ServiceTierType = (typeof SERVICE_TIERS)[number];
 
+export const ROUTING_MODES = ["balanced", "account_first", "provider_first"] as const;
+export type RoutingMode = (typeof ROUTING_MODES)[number];
 export const TRAFFIC_CLASSES = ["foreground", "opportunistic"] as const;
 export type TrafficClass = (typeof TRAFFIC_CLASSES)[number];
 export const TRANSPORT_POLICY_OVERRIDES = ["smart", "always_http", "always_websocket"] as const;
@@ -47,6 +49,7 @@ export const ApiKeySchema = z.object({
   keyPrefix: z.string(),
   allowedModels: z.array(z.string()).nullable(),
   applyToCodexModel: z.boolean().default(false),
+  routingMode: z.enum(ROUTING_MODES).default("balanced"),
   enforcedModel: z.string().nullable().default(null),
   allowedReasoningEfforts: z.array(z.enum(REASONING_EFFORTS)).nullable().default(null),
   trafficClass: z
@@ -60,6 +63,12 @@ export const ApiKeySchema = z.object({
     .default(null),
   usageSections: z.string().default("upstream_limits,account_pool_usage"),
   expiresAt: z.iso.datetime({ offset: true }).nullable(),
+  autoExtendExpiry: z.boolean().default(false),
+  autoExtendExpiryType: z.enum(["total_tokens", "cost_usd"]).nullable().default(null),
+  autoExtendExpiryThreshold: z.number().int().positive().nullable().default(null),
+  quotaShopEnabled: z.boolean().default(false),
+  quotaShopMaxWindows: z.number().int().positive().default(1),
+  quotaShopOptions: z.array(z.object({ limitType: z.string(), limitWindow: z.string() })).default([]),
   isActive: z.boolean(),
   accountAssignmentScopeEnabled: z.boolean().default(false),
   sourceAssignmentScopeEnabled: z.boolean().default(false),
@@ -86,6 +95,7 @@ export const ApiKeyCreateRequestSchema = z.object({
   name: z.string().min(1).max(128),
   allowedModels: z.array(z.string()).optional(),
   applyToCodexModel: z.boolean().optional(),
+  routingMode: z.enum(ROUTING_MODES).optional(),
   trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
@@ -98,6 +108,12 @@ export const ApiKeyCreateRequestSchema = z.object({
   usageSections: z.string().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.iso.datetime({ offset: true }).nullable().optional(),
+  autoExtendExpiry: z.boolean().optional(),
+  autoExtendExpiryType: z.enum(["total_tokens", "cost_usd"]).nullable().optional(),
+  autoExtendExpiryThreshold: z.number().int().positive().nullable().optional(),
+  quotaShopEnabled: z.boolean().optional(),
+  quotaShopMaxWindows: z.number().int().positive().optional(),
+  quotaShopOptions: z.array(z.object({ limitType: z.string(), limitWindow: z.string() })).optional(),
   assignedAccountIds: z.array(z.string()).optional(),
   assignedSourceIds: z.array(z.string()).optional(),
   limits: z.array(LimitRuleCreateSchema).optional(),
@@ -111,6 +127,7 @@ export const ApiKeyUpdateRequestSchema = z.object({
   name: z.string().min(1).max(128).optional(),
   allowedModels: z.array(z.string()).nullable().optional(),
   applyToCodexModel: z.boolean().optional(),
+  routingMode: z.enum(ROUTING_MODES).optional(),
   trafficClass: z.enum(TRAFFIC_CLASSES).optional(),
   transportPolicyOverride: z.enum(TRANSPORT_POLICY_OVERRIDES).nullable().optional(),
   enforcedModel: z.string().min(1).nullable().optional(),
@@ -123,6 +140,12 @@ export const ApiKeyUpdateRequestSchema = z.object({
   usageSections: z.string().optional(),
   weeklyTokenLimit: z.number().int().positive().nullable().optional(),
   expiresAt: z.iso.datetime({ offset: true }).nullable().optional(),
+  autoExtendExpiry: z.boolean().optional(),
+  autoExtendExpiryType: z.enum(["total_tokens", "cost_usd"]).nullable().optional(),
+  autoExtendExpiryThreshold: z.number().int().positive().nullable().optional(),
+  quotaShopEnabled: z.boolean().optional(),
+  quotaShopMaxWindows: z.number().int().positive().optional(),
+  quotaShopOptions: z.array(z.object({ limitType: z.string(), limitWindow: z.string() })).optional(),
   isActive: z.boolean().optional(),
   assignedAccountIds: z.array(z.string()).optional(),
   assignedSourceIds: z.array(z.string()).optional(),

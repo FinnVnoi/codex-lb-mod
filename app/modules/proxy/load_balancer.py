@@ -29,6 +29,7 @@ from app.core.balancer import (
     RoutingCostsByAccount,
     RoutingStrategy,
     TrafficClass,
+    UnstartedQuotaPreferenceWindow,
     evaluate_health_tier,
     handle_permanent_failure,
     handle_quota_exceeded,
@@ -42,6 +43,7 @@ from app.core.balancer.types import UpstreamError
 from app.core.config import settings as config_settings
 from app.core.config.settings import get_settings
 from app.core.config.settings_cache import get_settings_cache
+from app.core.crypto import TokenEncryptor
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
     account_cap_rejections_total,
@@ -61,6 +63,7 @@ from app.core.resilience.degradation import set_degraded, set_normal
 from app.core.usage.quota import apply_usage_quota
 from app.core.utils.time import utcnow
 from app.db.models import Account, AccountStatus, AdditionalUsageHistory, StickySessionKind, UsageHistory
+from app.modules.accounts.mappers import subscription_window
 from app.modules.proxy._load_balancer.sticky_selection import (
     _STICKY_EXISTING_UNSET,
     SelectionInputsProtocol,
@@ -541,6 +544,9 @@ class LoadBalancer:
         sticky_max_age_seconds: int | None = None,
         prefer_earlier_reset_accounts: bool = False,
         prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
+        prefer_unstarted_quota_accounts: bool = False,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
+        prefer_earlier_renewal_accounts: bool = False,
         routing_strategy: RoutingStrategy = "capacity_weighted",
         relative_availability_power: float = 2.0,
         relative_availability_top_k: int = 5,
@@ -824,6 +830,9 @@ class LoadBalancer:
                 request=UnboundSelectionRequest(
                     prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     relative_availability_power=relative_availability_power,
                     relative_availability_top_k=relative_availability_top_k,
@@ -898,6 +907,9 @@ class LoadBalancer:
                     sticky_max_age_seconds=sticky_max_age_seconds,
                     prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     relative_availability_power=relative_availability_power,
                     relative_availability_top_k=relative_availability_top_k,
@@ -1009,11 +1021,14 @@ class LoadBalancer:
         *,
         prefer_earlier_reset: bool,
         prefer_earlier_reset_window: ResetPreferenceWindow,
+        prefer_unstarted_quota_accounts: bool = False,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
         routing_strategy: RoutingStrategy,
         relative_availability_power: float,
         relative_availability_top_k: int,
         traffic_class: TrafficClass,
         routing_costs_by_account_id: RoutingCostsByAccount | None,
+        prefer_earlier_renewal_accounts: bool = False,
     ) -> ProbeReservation | None:
         if routing_strategy in ("sequential_drain", "reset_drain", "single_account"):
             return None
@@ -1021,6 +1036,9 @@ class LoadBalancer:
             states,
             prefer_earlier_reset=prefer_earlier_reset,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal_accounts,
             routing_strategy=routing_strategy,
             recovery_probe_only=True,
             relative_availability_power=relative_availability_power,
@@ -1380,6 +1398,9 @@ class LoadBalancer:
         routing_strategy: RoutingStrategy,
         budget_threshold_pct: float,
         prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
+        prefer_unstarted_quota_accounts: bool = False,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
+        prefer_earlier_renewal_accounts: bool = False,
         secondary_budget_threshold_pct: float = 100.0,
         lease_kind: AccountLeaseKind | None = None,
         concurrency_caps: AccountConcurrencyCaps | None = None,
@@ -1407,6 +1428,7 @@ class LoadBalancer:
                 runtime=self._runtime,
                 routing_policy_override=selection_inputs.routing_policy_override,
                 ignore_standard_quota_account_ids=selection_inputs.ignore_standard_quota_account_ids,
+                include_renewal=prefer_earlier_renewal_accounts,
             )
             selection_states = _filter_states_for_account_caps(
                 states,
@@ -1431,6 +1453,9 @@ class LoadBalancer:
             selection_states,
             prefer_earlier_reset=prefer_earlier_reset_accounts,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal=prefer_earlier_renewal_accounts,
             routing_strategy=routing_strategy,
             budget_threshold_pct=budget_threshold_pct,
             secondary_budget_threshold_pct=secondary_budget_threshold_pct,
@@ -1597,6 +1622,7 @@ class LoadBalancer:
         *,
         required_account_id: str | None,
         redact_sensitive_details: bool,
+        include_renewal: bool = False,
     ) -> tuple[list[AccountState], dict[str, Account]]:
         self._reclaim_stale_account_leases_locked(
             redact_sensitive_details=redact_sensitive_details,
@@ -1610,6 +1636,7 @@ class LoadBalancer:
             runtime=self._runtime,
             routing_policy_override=selection_inputs.routing_policy_override,
             ignore_standard_quota_account_ids=selection_inputs.ignore_standard_quota_account_ids,
+            include_renewal=include_renewal,
         )
         if required_account_id is None:
             return states, account_map
@@ -1659,6 +1686,9 @@ class LoadBalancer:
         secondary_budget_threshold_pct: float = 100.0,
         prefer_earlier_reset_accounts: bool,
         prefer_earlier_reset_window: ResetPreferenceWindow,
+        prefer_unstarted_quota_accounts: bool = False,
+        prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
+        prefer_earlier_renewal_accounts: bool = False,
         routing_strategy: RoutingStrategy,
         relative_availability_power: float = 2.0,
         relative_availability_top_k: int = 5,
@@ -1684,6 +1714,9 @@ class LoadBalancer:
             secondary_budget_threshold_pct=secondary_budget_threshold_pct,
             prefer_earlier_reset_accounts=prefer_earlier_reset_accounts,
             prefer_earlier_reset_window=prefer_earlier_reset_window,
+            prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+            prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
             routing_strategy=routing_strategy,
             relative_availability_power=relative_availability_power,
             relative_availability_top_k=relative_availability_top_k,
@@ -1802,6 +1835,26 @@ class LoadBalancer:
                 runtime.probe_success_streak = 0
             async with self._repo_factory() as repos:
                 await self._persist_state_if_current(repos.accounts, account_snapshot, state)
+
+    async def mark_overload_cooldown(self, account: Account, cooldown_seconds: int) -> None:
+        """Temporarily remove an upstream-overloaded account from selection."""
+        if cooldown_seconds <= 0:
+            return
+        lock = await self._get_account_lock(account.id)
+        async with lock:
+            runtime = self._runtime.setdefault(account.id, RuntimeState())
+            now = time.time()
+            runtime.cooldown_until = max(runtime.cooldown_until or 0.0, now + cooldown_seconds)
+            runtime.last_error_at = now
+            runtime.error_count = max(runtime.error_count, 1)
+            runtime.version += 1
+            runtime.health_version += 1
+            logger.warning(
+                "Account temporarily cooled down after upstream overload "
+                "account_id=%s cooldown_seconds=%s",
+                account.id,
+                cooldown_seconds,
+            )
 
     async def record_success(self, account: Account) -> None:
         """Clear transient error state after a successful upstream request."""
@@ -2093,9 +2146,11 @@ def _build_states(
     runtime: dict[str, RuntimeState],
     routing_policy_override: str | None = None,
     ignore_standard_quota_account_ids: frozenset[str] = frozenset(),
+    include_renewal: bool = False,
 ) -> tuple[list[AccountState], dict[str, Account]]:
     states: list[AccountState] = []
     account_map: dict[str, Account] = {}
+    renewal_encryptor = TokenEncryptor() if include_renewal else None
 
     for account in accounts:
         secondary_entry: UsageHistory | AdditionalUsageHistory | None = latest_secondary.get(account.id)
@@ -2111,6 +2166,9 @@ def _build_states(
             secondary_entry=secondary_entry,
             runtime=runtime.setdefault(account.id, RuntimeState()),
         )
+        if renewal_encryptor is not None:
+            _, renewal_at = subscription_window(account, renewal_encryptor)
+            state.renewal_at = renewal_at.timestamp() if renewal_at is not None else None
         if routing_policy_override is not None and account.id in ignore_standard_quota_account_ids:
             state.routing_policy = routing_policy_override
         state.ignore_standard_quota = account.id in ignore_standard_quota_account_ids
@@ -2556,6 +2614,8 @@ def _state_from_account(
     effective_used_percent = None if used_percent is None else min(100.0, used_percent + pressure_pct)
     effective_secondary_used_percent = None if secondary_used is None else min(100.0, secondary_used + pressure_pct)
     usage_exhaustion_evidence_status = status in (AccountStatus.QUOTA_EXCEEDED, AccountStatus.RATE_LIMITED)
+    primary_countdown_started = _quota_countdown_started(primary_entry)
+    secondary_countdown_started = _quota_countdown_started(effective_secondary_entry)
 
     return AccountState(
         account_id=account.id,
@@ -2564,10 +2624,12 @@ def _state_from_account(
         reset_at=reset_at,
         primary_reset_at=primary_reset,
         primary_window_minutes=primary_window_minutes,
+        primary_countdown_started=primary_countdown_started,
         blocked_at=next_blocked_at,
         cooldown_until=runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
         secondary_reset_at=secondary_reset,
+        secondary_countdown_started=secondary_countdown_started,
         last_error_at=runtime.last_error_at,
         last_selected_at=runtime.last_selected_at,
         error_count=runtime.error_count,
@@ -2582,6 +2644,19 @@ def _state_from_account(
         leased_tokens=runtime.leased_tokens,
         routing_policy=routing_policy,
     )
+
+
+def _quota_countdown_started(entry: _UsageWindowEntry | None) -> bool | None:
+    """Return whether the raw rolling window has begun consuming quota.
+
+    Codex reports an untouched rolling window at a 0-1% floor; countdown usage
+    starts only above that floor. Placeholder/absent windows
+    (``window_minutes <= 0`` or no reset) are not applicable and remain unknown,
+    so they can never manufacture preference.
+    """
+    if entry is None or entry.reset_at is None or not entry.window_minutes or entry.window_minutes <= 0:
+        return None
+    return float(entry.used_percent) > 1.0
 
 
 def _normalize_usage_inputs(

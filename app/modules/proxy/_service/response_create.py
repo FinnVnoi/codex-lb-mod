@@ -26,7 +26,7 @@ from app.core.clients.proxy import (
 )
 from app.core.config.settings import DEFAULT_HOME_DIR, get_settings
 from app.core.errors import OpenAIErrorEnvelope, openai_error
-from app.core.openai.requests import ResponsesRequest
+from app.core.openai.requests import ResponsesRequest, strip_invalid_native_input_item_ids
 from app.core.types import JsonValue
 from app.core.utils.json_guards import is_json_mapping
 from app.modules.proxy._service.support import (
@@ -188,6 +188,7 @@ def _response_create_text(
     client_metadata: Mapping[str, JsonValue] | None,
 ) -> str:
     upstream_payload = dict(payload.to_payload())
+    strip_invalid_native_input_item_ids(upstream_payload)
     upstream_payload.pop("stream", None)
     upstream_payload.pop("background", None)
     if include_type_field:
@@ -213,6 +214,7 @@ def _response_create_text_with_size_guard(
     transport: str,
 ) -> str | None:
     upstream_payload = dict(payload.to_payload())
+    strip_invalid_native_input_item_ids(upstream_payload)
     upstream_payload.pop("stream", None)
     upstream_payload.pop("background", None)
     if include_type_field:

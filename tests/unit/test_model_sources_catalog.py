@@ -13,6 +13,7 @@ from app.modules.model_sources.catalog import (
     source_model_request_overrides,
     source_model_supported_tool_types,
     source_model_supports_reasoning,
+    source_model_upstream_slug,
     source_models_to_upstream_models,
 )
 
@@ -87,6 +88,47 @@ def test_source_models_to_upstream_models_preserves_source_identity() -> None:
     assert model.raw["max_output_tokens"] == 4096
     assert model.supports_parallel_tool_calls is True
     assert model.prefer_websockets is False
+
+
+def _reasoning_source(raw_metadata_json: str | None) -> ModelSource:
+    return ModelSource(
+        id="src_reasoning",
+        name="Reasoning",
+        kind=MODEL_SOURCE_KIND_OPENAI_COMPATIBLE,
+        base_url="http://127.0.0.1:8000/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=True,
+        supports_audio_transcriptions=False,
+        models=[
+            ModelSourceModel(
+                model="reasoning-model",
+                is_enabled=True,
+                supports_streaming=True,
+                raw_metadata_json=raw_metadata_json,
+            )
+        ],
+    )
+
+
+def test_source_model_upstream_slug_uses_alias_and_falls_back_to_public_model() -> None:
+    source = ModelSource(
+        id="src_alias",
+        name="Aliased",
+        kind=MODEL_SOURCE_KIND_OPENAI_COMPATIBLE,
+        base_url="http://127.0.0.1:8000/v1",
+        is_enabled=True,
+        supports_chat_completions=True,
+        supports_responses=True,
+        models=[
+            ModelSourceModel(model="gpt-5.5", upstream_model="vendor/real-model", is_enabled=True),
+            ModelSourceModel(model="gpt-5.5-mini", upstream_model=None, is_enabled=True),
+        ],
+    )
+
+    assert source_model_upstream_slug(source, "gpt-5.5") == "vendor/real-model"
+    assert source_model_upstream_slug(source, "gpt-5.5-mini") == "gpt-5.5-mini"
+    assert source_model_upstream_slug(source, "missing") == "missing"
 
 
 def test_source_models_to_upstream_models_defaults_missing_context_window() -> None:
@@ -222,27 +264,6 @@ def test_source_models_force_codex_lb_provider_metadata() -> None:
 
     assert len(models) == 1
     assert models[0].raw["model_provider"] == "codex-lb"
-
-
-def _reasoning_source(raw_metadata_json: str | None) -> ModelSource:
-    return ModelSource(
-        id="src_reasoning",
-        name="Reasoning",
-        kind=MODEL_SOURCE_KIND_OPENAI_COMPATIBLE,
-        base_url="http://127.0.0.1:8000/v1",
-        is_enabled=True,
-        supports_chat_completions=True,
-        supports_responses=True,
-        supports_audio_transcriptions=False,
-        models=[
-            ModelSourceModel(
-                model="reasoning-model",
-                is_enabled=True,
-                supports_streaming=True,
-                raw_metadata_json=raw_metadata_json,
-            )
-        ],
-    )
 
 
 def test_source_model_without_metadata_advertises_no_reasoning_levels() -> None:

@@ -9,7 +9,7 @@ from app.modules.shared.schemas import DashboardModel
 
 class LimitRuleCreate(DashboardModel):
     limit_type: str = Field(pattern=r"^(total_tokens|input_tokens|output_tokens|cost_usd|credits)$")
-    limit_window: str = Field(pattern=r"^(daily|weekly|monthly|5h|7d)$")
+    limit_window: str = Field(pattern=r"^(1h|daily|weekly|monthly|5h|7d|lifetime)$")
     max_value: int = Field(ge=1)
     model_filter: str | None = None
 
@@ -21,12 +21,19 @@ class LimitRuleResponse(DashboardModel):
     max_value: int
     current_value: int
     model_filter: str | None
-    reset_at: datetime
+    reset_at: datetime | None
+
+
+class QuotaShopOption(DashboardModel):
+    limit_type: str
+    limit_window: str
+    model_filter: str | None = None
 
 
 class ApiKeyCreateRequest(DashboardModel):
     name: str = Field(min_length=1, max_length=128)
     allowed_models: list[str] | None = None
+    routing_mode: str = Field(default="balanced", pattern=r"^(balanced|account_first|provider_first)$")
     apply_to_codex_model: bool = False
     enforced_model: str | None = Field(default=None, min_length=1)
     enforced_reasoning_effort: str | None = Field(
@@ -39,6 +46,12 @@ class ApiKeyCreateRequest(DashboardModel):
     usage_sections: str | None = None
     weekly_token_limit: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
+    auto_extend_expiry: bool = False
+    auto_extend_expiry_type: str | None = Field(default=None, pattern=r"^(total_tokens|cost_usd)$")
+    auto_extend_expiry_threshold: int | None = Field(default=None, ge=1)
+    quota_shop_enabled: bool = False
+    quota_shop_max_windows: int = Field(default=1, ge=1)
+    quota_shop_options: list[QuotaShopOption] | None = None
     assigned_account_ids: list[str] | None = None
     assigned_source_ids: list[str] | None = None
     limits: list[LimitRuleCreate] | None = None
@@ -47,6 +60,9 @@ class ApiKeyCreateRequest(DashboardModel):
 class ApiKeyUpdateRequest(DashboardModel):
     name: str | None = Field(default=None, min_length=1, max_length=128)
     allowed_models: list[str] | None = None
+    routing_mode: str | None = Field(
+        default=None, pattern=r"^(balanced|account_first|provider_first)$"
+    )
     apply_to_codex_model: bool | None = None
     enforced_model: str | None = Field(default=None, min_length=1)
     enforced_reasoning_effort: str | None = Field(
@@ -59,6 +75,12 @@ class ApiKeyUpdateRequest(DashboardModel):
     usage_sections: str | None = None
     weekly_token_limit: int | None = Field(default=None, ge=1)
     expires_at: datetime | None = None
+    auto_extend_expiry: bool | None = None
+    auto_extend_expiry_type: str | None = Field(default=None, pattern=r"^(total_tokens|cost_usd)$")
+    auto_extend_expiry_threshold: int | None = Field(default=None, ge=1)
+    quota_shop_enabled: bool | None = None
+    quota_shop_max_windows: int | None = Field(default=None, ge=1)
+    quota_shop_options: list[QuotaShopOption] | None = None
     is_active: bool | None = None
     assigned_account_ids: list[str] | None = None
     assigned_source_ids: list[str] | None = None
@@ -87,11 +109,18 @@ class ApiKeyResponse(DashboardModel):
     transport_policy_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     expires_at: datetime | None
+    auto_extend_expiry: bool = False
+    auto_extend_expiry_type: str | None = None
+    auto_extend_expiry_threshold: int | None = None
+    quota_shop_enabled: bool = False
+    quota_shop_max_windows: int = 1
+    quota_shop_options: list[QuotaShopOption] = Field(default_factory=list)
     is_active: bool
     account_assignment_scope_enabled: bool = False
     source_assignment_scope_enabled: bool = False
     assigned_account_ids: list[str] = Field(default_factory=list)
     assigned_source_ids: list[str] = Field(default_factory=list)
+    routing_mode: str = "balanced"
     created_at: datetime
     last_used_at: datetime | None
     limits: list[LimitRuleResponse] = Field(default_factory=list)

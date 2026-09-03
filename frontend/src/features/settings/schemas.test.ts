@@ -17,6 +17,7 @@ describe("DashboardSettingsSchema", () => {
       upstreamProxyRoutingEnabled: true,
       upstreamProxyDefaultPoolId: "pool_1",
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "relative_availability",
       preferEarlierResetWindow: "secondary",
       showResetCreditBadges: false,
@@ -36,6 +37,11 @@ describe("DashboardSettingsSchema", () => {
       stickyReallocationBudgetThresholdPct: 95,
       stickyReallocationPrimaryBudgetThresholdPct: 90,
       stickyReallocationSecondaryBudgetThresholdPct: 100,
+      globalApiRoutingOverride: "provider_first",
+      providerFailurePolicy: "providers_before_accounts",
+      accountFailurePolicy: "provider_after_first_failure",
+      providerMaxAttempts: 4,
+      accountMaxAttempts: 5,
       warmupModel: "gpt-5.4-mini",
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
@@ -77,6 +83,11 @@ describe("DashboardSettingsSchema", () => {
     expect(parsed.dashboardSessionTtlSeconds).toBe(43200);
     expect(parsed.stickyReallocationPrimaryBudgetThresholdPct).toBe(90);
     expect(parsed.stickyReallocationSecondaryBudgetThresholdPct).toBe(100);
+    expect(parsed.globalApiRoutingOverride).toBe("provider_first");
+    expect(parsed.providerFailurePolicy).toBe("providers_before_accounts");
+    expect(parsed.accountFailurePolicy).toBe("provider_after_first_failure");
+    expect(parsed.providerMaxAttempts).toBe(4);
+    expect(parsed.accountMaxAttempts).toBe(5);
     expect(parsed.warmupModel).toBe("gpt-5.4-mini");
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.guestAccessEnabled).toBe(true);
@@ -92,6 +103,7 @@ describe("DashboardSettingsSchema", () => {
     const parsed = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       stickyReallocationBudgetThresholdPct: 95,
@@ -124,6 +136,11 @@ describe("DashboardSettingsSchema", () => {
     expect(parsed.showResetCreditBadges).toBe(true);
     expect(parsed.autoRedeemResetCreditsBeforeExpiry).toBe(false);
     expect(parsed.showResetCreditExpiryBadge).toBe(true);
+    expect(parsed.globalApiRoutingOverride).toBe("normal");
+    expect(parsed.providerFailurePolicy).toBe("account_after_first_failure");
+    expect(parsed.accountFailurePolicy).toBe("accounts_before_providers");
+    expect(parsed.providerMaxAttempts).toBe(3);
+    expect(parsed.accountMaxAttempts).toBe(3);
     expect(parsed.stickyReallocationPrimaryBudgetThresholdPct).toBe(95);
     expect(parsed.stickyReallocationSecondaryBudgetThresholdPct).toBe(95);
     expect(parsed.guestAccessEnabled).toBe(false);
@@ -135,6 +152,7 @@ describe("DashboardSettingsSchema", () => {
       stickyThreadsEnabled: true,
       upstreamStreamTransport: "default",
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "round_robin",
       openaiCacheAffinityMaxAgeSeconds: 300,
       dashboardSessionTtlSeconds: 43200,
@@ -154,6 +172,7 @@ describe("DashboardSettingsSchema", () => {
       stickyThreadsEnabled: true,
       upstreamStreamTransport: "default",
       preferEarlierResetAccounts: false,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "round_robin",
       openaiCacheAffinityMaxAgeSeconds: 300,
       dashboardSessionTtlSeconds: 43200,
@@ -179,6 +198,7 @@ describe("SettingsUpdateRequestSchema", () => {
       upstreamProxyRoutingEnabled: true,
       upstreamProxyDefaultPoolId: null,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "relative_availability",
       preferEarlierResetWindow: "secondary",
       showResetCreditBadges: false,
@@ -198,6 +218,11 @@ describe("SettingsUpdateRequestSchema", () => {
       stickyReallocationBudgetThresholdPct: 95,
       stickyReallocationPrimaryBudgetThresholdPct: 90,
       stickyReallocationSecondaryBudgetThresholdPct: 100,
+      globalApiRoutingOverride: "account_first",
+      providerFailurePolicy: "provider_only",
+      accountFailurePolicy: "account_only",
+      providerMaxAttempts: 2,
+      accountMaxAttempts: 6,
       warmupModel: " gpt-5.4-nano ",
       importWithoutOverwrite: true,
       totpRequiredOnLogin: true,
@@ -225,6 +250,11 @@ describe("SettingsUpdateRequestSchema", () => {
     expect(parsed.showResetCreditExpiryBadge).toBe(false);
     expect(parsed.upstreamProxyRoutingEnabled).toBe(true);
     expect(parsed.upstreamProxyDefaultPoolId).toBeNull();
+    expect(parsed.globalApiRoutingOverride).toBe("account_first");
+    expect(parsed.providerFailurePolicy).toBe("provider_only");
+    expect(parsed.accountFailurePolicy).toBe("account_only");
+    expect(parsed.providerMaxAttempts).toBe(2);
+    expect(parsed.accountMaxAttempts).toBe(6);
     expect(parsed.importWithoutOverwrite).toBe(true);
     expect(parsed.routingStrategy).toBe("relative_availability");
     expect(parsed.relativeAvailabilityPower).toBe(1.5);
@@ -248,6 +278,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       dashboardSessionTtlSeconds: 31536000,
     });
 
@@ -258,6 +289,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
     });
 
     expect(parsed.upstreamStreamTransport).toBeUndefined();
@@ -288,6 +320,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const result = SettingsUpdateRequestSchema.safeParse({
       stickyThreadsEnabled: "yes",
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
     });
 
     expect(result.success).toBe(false);
@@ -303,6 +336,7 @@ describe("SettingsUpdateRequestSchema", () => {
         SettingsUpdateRequestSchema.safeParse({
           stickyThreadsEnabled: false,
           preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
           ...payload,
         }).success,
       ).toBe(false);
@@ -330,6 +364,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         proxyAccountStreamLimit: 2,
         proxyAccountStreamRecoveryReserve: 3,
       }).success,
@@ -340,6 +375,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: true,
       totpRequiredOnLogin: false,
       totpConfigured: false,
@@ -356,6 +392,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const parsed = SettingsUpdateRequestSchema.parse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "fill_first",
     });
 
@@ -366,6 +403,7 @@ describe("SettingsUpdateRequestSchema", () => {
     const result = SettingsUpdateRequestSchema.safeParse({
       stickyThreadsEnabled: false,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       routingStrategy: "fill_last",
     });
 
@@ -377,6 +415,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         weeklyPaceWorkingDays: "0,1,7",
       }).success,
     ).toBe(false);
@@ -387,6 +426,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         weeklyPaceSmoothingMinutes: 45,
       }).success,
     ).toBe(false);
@@ -397,6 +437,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupModel: "m".repeat(129),
       }).success,
     ).toBe(false);
@@ -404,6 +445,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupPrompt: "p".repeat(513),
       }).success,
     ).toBe(false);
@@ -414,6 +456,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupExhaustedThresholdPercent: 0,
       }).success,
     ).toBe(false);
@@ -421,6 +464,7 @@ describe("SettingsUpdateRequestSchema", () => {
       SettingsUpdateRequestSchema.safeParse({
         stickyThreadsEnabled: false,
         preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
         limitWarmupExhaustedThresholdPercent: 100.1,
       }).success,
     ).toBe(false);
@@ -553,6 +597,7 @@ describe("retention fields", () => {
     const withValues = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       totpConfigured: false,
@@ -570,6 +615,7 @@ describe("retention fields", () => {
     const withoutValues = DashboardSettingsSchema.parse({
       stickyThreadsEnabled: true,
       preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
       importWithoutOverwrite: false,
       totpRequiredOnLogin: false,
       totpConfigured: false,

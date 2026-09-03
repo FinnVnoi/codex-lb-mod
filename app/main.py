@@ -69,6 +69,7 @@ from app.modules.accounts.deletion import build_account_deletion_scheduler
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.accounts.usage_rollup_scheduler import build_account_usage_rollup_scheduler
 from app.modules.api_keys import api as api_keys_api
+from app.modules.api_keys import quota_shop as quota_shop_api
 from app.modules.api_keys.last_used_coalescer import build_api_key_last_used_flush_scheduler
 from app.modules.api_keys.reset_scheduler import build_api_key_limit_reset_scheduler
 from app.modules.audit import api as audit_api
@@ -849,6 +850,7 @@ def create_app() -> FastAPI:
     app.include_router(sticky_sessions_api.router)
     app.include_router(automations_api.router)
     app.include_router(api_keys_api.router)
+    app.include_router(quota_shop_api.router)
     app.include_router(model_sources_api.router)
     app.include_router(health_api.router)
 

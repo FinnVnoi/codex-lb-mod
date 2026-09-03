@@ -93,6 +93,7 @@ type RoutingSettingsDraft = {
   proxyAccountStreamLimit: string;
   proxyAccountStreamRecoveryReserve: string;
   proxyApiKeyFairShareCongestionThresholdPct: string;
+  modelSourceStickyTtl: string;
   relativeAvailabilityPower: string;
   relativeAvailabilityTopK: string;
   stickyPrimaryThreshold: string;
@@ -114,6 +115,7 @@ function createRoutingSettingsDraft(settings: DashboardSettings): RoutingSetting
     proxyAccountStreamLimit: String(settings.proxyAccountStreamLimit),
     proxyAccountStreamRecoveryReserve: String(settings.proxyAccountStreamRecoveryReserve),
     proxyApiKeyFairShareCongestionThresholdPct: String(settings.proxyApiKeyFairShareCongestionThresholdPct),
+    modelSourceStickyTtl: String(settings.modelSourceStickyTtlSeconds),
     relativeAvailabilityPower: String(settings.relativeAvailabilityPower),
     relativeAvailabilityTopK: String(settings.relativeAvailabilityTopK),
     stickyPrimaryThreshold: String(settings.stickyReallocationPrimaryBudgetThresholdPct ?? 95),
@@ -198,6 +200,14 @@ export function RoutingSettings({
   const parsedProxyAccountStreamRecoveryReserve = parseNonnegativeInteger(
     draft.proxyAccountStreamRecoveryReserve,
   );
+  const parsedModelSourceStickyTtl = Number.parseInt(draft.modelSourceStickyTtl, 10);
+  const modelSourceStickyTtlValid =
+    Number.isInteger(parsedModelSourceStickyTtl) &&
+    parsedModelSourceStickyTtl >= 60 &&
+    parsedModelSourceStickyTtl <= 86400;
+  const modelSourceStickyTtlChanged =
+    modelSourceStickyTtlValid &&
+    parsedModelSourceStickyTtl !== settings.modelSourceStickyTtlSeconds;
   const parsedProxyApiKeyFairShareCongestionThresholdPct = parseNonnegativeInteger(
     draft.proxyApiKeyFairShareCongestionThresholdPct,
   );
@@ -821,6 +831,46 @@ export function RoutingSettings({
               {t("settings.routing.stickyThreads.hardAffinityNote")}
             </p>
           </div>
+          <div className="space-y-3 p-3">
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-medium">{t("settings.routing.modelSourceSticky.label")}</p>
+                <p className="text-xs text-muted-foreground">
+                  {t("settings.routing.modelSourceSticky.description")}
+                </p>
+              </div>
+              <Switch
+                aria-label={t("settings.routing.modelSourceSticky.ariaLabel")}
+                checked={settings.modelSourceStickyEnabled}
+                disabled={busy}
+                onCheckedChange={(checked) => save({ modelSourceStickyEnabled: checked })}
+              />
+            </div>
+            <div className="flex flex-wrap items-end gap-2">
+              <label className="grid gap-1 text-xs text-muted-foreground">
+                {t("settings.routing.modelSourceStickyTtl.label")}
+                <Input
+                  aria-label={t("settings.routing.modelSourceStickyTtl.label")}
+                  value={draft.modelSourceStickyTtl}
+                  disabled={busy || !settings.modelSourceStickyEnabled}
+                  onChange={(event) => updateDraft({ modelSourceStickyTtl: event.target.value })}
+                  inputMode="numeric"
+                />
+              </label>
+              <Button
+                type="button"
+                size="sm"
+                variant="outline"
+                disabled={busy || !settings.modelSourceStickyEnabled || !modelSourceStickyTtlChanged}
+                onClick={() => save({ modelSourceStickyTtlSeconds: parsedModelSourceStickyTtl })}
+              >
+                {t("settings.routing.modelSourceStickyTtl.save")}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t("settings.routing.modelSourceStickyTtl.description")}
+            </p>
+          </div>
 
           <div className="space-y-1 p-3">
             <p className="text-sm font-medium">{t("settings.routing.quotaWindows.title")}</p>
@@ -925,6 +975,58 @@ export function RoutingSettings({
                 {t("settings.routing.stickyThresholds.saveSecondary")}
               </Button>
             </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div>
+              <p className="text-sm font-medium">{t("settings.routing.preferUnstartedQuota.label")}</p>
+              <p className="text-xs text-muted-foreground">
+                {t("settings.routing.preferUnstartedQuota.description")}
+              </p>
+            </div>
+            <div className="flex items-center gap-3">
+              <Select
+                value={settings.preferUnstartedQuotaWindow}
+                onValueChange={(value) =>
+                  save({ preferUnstartedQuotaWindow: value as "primary" | "secondary" | "both" | "any" })
+                }
+              >
+                <SelectTrigger
+                  aria-label={t("settings.routing.preferUnstartedQuota.windowAria")}
+                  className="h-8 w-36 text-xs"
+                  disabled={busy || !settings.preferUnstartedQuotaAccounts}
+                >
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent align="end">
+                  <SelectItem value="any">{t("settings.routing.quotaWindows.any")}</SelectItem>
+                  <SelectItem value="both">{t("settings.routing.quotaWindows.both")}</SelectItem>
+                  <SelectItem value="secondary">{t("settings.routing.quotaWindows.weekly")}</SelectItem>
+                  <SelectItem value="primary">{t("settings.routing.quotaWindows.fiveHour")}</SelectItem>
+                </SelectContent>
+              </Select>
+              <Switch
+                aria-label={t("settings.routing.preferUnstartedQuota.ariaLabel")}
+                checked={settings.preferUnstartedQuotaAccounts}
+                disabled={busy}
+                onCheckedChange={(checked) => save({ preferUnstartedQuotaAccounts: checked })}
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div>
+              <p className="text-sm font-medium">{t("settings.routing.preferEarlierRenewal.label")}</p>
+              <p className="text-xs text-muted-foreground">
+                {t("settings.routing.preferEarlierRenewal.description")}
+              </p>
+            </div>
+            <Switch
+              aria-label={t("settings.routing.preferEarlierRenewal.ariaLabel")}
+              checked={settings.preferEarlierRenewalAccounts}
+              disabled={busy}
+              onCheckedChange={(checked) => save({ preferEarlierRenewalAccounts: checked })}
+            />
           </div>
 
           <div className="flex items-center justify-between p-3">

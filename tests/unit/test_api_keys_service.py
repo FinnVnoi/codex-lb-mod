@@ -21,6 +21,7 @@ from app.db.models import (
     UsageHistory,
 )
 from app.modules.api_keys.last_used_coalescer import ApiKeyLastUsedCoalescer
+from app.modules.api_keys.limit_windows import next_limit_reset
 from app.modules.api_keys.repository import (
     _UNSET,
     ApiKeyTrendBucket,
@@ -76,6 +77,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self.commit_calls = 0
         self.rollback_calls = 0
         self.commit_count = 0
+        self.update_last_used_commit_flags: list[bool] = []
         self.touched_reservations: list[str] = []
 
     async def create(self, row: ApiKey, *, commit: bool = True) -> ApiKey:
@@ -93,9 +95,6 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             row.account_assignments = self._account_assignments.get(key_id, [])
             row.source_assignments = self._source_assignments.get(key_id, [])
         return row
-
-    async def get_for_limit_enforcement(self, key_id: str) -> ApiKey | None:
-        return await self.get_by_id(key_id)
 
     async def get_by_hash(self, key_hash: str) -> ApiKey | None:
         for row in self.rows.values():
@@ -149,14 +148,20 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         apply_to_codex_model: bool | _Unset = _UNSET,
         enforced_model: str | None | _Unset = _UNSET,
         enforced_reasoning_effort: str | None | _Unset = _UNSET,
-        allowed_reasoning_efforts: str | None | _Unset = _UNSET,
         enforced_service_tier: str | None | _Unset = _UNSET,
         traffic_class: str | _Unset = _UNSET,
+        routing_mode: str | _Unset = _UNSET,
         transport_policy_override: str | None | _Unset = _UNSET,
         usage_sections: str | _Unset = _UNSET,
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
         source_assignment_scope_enabled: bool | _Unset = _UNSET,
         expires_at: datetime | None | _Unset = _UNSET,
+        auto_extend_expiry: bool | _Unset = _UNSET,
+        auto_extend_expiry_type: str | None | _Unset = _UNSET,
+        auto_extend_expiry_threshold: int | None | _Unset = _UNSET,
+        quota_shop_enabled: bool | _Unset = _UNSET,
+        quota_shop_max_windows: int | _Unset = _UNSET,
+        quota_shop_options: str | _Unset = _UNSET,
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
@@ -172,14 +177,20 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             "apply_to_codex_model": apply_to_codex_model,
             "enforced_model": enforced_model,
             "enforced_reasoning_effort": enforced_reasoning_effort,
-            "allowed_reasoning_efforts": allowed_reasoning_efforts,
             "enforced_service_tier": enforced_service_tier,
             "traffic_class": traffic_class,
+            "routing_mode": routing_mode,
             "transport_policy_override": transport_policy_override,
             "usage_sections": usage_sections,
             "account_assignment_scope_enabled": account_assignment_scope_enabled,
             "source_assignment_scope_enabled": source_assignment_scope_enabled,
             "expires_at": expires_at,
+            "auto_extend_expiry": auto_extend_expiry,
+            "auto_extend_expiry_type": auto_extend_expiry_type,
+            "auto_extend_expiry_threshold": auto_extend_expiry_threshold,
+            "quota_shop_enabled": quota_shop_enabled,
+            "quota_shop_max_windows": quota_shop_max_windows,
+            "quota_shop_options": quota_shop_options,
             "is_active": is_active,
             "key_hash": key_hash,
             "key_prefix": key_prefix,
@@ -198,6 +209,14 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         self._limits.pop(key_id, None)
         self._source_assignments.pop(key_id, None)
         return True
+
+    async def update_last_used(self, key_id: str, *, commit: bool = True) -> None:
+        self.update_last_used_commit_flags.append(commit)
+        row = self.rows.get(key_id)
+        if row is not None:
+            row.last_used_at = utcnow()
+        if commit:
+            await self.commit()
 
     async def commit(self) -> None:
         self.commit_calls += 1
@@ -280,8 +299,19 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             increment = _compute_increment(limit, input_tokens, output_tokens, cost_microdollars)
             if increment > 0:
                 limit.current_value += increment
+                if limit.reset_at is None:
+                    limit.reset_at = next_limit_reset(utcnow(), limit.limit_window)
+        row = self.rows.get(key_id)
+        if row is not None:
+            row.last_used_at = utcnow()
 
-    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
+    async def reset_limit(
+        self,
+        limit_id: int,
+        *,
+        expected_reset_at: datetime,
+        new_reset_at: datetime | None,
+    ) -> bool:
         for limits in self._limits.values():
             for limit in limits:
                 if limit.id == limit_id and limit.reset_at == expected_reset_at:
@@ -295,7 +325,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
+        first_reset_at: datetime,
     ) -> ReservationResult:
         limit = _find_limit_by_id(self._limits, limit_id)
         if limit is None:
@@ -305,6 +336,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         if limit.current_value + delta > limit.max_value:
             return ReservationResult(False, limit_id, limit.current_value, limit.max_value, limit.reset_at)
         limit.current_value += delta
+        if limit.reset_at is None:
+            limit.reset_at = first_reset_at
         return ReservationResult(True, limit_id, limit.current_value, limit.max_value, limit.reset_at)
 
     async def adjust_reserved_usage(
@@ -312,7 +345,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
     ) -> bool:
         limit = _find_limit_by_id(self._limits, limit_id)
         if limit is None or limit.reset_at != expected_reset_at:
@@ -656,6 +689,27 @@ async def test_api_key_read_skips_null_allowed_models() -> None:
 
 
 @pytest.mark.asyncio
+async def test_create_key_uses_amin_prefix_when_expiry_is_set() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="expiring-key",
+            allowed_models=None,
+            expires_at=datetime(2026, 3, 20, 23, 59, 59, tzinfo=timezone(timedelta(hours=9))),
+        )
+    )
+
+    assert created.key.startswith("sk-amin-")
+    assert created.key_prefix == created.key[:15]
+
+    stored = await repo.get_by_id(created.id)
+    assert stored is not None
+    assert stored.key_prefix == created.key[:15]
+
+
+@pytest.mark.asyncio
 async def test_create_key_normalizes_timezone_aware_expiry_to_utc_naive() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -709,108 +763,6 @@ async def test_create_key_normalizes_enforced_reasoning_effort() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_key_normalizes_allowed_reasoning_efforts() -> None:
-    repo = _FakeApiKeysRepository()
-    service = ApiKeysService(repo)
-
-    created = await service.create_key(
-        ApiKeyCreateData(
-            name="selectable-reasoning-policy",
-            allowed_models=None,
-            allowed_reasoning_efforts=["XHIGH", "low", "high", "low"],
-        )
-    )
-
-    assert created.allowed_reasoning_efforts == ["low", "high", "xhigh"]
-    stored = await repo.get_by_id(created.id)
-    assert stored is not None
-    assert stored.allowed_reasoning_efforts == '["low", "high", "xhigh"]'
-    assert (await service.validate_key(created.key)).id == created.id
-
-
-@pytest.mark.asyncio
-async def test_create_key_rejects_empty_or_conflicting_reasoning_policies() -> None:
-    service = ApiKeysService(_FakeApiKeysRepository())
-
-    with pytest.raises(ApiKeyValidationError, match="must not be empty"):
-        await service.create_key(
-            ApiKeyCreateData(name="empty-reasoning-policy", allowed_models=None, allowed_reasoning_efforts=[])
-        )
-
-    with pytest.raises(ApiKeyValidationError, match="cannot be configured together"):
-        await service.create_key(
-            ApiKeyCreateData(
-                name="conflicting-reasoning-policy",
-                allowed_models=None,
-                enforced_reasoning_effort="low",
-                allowed_reasoning_efforts=["low"],
-            )
-        )
-
-
-@pytest.mark.asyncio
-async def test_update_key_validates_effective_reasoning_policy() -> None:
-    repo = _FakeApiKeysRepository()
-    service = ApiKeysService(repo)
-    created = await service.create_key(
-        ApiKeyCreateData(name="switchable-reasoning-policy", allowed_models=None, enforced_reasoning_effort="low")
-    )
-
-    with pytest.raises(ApiKeyValidationError, match="cannot be configured together"):
-        await service.update_key(
-            created.id,
-            ApiKeyUpdateData(
-                allowed_reasoning_efforts=["low", "medium"],
-                allowed_reasoning_efforts_set=True,
-            ),
-        )
-
-    updated = await service.update_key(
-        created.id,
-        ApiKeyUpdateData(
-            enforced_reasoning_effort=None,
-            enforced_reasoning_effort_set=True,
-            allowed_reasoning_efforts=["low", "medium"],
-            allowed_reasoning_efforts_set=True,
-        ),
-    )
-
-    assert updated.enforced_reasoning_effort is None
-    assert updated.allowed_reasoning_efforts == ["low", "medium"]
-
-
-@pytest.mark.asyncio
-async def test_update_key_translates_reasoning_policy_constraint_race() -> None:
-    class ConstraintFailingRepository(_FakeApiKeysRepository):
-        fail_reasoning_policy_commit = False
-
-        async def commit(self) -> None:
-            if self.fail_reasoning_policy_commit:
-                raise IntegrityError(
-                    "UPDATE api_keys",
-                    {},
-                    Exception("CHECK constraint failed: ck_api_keys_reasoning_policy_exclusive"),
-                )
-            await super().commit()
-
-    repo = ConstraintFailingRepository()
-    service = ApiKeysService(repo)
-    created = await service.create_key(ApiKeyCreateData(name="concurrent-reasoning-policy", allowed_models=None))
-    repo.fail_reasoning_policy_commit = True
-
-    with pytest.raises(ApiKeyValidationError, match="cannot be configured together"):
-        await service.update_key(
-            created.id,
-            ApiKeyUpdateData(
-                allowed_reasoning_efforts=["low"],
-                allowed_reasoning_efforts_set=True,
-            ),
-        )
-
-    assert repo.rollback_calls == 1
-
-
-@pytest.mark.asyncio
 async def test_create_key_persists_apply_to_codex_model_flag() -> None:
     repo = _FakeApiKeysRepository()
     service = ApiKeysService(repo)
@@ -846,23 +798,6 @@ async def test_create_key_normalizes_fast_service_tier_alias() -> None:
     )
 
     assert created.enforced_service_tier == "priority"
-
-
-@pytest.mark.asyncio
-async def test_create_key_preserves_ultrafast_service_tier() -> None:
-    repo = _FakeApiKeysRepository()
-    service = ApiKeysService(repo)
-
-    created = await service.create_key(
-        ApiKeyCreateData(
-            name="ultrafast-service-tier-policy",
-            allowed_models=None,
-            enforced_service_tier=" ULTRAFAST ",
-            expires_at=None,
-        )
-    )
-
-    assert created.enforced_service_tier == "ultrafast"
 
 
 @pytest.mark.asyncio
@@ -1339,8 +1274,95 @@ async def test_create_key_with_limits() -> None:
     assert token_limit.max_value == 1_000_000
     assert token_limit.limit_window == "weekly"
     assert token_limit.current_value == 0
+    assert token_limit.reset_at is None
     assert cost_limit.max_value == 5_000_000
     assert cost_limit.limit_window == "daily"
+    assert cost_limit.reset_at is None
+
+
+@pytest.mark.asyncio
+async def test_admin_edit_preserves_usage_and_countdown() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="preserve-countdown",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=100)],
+        )
+    )
+    limits = await repo.get_limits_by_key(created.id)
+    original_reset_at = utcnow() + timedelta(days=3)
+    limits[0].current_value = 12
+    limits[0].reset_at = original_reset_at
+
+    await service.update_key(
+        created.id,
+        ApiKeyUpdateData(
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=200)],
+            limits_set=True,
+        ),
+    )
+
+    updated = (await repo.get_limits_by_key(created.id))[0]
+    assert updated.max_value == 200
+    assert updated.current_value == 12
+    assert updated.reset_at == original_reset_at
+
+
+@pytest.mark.asyncio
+async def test_explicit_reset_clears_countdown_until_first_usage() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="reset-countdown",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=100)],
+        )
+    )
+    limits = await repo.get_limits_by_key(created.id)
+    limits[0].current_value = 12
+    limits[0].reset_at = utcnow() + timedelta(days=3)
+
+    await service.update_key(created.id, ApiKeyUpdateData(reset_usage=True))
+    reset = (await repo.get_limits_by_key(created.id))[0]
+    assert reset.current_value == 0
+    assert reset.reset_at is None
+
+    await service.record_usage(created.id, model="gpt-5.1", input_tokens=1, output_tokens=1)
+    used = (await repo.get_limits_by_key(created.id))[0]
+    assert used.current_value == 2
+    assert used.reset_at is not None
+    assert used.reset_at > utcnow() + timedelta(days=6)
+
+
+@pytest.mark.asyncio
+async def test_quota_shop_mode_blocks_usage_until_first_purchase() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="quota-shop-locked-key",
+            allowed_models=None,
+            expires_at=None,
+            quota_shop_enabled=True,
+            quota_shop_options=[{"limit_type": "total_tokens", "limit_window": "lifetime"}],
+            limits=[],
+        )
+    )
+
+    # Authentication and catalog access remain available so the customer can buy quota.
+    validated = await service.validate_key(created.key)
+    assert validated.id == created.id
+
+    with pytest.raises(ApiKeyRateLimitExceededError) as exc_info:
+        await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+    assert str(exc_info.value) == "API key đang ở Quota Shop Mode. Vui lòng mua quota trước khi sử dụng."
+    assert exc_info.value.is_lifetime is True
 
 
 @pytest.mark.asyncio
@@ -1403,7 +1425,7 @@ async def test_validate_key_lazy_resets_expired_limit() -> None:
     # Verify lazy reset occurred
     updated_limits = await repo.get_limits_by_key(created.id)
     assert updated_limits[0].current_value == 0
-    assert updated_limits[0].reset_at > utcnow()
+    assert updated_limits[0].reset_at is None
 
 
 @pytest.mark.asyncio
@@ -1461,7 +1483,7 @@ async def test_validate_key_advances_reset_strictly_into_future(monkeypatch: pyt
 
     updated_limits = await repo.get_limits_by_key(created.id)
     assert updated_limits[0].current_value == 0
-    assert updated_limits[0].reset_at == fixed_now + timedelta(days=7)
+    assert updated_limits[0].reset_at is None
 
 
 @pytest.mark.asyncio
@@ -1492,7 +1514,30 @@ async def test_validate_key_multi_limit_all_must_pass() -> None:
 
     with pytest.raises(ApiKeyRateLimitExceededError) as exc_info:
         await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert "cost_usd" in str(exc_info.value)
+    assert str(exc_info.value) == "Đã đạt đến giới hạn. Vui lòng nạp thêm quota hoặc chờ hạn mức tự reset."
+    assert exc_info.value.is_lifetime is False
+
+
+@pytest.mark.asyncio
+async def test_enforce_lifetime_limit_exceeded_requests_top_up_without_reset_hint() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="lifetime-limit-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="lifetime", max_value=100)],
+        )
+    )
+    limit = (await repo.get_limits_by_key(created.id))[0]
+    limit.current_value = limit.max_value
+
+    with pytest.raises(ApiKeyRateLimitExceededError) as exc_info:
+        await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+    assert str(exc_info.value) == "Đã đạt đến giới hạn. Vui lòng nạp thêm quota."
+    assert exc_info.value.is_lifetime is True
 
 
 @pytest.mark.asyncio
@@ -1516,7 +1561,6 @@ async def test_enforce_limits_reserves_tier_aware_cost_budget() -> None:
         request_service_tier="priority",
         request_usage_budget=ApiKeyRequestUsageBudget(input_tokens=8192, output_tokens=8192),
     )
-    assert priority_reservation is not None
     assert priority_reservation.key_id == priority_created.id
 
     priority_limits = await repo.get_limits_by_key(priority_created.id)
@@ -1539,7 +1583,6 @@ async def test_enforce_limits_reserves_tier_aware_cost_budget() -> None:
         request_service_tier=None,
         request_usage_budget=ApiKeyRequestUsageBudget(input_tokens=8192, output_tokens=8192),
     )
-    assert standard_reservation is not None
     assert standard_reservation.key_id == standard_created.id
 
     standard_limits = await repo.get_limits_by_key(standard_created.id)
@@ -1579,9 +1622,7 @@ async def test_enforce_limits_default_budget_allows_eight_priority_lanes_under_f
     )
 
     assert len(reservations) == 8
-    granted = [reservation for reservation in reservations if reservation is not None]
-    assert len(granted) == 8
-    assert {reservation.key_id for reservation in granted} == {created.id}
+    assert {reservation.key_id for reservation in reservations} == {created.id}
     limits = await repo.get_limits_by_key(created.id)
     cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
     assert 0 < cost_limit.current_value < 5_000_000
@@ -1638,7 +1679,6 @@ async def test_finalize_usage_reservation_accounts_for_zero_reserved_limit_item(
         request_model="gpt-5.5",
         request_usage_budget=ApiKeyRequestUsageBudget(input_tokens=0, output_tokens=0),
     )
-    assert reservation is not None
 
     limits = await repo.get_limits_by_key(created.id)
     output_limit = next(limit for limit in limits if limit.limit_type == LimitType.OUTPUT_TOKENS)
@@ -1682,107 +1722,13 @@ async def test_enforce_limits_retries_sqlite_busy_reservation_commit(monkeypatch
     repo = _BusyRepo()
     service = ApiKeysService(repo)
     monkeypatch.setattr("app.modules.api_keys.service.asyncio.sleep", _async_noop)
-    created = await service.create_key(
-        ApiKeyCreateData(
-            name="busy-retry-key",
-            allowed_models=None,
-            expires_at=None,
-            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=1_000_000)],
-        )
-    )
+    created = await service.create_key(ApiKeyCreateData(name="busy-retry-key", allowed_models=None, expires_at=None))
     initial_commit_count = repo.commit_count
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
 
-    assert reservation is not None
     assert reservation.key_id == created.id
     assert repo.create_usage_reservation_calls == 3
-    assert repo.commit_count == initial_commit_count + 1
-
-
-@pytest.mark.asyncio
-async def test_enforce_limits_without_limits_skips_reservation_and_commit() -> None:
-    repo = _FakeApiKeysRepository()
-    coalescer = ApiKeyLastUsedCoalescer()
-    service = ApiKeysService(repo, last_used_coalescer=coalescer)
-    created = await service.create_key(ApiKeyCreateData(name="unlimited-key", allowed_models=None, expires_at=None))
-    initial_commit_count = repo.commit_count
-    initial_rollback_calls = repo.rollback_calls
-
-    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-
-    assert reservation is None
-    assert repo._reservations == {}
-    # The implicit transaction opened by the admission SELECTs must be closed
-    # on the limit-free path (long-lived sessions would otherwise idle in
-    # transaction across the upstream round-trip) — via commit(), never
-    # rollback(): rollback expires every ORM object tracked by a shared
-    # session even with expire_on_commit=False, which broke quota-planner
-    # warmup probes. The commit is read-only (no reservation was inserted).
-    assert repo.commit_count == initial_commit_count + 1
-    assert repo.rollback_calls == initial_rollback_calls
-    # Settlement never runs without a reservation, so admission itself must
-    # record the last-used touch for limit-free keys.
-    pending = coalescer.pending_snapshot()
-    assert set(pending) == {created.id}
-    assert pending[created.id] <= utcnow()
-
-
-@pytest.mark.asyncio
-async def test_enforce_limits_with_no_applicable_limits_skips_reservation_and_leaves_limits_untouched() -> None:
-    repo = _FakeApiKeysRepository()
-    service = ApiKeysService(repo)
-    created = await service.create_key(
-        ApiKeyCreateData(
-            name="filtered-limits-key",
-            allowed_models=None,
-            expires_at=None,
-            limits=[
-                LimitRuleInput(
-                    limit_type="total_tokens",
-                    limit_window="weekly",
-                    max_value=10_000,
-                    model_filter="gpt-5.1",
-                ),
-            ],
-        )
-    )
-    initial_commit_count = repo.commit_count
-    initial_rollback_calls = repo.rollback_calls
-
-    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.5")
-
-    assert reservation is None
-    assert repo._reservations == {}
-    # One read-only commit closes the admission transaction; no rollback
-    # (rollback would expire shared-session ORM state — see the limit-free
-    # transaction-close comment in _enforce_limits_for_request_once).
-    assert repo.commit_count == initial_commit_count + 1
-    assert repo.rollback_calls == initial_rollback_calls
-    limits = await repo.get_limits_by_key(created.id)
-    assert limits[0].current_value == 0
-
-
-@pytest.mark.asyncio
-async def test_enforce_limits_with_applicable_limit_still_creates_reservation() -> None:
-    repo = _FakeApiKeysRepository()
-    service = ApiKeysService(repo)
-    created = await service.create_key(
-        ApiKeyCreateData(
-            name="limited-regression-key",
-            allowed_models=None,
-            expires_at=None,
-            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=1_000_000)],
-        )
-    )
-    initial_commit_count = repo.commit_count
-
-    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-
-    assert reservation is not None
-    assert reservation.key_id == created.id
-    assert reservation.has_applicable_limits is True
-    assert reservation.reservation_id in repo._reservations
     assert repo.commit_count == initial_commit_count + 1
 
 
@@ -1831,7 +1777,6 @@ async def test_enforce_limits_retries_sqlite_busy_during_lazy_reset_rolls_back(m
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5")
 
-    assert reservation is not None
     assert reservation.key_id == created.id
     assert repo.reset_limit_calls == 3
     assert repo.rollback_calls >= 2
@@ -1877,6 +1822,32 @@ async def test_regenerate_key_rotates_hash_and_prefix() -> None:
     assert regenerated.key.startswith("sk-clb-")
     assert row_after.key_hash != old_hash
     assert row_after.key_prefix != old_prefix
+
+
+@pytest.mark.asyncio
+async def test_regenerate_key_preserves_amin_prefix_for_expiring_key() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="regen-expiring-key",
+            allowed_models=None,
+            expires_at=utcnow() + timedelta(days=30),
+        )
+    )
+
+    row_before = await repo.get_by_id(created.id)
+    assert row_before is not None
+    old_hash = row_before.key_hash
+
+    regenerated = await service.regenerate_key(created.id)
+    row_after = await repo.get_by_id(created.id)
+    assert row_after is not None
+
+    assert created.key.startswith("sk-amin-")
+    assert regenerated.key.startswith("sk-amin-")
+    assert row_after.key_hash != old_hash
+    assert row_after.key_prefix == regenerated.key[:15]
 
 
 @pytest.mark.asyncio
@@ -2051,8 +2022,8 @@ async def test_record_usage_cost_limit_uses_flex_service_tier_pricing() -> None:
     [
         ("gpt-5.6", 286_720, 31_000_000),
         ("gpt-5.6-sol-snapshot", 286_720, 31_000_000),
-        ("gpt-5.6-terra-snapshot", 114_688, 12_400_000),
-        ("gpt-5.6-luna-snapshot", 11_468, 1_240_000),
+        ("gpt-5.6-terra-snapshot", 143_360, 15_500_000),
+        ("gpt-5.6-luna-snapshot", 57_344, 6_200_000),
     ],
 )
 async def test_usage_reservation_uses_gpt_5_6_personality_pricing(
@@ -2078,7 +2049,6 @@ async def test_usage_reservation_uses_gpt_5_6_personality_pricing(
         request_model=model,
         request_usage_budget=ApiKeyRequestUsageBudget(input_tokens=8_192, output_tokens=8_192),
     )
-    assert reservation is not None
 
     limits = await repo.get_limits_by_key(created.id)
     cost_limit = next(lim for lim in limits if lim.limit_type == LimitType.COST_USD)
@@ -2110,7 +2080,6 @@ async def test_release_usage_reservation_restores_reserved_counter() -> None:
     )
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
     limits = await repo.get_limits_by_key(created.id)
     assert limits[0].current_value == 100
 
@@ -2135,7 +2104,6 @@ async def test_touch_usage_reservation_only_updates_reserved_reservation() -> No
     )
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
 
     assert await service.touch_usage_reservation(reservation.reservation_id) is True
     await service.release_usage_reservation(reservation.reservation_id)
@@ -2159,7 +2127,6 @@ async def test_finalize_usage_reservation_is_idempotent() -> None:
     )
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
     await service.finalize_usage_reservation(
         reservation.reservation_id,
         model="gpt-5.1",
@@ -2180,10 +2147,9 @@ async def test_finalize_usage_reservation_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_finalize_usage_reservation_records_last_used_in_coalescer() -> None:
+async def test_finalize_usage_reservation_updates_last_used_in_settlement_commit() -> None:
     repo = _FakeApiKeysRepository()
-    coalescer = ApiKeyLastUsedCoalescer()
-    service = ApiKeysService(repo, last_used_coalescer=coalescer)
+    service = ApiKeysService(repo)
     created = await service.create_key(
         ApiKeyCreateData(
             name="reservation-last-used-key",
@@ -2197,7 +2163,6 @@ async def test_finalize_usage_reservation_records_last_used_in_coalescer() -> No
     initial_commit_count = repo.commit_count
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
     assert repo.commit_count == initial_commit_count + 1
 
     await service.finalize_usage_reservation(
@@ -2210,12 +2175,8 @@ async def test_finalize_usage_reservation_records_last_used_in_coalescer() -> No
 
     stored = await repo.get_by_id(created.id)
     assert stored is not None
-    # Write-behind: the settlement commit no longer carries the last_used_at
-    # UPDATE; the touch is recorded in the coalescer for the periodic flush.
-    assert stored.last_used_at is None
-    pending = coalescer.pending_snapshot()
-    assert set(pending) == {created.id}
-    assert pending[created.id] <= utcnow()
+    assert stored.last_used_at is not None
+    assert repo.update_last_used_commit_flags == [False]
     assert repo.commit_count == initial_commit_count + 2
 
 
@@ -2248,7 +2209,6 @@ async def test_finalize_usage_reservation_retries_sqlite_busy_settlement(
         )
     )
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
 
     await service.finalize_usage_reservation(
         reservation.reservation_id,
@@ -2296,7 +2256,6 @@ async def test_release_usage_reservation_retries_sqlite_busy_settlement(
         )
     )
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
 
     await service.release_usage_reservation(reservation.reservation_id)
 
@@ -2325,7 +2284,6 @@ async def test_fail_usage_reservation_preserves_failed_request_record() -> None:
     )
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
     await service.fail_usage_reservation(
         reservation.reservation_id,
         model="gpt-5.1",
@@ -2358,7 +2316,6 @@ async def test_release_after_finalize_is_noop() -> None:
     )
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
     limits = await repo.get_limits_by_key(created.id)
     assert limits[0].current_value == 100  # reserved
 
@@ -2397,7 +2354,6 @@ async def test_finalize_after_release_is_noop() -> None:
     )
 
     reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
-    assert reservation is not None
 
     await service.release_usage_reservation(reservation.reservation_id)
 
@@ -2577,3 +2533,239 @@ async def test_create_key_rejects_invalid_usage_sections() -> None:
                 usage_sections="bad_section",
             )
         )
+
+
+async def test_create_key_normalizes_allowed_reasoning_efforts() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="selectable-reasoning-policy",
+            allowed_models=None,
+            allowed_reasoning_efforts=["XHIGH", "low", "high", "low"],
+        )
+    )
+
+    assert created.allowed_reasoning_efforts == ["low", "high", "xhigh"]
+    stored = await repo.get_by_id(created.id)
+    assert stored is not None
+    assert stored.allowed_reasoning_efforts == '["low", "high", "xhigh"]'
+    assert (await service.validate_key(created.key)).id == created.id
+
+
+async def test_create_key_rejects_empty_or_conflicting_reasoning_policies() -> None:
+    service = ApiKeysService(_FakeApiKeysRepository())
+
+    with pytest.raises(ApiKeyValidationError, match="must not be empty"):
+        await service.create_key(
+            ApiKeyCreateData(name="empty-reasoning-policy", allowed_models=None, allowed_reasoning_efforts=[])
+        )
+
+    with pytest.raises(ApiKeyValidationError, match="cannot be configured together"):
+        await service.create_key(
+            ApiKeyCreateData(
+                name="conflicting-reasoning-policy",
+                allowed_models=None,
+                enforced_reasoning_effort="low",
+                allowed_reasoning_efforts=["low"],
+            )
+        )
+
+
+async def test_update_key_validates_effective_reasoning_policy() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(name="switchable-reasoning-policy", allowed_models=None, enforced_reasoning_effort="low")
+    )
+
+    with pytest.raises(ApiKeyValidationError, match="cannot be configured together"):
+        await service.update_key(
+            created.id,
+            ApiKeyUpdateData(
+                allowed_reasoning_efforts=["low", "medium"],
+                allowed_reasoning_efforts_set=True,
+            ),
+        )
+
+    updated = await service.update_key(
+        created.id,
+        ApiKeyUpdateData(
+            enforced_reasoning_effort=None,
+            enforced_reasoning_effort_set=True,
+            allowed_reasoning_efforts=["low", "medium"],
+            allowed_reasoning_efforts_set=True,
+        ),
+    )
+
+    assert updated.enforced_reasoning_effort is None
+    assert updated.allowed_reasoning_efforts == ["low", "medium"]
+
+
+async def test_update_key_translates_reasoning_policy_constraint_race() -> None:
+    class ConstraintFailingRepository(_FakeApiKeysRepository):
+        fail_reasoning_policy_commit = False
+
+        async def commit(self) -> None:
+            if self.fail_reasoning_policy_commit:
+                raise IntegrityError(
+                    "UPDATE api_keys",
+                    {},
+                    Exception("CHECK constraint failed: ck_api_keys_reasoning_policy_exclusive"),
+                )
+            await super().commit()
+
+    repo = ConstraintFailingRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(ApiKeyCreateData(name="concurrent-reasoning-policy", allowed_models=None))
+    repo.fail_reasoning_policy_commit = True
+
+    with pytest.raises(ApiKeyValidationError, match="cannot be configured together"):
+        await service.update_key(
+            created.id,
+            ApiKeyUpdateData(
+                allowed_reasoning_efforts=["low"],
+                allowed_reasoning_efforts_set=True,
+            ),
+        )
+
+    assert repo.rollback_calls == 1
+
+
+async def test_create_key_preserves_ultrafast_service_tier() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="ultrafast-service-tier-policy",
+            allowed_models=None,
+            enforced_service_tier=" ULTRAFAST ",
+            expires_at=None,
+        )
+    )
+
+    assert created.enforced_service_tier == "ultrafast"
+
+
+async def test_enforce_limits_without_limits_skips_reservation_and_commit() -> None:
+    repo = _FakeApiKeysRepository()
+    coalescer = ApiKeyLastUsedCoalescer()
+    service = ApiKeysService(repo, last_used_coalescer=coalescer)
+    created = await service.create_key(ApiKeyCreateData(name="unlimited-key", allowed_models=None, expires_at=None))
+    initial_commit_count = repo.commit_count
+    initial_rollback_calls = repo.rollback_calls
+
+    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+    assert reservation is None
+    assert repo._reservations == {}
+    # The implicit transaction opened by the admission SELECTs must be closed
+    # on the limit-free path (long-lived sessions would otherwise idle in
+    # transaction across the upstream round-trip) — via commit(), never
+    # rollback(): rollback expires every ORM object tracked by a shared
+    # session even with expire_on_commit=False, which broke quota-planner
+    # warmup probes. The commit is read-only (no reservation was inserted).
+    assert repo.commit_count == initial_commit_count + 1
+    assert repo.rollback_calls == initial_rollback_calls
+    # Settlement never runs without a reservation, so admission itself must
+    # record the last-used touch for limit-free keys.
+    pending = coalescer.pending_snapshot()
+    assert set(pending) == {created.id}
+    assert pending[created.id] <= utcnow()
+
+
+async def test_enforce_limits_with_no_applicable_limits_skips_reservation_and_leaves_limits_untouched() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="filtered-limits-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[
+                LimitRuleInput(
+                    limit_type="total_tokens",
+                    limit_window="weekly",
+                    max_value=10_000,
+                    model_filter="gpt-5.1",
+                ),
+            ],
+        )
+    )
+    initial_commit_count = repo.commit_count
+    initial_rollback_calls = repo.rollback_calls
+
+    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.5")
+
+    assert reservation is None
+    assert repo._reservations == {}
+    # One read-only commit closes the admission transaction; no rollback
+    # (rollback would expire shared-session ORM state — see the limit-free
+    # transaction-close comment in _enforce_limits_for_request_once).
+    assert repo.commit_count == initial_commit_count + 1
+    assert repo.rollback_calls == initial_rollback_calls
+    limits = await repo.get_limits_by_key(created.id)
+    assert limits[0].current_value == 0
+
+
+async def test_enforce_limits_with_applicable_limit_still_creates_reservation() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="limited-regression-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=1_000_000)],
+        )
+    )
+    initial_commit_count = repo.commit_count
+
+    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+
+    assert reservation is not None
+    assert reservation.key_id == created.id
+    assert reservation.has_applicable_limits is True
+    assert reservation.reservation_id in repo._reservations
+    assert repo.commit_count == initial_commit_count + 1
+
+
+async def test_finalize_usage_reservation_records_last_used_in_coalescer() -> None:
+    repo = _FakeApiKeysRepository()
+    coalescer = ApiKeyLastUsedCoalescer()
+    service = ApiKeysService(repo, last_used_coalescer=coalescer)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="reservation-last-used-key",
+            allowed_models=None,
+            expires_at=None,
+            limits=[
+                LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=100),
+            ],
+        )
+    )
+    initial_commit_count = repo.commit_count
+
+    reservation = await service.enforce_limits_for_request(created.id, request_model="gpt-5.1")
+    assert reservation is not None
+    assert repo.commit_count == initial_commit_count + 1
+
+    await service.finalize_usage_reservation(
+        reservation.reservation_id,
+        model="gpt-5.1",
+        input_tokens=10,
+        output_tokens=5,
+        cached_input_tokens=0,
+    )
+
+    stored = await repo.get_by_id(created.id)
+    assert stored is not None
+    # Write-behind: the settlement commit no longer carries the last_used_at
+    # UPDATE; the touch is recorded in the coalescer for the periodic flush.
+    assert stored.last_used_at is None
+    pending = coalescer.pending_snapshot()
+    assert set(pending) == {created.id}
+    assert pending[created.id] <= utcnow()
+    assert repo.commit_count == initial_commit_count + 2

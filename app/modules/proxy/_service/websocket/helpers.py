@@ -836,7 +836,7 @@ def _websocket_precreated_retry_error_code(
         if _websocket_response_id(None, payload) is not None:
             return None
         return _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
-    if is_upstream_model_capacity_error(error_message):
+    if error_code in {"overloaded_error", "server_is_overloaded"} or is_upstream_model_capacity_error(error_message):
         if error_code in {
             "rate_limit_exceeded",
             "usage_limit_reached",
@@ -845,9 +845,14 @@ def _websocket_precreated_retry_error_code(
             "quota_exceeded",
         }:
             return error_code
-        if _websocket_response_id(None, payload) is not None:
+        upstream_response_id = _websocket_response_id(None, payload)
+        if upstream_response_id is not None and event_type != "response.failed":
             return None
-        return "server_is_overloaded"
+        # A terminal overload may carry a response id even when upstream
+        # failed before producing any model output.  The caller still applies
+        # the visible-output, replay-count, continuity, and account-bound-file
+        # guards before moving this retained request body to another account.
+        return error_code if error_code in {"overloaded_error", "server_is_overloaded"} else "server_is_overloaded"
     if error_code not in _facade()._WEBSOCKET_TRANSPARENT_REPLAY_ERROR_CODES:
         return None
     return error_code

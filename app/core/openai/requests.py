@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections.abc import Iterable, Mapping
@@ -42,6 +43,17 @@ _INTERLEAVED_REASONING_PART_TYPES = frozenset({"reasoning", "reasoning_content",
 _ASSISTANT_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
 _TOOL_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text", "refusal"})
 _COMPACT_STATE_TOOL_NAMES = frozenset({"create_goal", "get_goal", "update_goal", "update_plan"})
+_NATIVE_INPUT_ITEM_ID_PREFIX_BY_TYPE = {
+    "message": "msg",
+    "function_call": "fc",
+    "custom_tool_call": "ctc",
+    "custom_tool_call_output": "ctco",
+    "apply_patch_call": "fc",
+    "reasoning": "rs",
+    "compaction": "rs",
+    "compaction_summary": "rs",
+}
+_NATIVE_INPUT_ITEM_ID_LIMIT = 64
 # A call_id can be reused by different item protocols. Compact pairing must
 # therefore keep each protocol's occurrence stream separate.
 _COMPACT_TOOL_CALL_TYPE_BY_OUTPUT_TYPE: dict[str, str] = {
@@ -897,6 +909,112 @@ def _strip_unsupported_fields(
     for key in _UNSUPPORTED_UPSTREAM_FIELDS:
         payload.pop(key, None)
     return payload
+
+
+def strip_invalid_native_input_item_ids(payload: MutableJsonObject) -> None:
+    input_value = payload.get("input")
+    if not is_json_list(input_value):
+        return
+
+    input_items = cast(list[JsonValue], input_value)
+    occupied: set[str] = set()
+    preserved: set[str] = set()
+    normalized: list[tuple[JsonValue, str | None, str | None, bool]] = []
+    for item in input_items:
+        if not is_json_mapping(item):
+            normalized.append((item, None, None, False))
+            continue
+        item_id = item.get("id")
+        if not isinstance(item_id, str):
+            normalized.append((item, None, None, False))
+            continue
+        if _should_drop_native_reasoning_item(item, payload):
+            normalized.append((item, item_id, None, True))
+            continue
+        expected_prefix = _native_input_item_id_prefix(item)
+        candidate = _normalize_native_input_item_id(item, item_id) if expected_prefix else item_id
+        if candidate == item_id and len(candidate) <= _NATIVE_INPUT_ITEM_ID_LIMIT:
+            preserved.add(candidate)
+            occupied.add(candidate)
+        normalized.append((item, item_id, candidate, False))
+
+    stripped_items: list[JsonValue] = []
+    changed = False
+    used: set[str] = set()
+    shortened: dict[str, str] = {}
+    for item, original_id, candidate, drop in normalized:
+        if drop:
+            if is_json_mapping(item):
+                sanitized_item = dict(item)
+                sanitized_item.pop("id", None)
+                stripped_items.append(sanitized_item)
+                changed = True
+            else:
+                stripped_items.append(item)
+            continue
+        if not is_json_mapping(item) or original_id is None or candidate is None:
+            stripped_items.append(item)
+            continue
+        if _native_input_item_id_prefix(item) is None:
+            stripped_items.append(item)
+            continue
+        new_id = candidate
+        if new_id in preserved and new_id != original_id:
+            new_id = _shorten_native_input_item_id(new_id, used | occupied)
+        if len(new_id) > _NATIVE_INPUT_ITEM_ID_LIMIT:
+            new_id = shortened.get(new_id) or _shorten_native_input_item_id(new_id, used | occupied)
+            shortened[candidate] = new_id
+        while new_id in used:
+            new_id = _shorten_native_input_item_id(new_id, used | occupied)
+        used.add(new_id)
+        if new_id == original_id:
+            stripped_items.append(item)
+            continue
+        sanitized_item = dict(item)
+        sanitized_item["id"] = new_id
+        stripped_items.append(sanitized_item)
+        changed = True
+
+    if changed:
+        payload["input"] = stripped_items
+
+
+def _native_input_item_id_prefix(item: Mapping[str, JsonValue]) -> str | None:
+    item_type = item.get("type")
+    if not isinstance(item_type, str):
+        return None
+    return _NATIVE_INPUT_ITEM_ID_PREFIX_BY_TYPE.get(item_type)
+
+
+def _normalize_native_input_item_id(item: Mapping[str, JsonValue], item_id: str) -> str:
+    prefix = _native_input_item_id_prefix(item)
+    if prefix is None or not item_id or item_id.startswith(prefix + "_"):
+        return item_id
+    return f"{prefix}_{item_id}"
+
+
+def _should_drop_native_reasoning_item(item: Mapping[str, JsonValue], payload: Mapping[str, JsonValue]) -> bool:
+    # Match CPA's orphan-ID fix: with store=false, only a reasoning item that
+    # has no encrypted content is treated as a lookup for an unpersisted item.
+    # Keep valid reasoning and all message/tool content untouched.
+    return (
+        payload.get("store") is not True
+        and item.get("type") == "reasoning"
+        and "id" in item
+        and not item.get("encrypted_content")
+    )
+
+
+def _shorten_native_input_item_id(item_id: str, occupied: set[str]) -> str:
+    base = item_id[: _NATIVE_INPUT_ITEM_ID_LIMIT - 17]
+    attempt = 0
+    while True:
+        suffix_input = item_id if attempt == 0 else f"{item_id}\\x00{attempt}"
+        digest = hashlib.sha256(suffix_input.encode("utf-8")).hexdigest()[:16]
+        candidate = f"{base}_{digest}"
+        if candidate not in occupied:
+            return candidate
+        attempt += 1
 
 
 def _strip_poisoned_local_compact_fallback_items(payload: MutableJsonObject) -> None:

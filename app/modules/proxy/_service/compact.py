@@ -413,7 +413,15 @@ def _compact_same_contract_retry_budget() -> int:
 
 
 def _compact_max_account_attempts() -> int:
-    return cast(int, _service_global("_COMPACT_MAX_ACCOUNT_ATTEMPTS"))
+    return cast(int, _service_global("_ACCOUNT_MAX_ATTEMPTS_DEFAULT"))
+
+
+def _routing_engine_policy_from_settings(settings: DashboardSettings) -> Any:
+    return _service_global("_routing_engine_policy_from_settings")(settings)
+
+
+def _account_branch_max_attempts(policy: Any) -> int:
+    return cast(int, _service_global("_account_branch_max_attempts")(policy))
 
 
 def _max_transient_same_account_retries() -> int:
@@ -853,6 +861,9 @@ class _CompactMixin:
         settings = await _service_get_settings_cache().get()
         concurrency_caps = effective_account_concurrency_caps(settings)
         prefer_earlier_reset = settings.prefer_earlier_reset_accounts
+        prefer_unstarted_quota = bool(getattr(settings, "prefer_unstarted_quota_accounts", False))
+        prefer_unstarted_quota_window = getattr(settings, "prefer_unstarted_quota_window", "both")
+        prefer_earlier_renewal = bool(getattr(settings, "prefer_earlier_renewal_accounts", False))
         had_prompt_cache_key = _prompt_cache_key_from_request_model(payload) is not None
         affinity = _sticky_key_for_compact_request(
             payload,
@@ -1241,7 +1252,8 @@ class _CompactMixin:
             estimated_lease_tokens = _estimated_lease_tokens_from_request_usage_budget(
                 estimate_api_key_request_usage(payload)
             )
-            for _account_attempt in range(_compact_max_account_attempts()):
+            max_account_attempts = _account_branch_max_attempts(_routing_engine_policy_from_settings(settings))
+            for _account_attempt in range(max_account_attempts):
                 selection = await proxy._select_account_with_budget_compatible(
                     deadline,
                     request_id=request_id,
@@ -1249,6 +1261,9 @@ class _CompactMixin:
                     api_key=api_key,
                     affinity_policy=affinity,
                     prefer_earlier_reset_accounts=prefer_earlier_reset,
+                    prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                     routing_strategy=routing_strategy,
                     model=payload.model,
@@ -1280,6 +1295,9 @@ class _CompactMixin:
                             api_key=api_key,
                             affinity_policy=affinity,
                             prefer_earlier_reset_accounts=prefer_earlier_reset,
+                            prefer_unstarted_quota_accounts=prefer_unstarted_quota,
+                            prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                            prefer_earlier_renewal_accounts=prefer_earlier_renewal,
                             prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                             routing_strategy=routing_strategy,
                             model=payload.model,
@@ -1915,7 +1933,7 @@ class _CompactMixin:
                             if (
                                 not account.security_work_authorized
                                 and account.id != preferred_account_id
-                                and _account_attempt < _compact_max_account_attempts() - 1
+                                and _account_attempt < max_account_attempts - 1
                             ):
                                 last_exc = exc
                                 excluded_account_ids.add(account.id)
@@ -2003,7 +2021,7 @@ class _CompactMixin:
                             action = failover_decision(
                                 failure_class=classified["failure_class"],
                                 downstream_visible=False,
-                                candidates_remaining=_compact_max_account_attempts() - _account_attempt - 1,
+                                candidates_remaining=max_account_attempts - _account_attempt - 1,
                             )
                         else:
                             action = "surface"

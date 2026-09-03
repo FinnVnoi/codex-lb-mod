@@ -51,6 +51,7 @@ REAUTH_REQUIRED_FAILURE_CODES = frozenset(
 SECONDS_PER_DAY = 60 * 60 * 24
 SECONDS_PER_HOUR = 60 * 60
 SECONDS_PER_WEEK = 7 * SECONDS_PER_DAY
+RENEWAL_COHORT_SECONDS = 3 * SECONDS_PER_DAY
 RATE_LIMIT_RESET_MAX_HORIZON_SECONDS = 366 * SECONDS_PER_DAY
 RATE_LIMIT_RESET_ROUNDING_TOLERANCE_SECONDS = 1.0
 UNKNOWN_RESET_BUCKET_DAYS = 10_000
@@ -72,6 +73,7 @@ RoutingStrategy = Literal[
 TrafficClass = Literal["foreground", "opportunistic"]
 UsageWeightedOrder = Literal["secondary_first", "primary_first"]
 ResetPreferenceWindow = Literal["primary", "secondary"]
+UnstartedQuotaPreferenceWindow = Literal["primary", "secondary", "both", "any"]
 UNKNOWN_PLAN_FALLBACK = "free"
 CAPACITY_PLAN_ALIASES = {
     "education": "edu",
@@ -119,10 +121,12 @@ class AccountState:
     reset_at: float | None = None
     primary_reset_at: int | None = None
     primary_window_minutes: int | None = None
+    primary_countdown_started: bool | None = None
     blocked_at: float | None = None
     cooldown_until: float | None = None
     secondary_used_percent: float | None = None
     secondary_reset_at: int | None = None
+    secondary_countdown_started: bool | None = None
     last_error_at: float | None = None
     last_selected_at: float | None = None
     error_count: int = 0
@@ -140,6 +144,7 @@ class AccountState:
     leased_tokens: float = 0.0
     routing_policy: str = ROUTING_POLICY_NORMAL
     ignore_standard_quota: bool = False
+    renewal_at: float | None = None
 
 
 @dataclass
@@ -450,6 +455,9 @@ def select_account(
     *,
     prefer_earlier_reset: bool = False,
     prefer_earlier_reset_window: ResetPreferenceWindow = "secondary",
+    prefer_unstarted_quota: bool = False,
+    prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow = "both",
+    prefer_earlier_renewal: bool = False,
     routing_strategy: RoutingStrategy = "capacity_weighted",
     allow_backoff_fallback: bool = True,
     deterministic_probe: bool = False,
@@ -484,6 +492,12 @@ def select_account(
             (``"primary"`` for short window or ``"secondary"`` for weekly),
             with the other window used as fallback when the configured reset is
             unavailable.
+        prefer_earlier_renewal: Whether to restrict the effective candidate
+            pool to the earliest three-day upcoming renewal cohort. Missing or
+            elapsed renewal timestamps rank after upcoming ones. This
+            preference yields to an active unstarted-quota preference so every
+            eligible idle countdown can participate in the configured routing
+            strategy before renewal ranking resumes.
         routing_strategy: Balancing strategy used to pick from the effective
             pool (``"capacity_weighted"``, ``"sequential_drain"``,
             ``"reset_drain"``, ``"single_account"``, ``"relative_availability"``,
@@ -729,16 +743,38 @@ def select_account(
     normal = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_NORMAL]
     preserve = [s for s in health_pool if _routing_policy(s) == ROUTING_POLICY_PRESERVE]
     effective_pool = burn_first or normal or preserve or health_pool
-    effective_prefer_earlier_reset = prefer_earlier_reset and routing_strategy != "relative_availability"
+    effective_prefer_earlier_reset = prefer_earlier_reset and routing_strategy in {
+        "capacity_weighted",
+        "fill_first",
+        "usage_weighted",
+    }
+    # Optional routing preferences are ordered tiers: unstarted countdown
+    # first, subscription renewal second, and earlier reset third. Once an
+    # unstarted pool exists, keep the whole pool so the configured routing
+    # strategy can actually distribute first-use traffic across it; renewal
+    # ranking resumes only after every eligible countdown has started.
+    unstarted_preference_applied = False
+    if prefer_unstarted_quota:
+        unstarted_pool = _unstarted_quota_candidates(
+            effective_pool,
+            window=prefer_unstarted_quota_window,
+        )
+        if unstarted_pool:
+            effective_pool = unstarted_pool
+            unstarted_preference_applied = True
+    if prefer_earlier_renewal and not unstarted_preference_applied:
+        effective_pool = _prefer_earlier_renewal_candidates(effective_pool, current)
+    if effective_prefer_earlier_reset and not unstarted_preference_applied:
+        effective_pool = _prefer_earlier_reset_candidates(
+            effective_pool,
+            current,
+            prefer_earlier_reset_window,
+        )
 
     if routing_strategy == "round_robin":
         selected = min(effective_pool, key=_round_robin_sort_key)
     elif routing_strategy == "capacity_weighted":
-        candidate_pool = (
-            _prefer_earlier_reset_candidates(effective_pool, current, prefer_earlier_reset_window)
-            if effective_prefer_earlier_reset
-            else effective_pool
-        )
+        candidate_pool = effective_pool
         if deterministic_probe:
             selected = min(candidate_pool, key=lambda state: _capacity_probe_sort_key_with_cost(state, routing_costs))
         else:
@@ -754,12 +790,7 @@ def select_account(
             deterministic_probe=deterministic_probe,
         )
     elif routing_strategy == "fill_first":
-        candidate_pool = (
-            _prefer_earlier_reset_candidates(effective_pool, current, prefer_earlier_reset_window)
-            if prefer_earlier_reset
-            else effective_pool
-        )
-        selected = _select_fill_first(candidate_pool)
+        selected = _select_fill_first(effective_pool)
     else:
         effective_usage_weighted_order: UsageWeightedOrder = (
             "primary_first" if primary_first_usage_weighted else usage_weighted_order
@@ -767,18 +798,72 @@ def select_account(
         if effective_usage_weighted_order == "primary_first":
             selected = min(
                 effective_pool,
-                key=(
-                    _primary_reset_first_sort_key
-                    if effective_prefer_earlier_reset
-                    else _primary_usage_sort_key_with_cost
-                ),
+                key=(_primary_usage_sort_key_with_cost),
             )
         else:
             selected = min(
                 effective_pool,
-                key=_reset_first_sort_key if effective_prefer_earlier_reset else _usage_sort_key_with_cost,
+                key=_usage_sort_key_with_cost,
             )
     return SelectionResult(selected, None)
+
+
+def _unstarted_quota_candidates(
+    available: list[AccountState],
+    *,
+    window: UnstartedQuotaPreferenceWindow,
+) -> list[AccountState]:
+    """Return accounts whose selected quota countdown has not started.
+
+    The countdown flags are derived from the latest raw usage sample before
+    lease pressure is added. Missing usage is unknown, not proof of an idle
+    countdown. For ``both``, every applicable quota window on the account must
+    still be idle. An empty result tells the caller to continue with the full
+    pool and lower-priority preferences.
+    """
+
+    def _has_unstarted_selected_quota(state: AccountState) -> bool:
+        if window == "primary":
+            selected = (state.primary_countdown_started,)
+        elif window == "secondary":
+            selected = (state.secondary_countdown_started,)
+        else:
+            selected = (
+                state.primary_countdown_started,
+                state.secondary_countdown_started,
+            )
+        applicable = [started for started in selected if started is not None]
+        if not applicable:
+            return False
+        if window == "any":
+            return any(started is False for started in applicable)
+        return all(started is False for started in applicable)
+
+    return [state for state in available if _has_unstarted_selected_quota(state)]
+
+
+def _prefer_earlier_renewal_candidates(
+    available: list[AccountState],
+    current: float,
+) -> list[AccountState]:
+    """Keep the earliest known subscription-renewal cohort.
+
+    Renewal preference is applied after hard eligibility, health, and account
+    routing policy. The three-day cohort prevents one exact timestamp from
+    monopolizing traffic while retaining a meaningful bias toward subscriptions
+    that renew soon or whose recorded entitlement has just elapsed. An elapsed
+    timestamp does not itself make an account ineligible: ChatGPT can continue
+    serving Codex during a post-subscription grace period, and those accounts
+    should be burned before accounts with later entitlement dates. Accounts
+    without a renewal date are used only when no dated account is available.
+    """
+    del current  # Eligibility, not this preference, decides whether an account still works.
+    dated = [state for state in available if state.renewal_at is not None]
+    if not dated:
+        return available
+    earliest = min(float(state.renewal_at) for state in dated if state.renewal_at is not None)
+    cohort_end = earliest + RENEWAL_COHORT_SECONDS
+    return [state for state in dated if float(state.renewal_at or 0.0) <= cohort_end]
 
 
 def _oldest_due_probing_account(

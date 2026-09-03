@@ -52,11 +52,18 @@ def _to_response(row: ApiKeyData) -> ApiKeyResponse:
         transport_policy_override=row.transport_policy_override,
         usage_sections=row.usage_sections,
         expires_at=row.expires_at,
+        auto_extend_expiry=row.auto_extend_expiry,
+        auto_extend_expiry_type=row.auto_extend_expiry_type,
+        auto_extend_expiry_threshold=row.auto_extend_expiry_threshold,
+        quota_shop_enabled=row.quota_shop_enabled,
+        quota_shop_max_windows=row.quota_shop_max_windows,
+        quota_shop_options=row.quota_shop_options,
         is_active=row.is_active,
         account_assignment_scope_enabled=row.account_assignment_scope_enabled,
         source_assignment_scope_enabled=row.source_assignment_scope_enabled,
         assigned_account_ids=row.assigned_account_ids,
         assigned_source_ids=row.assigned_source_ids,
+        routing_mode=row.routing_mode,
         created_at=row.created_at,
         last_used_at=row.last_used_at,
         limits=[
@@ -146,8 +153,15 @@ async def create_api_key(
                     else "upstream_limits,account_pool_usage"
                 ),
                 expires_at=payload.expires_at,
+                auto_extend_expiry=payload.auto_extend_expiry,
+                auto_extend_expiry_type=payload.auto_extend_expiry_type,
+                auto_extend_expiry_threshold=payload.auto_extend_expiry_threshold,
+                quota_shop_enabled=payload.quota_shop_enabled,
+                quota_shop_max_windows=1,
+                quota_shop_options=[option.model_dump() for option in (payload.quota_shop_options or [])],
                 assigned_account_ids=payload.assigned_account_ids,
                 assigned_source_ids=payload.assigned_source_ids,
+                routing_mode=payload.routing_mode,
                 limits=limit_inputs,
             )
         )
@@ -165,6 +179,7 @@ async def create_api_key(
     )
 
 
+@router.get("", response_model=list[ApiKeyResponse], include_in_schema=False)
 @router.get("/", response_model=list[ApiKeyResponse])
 async def list_api_keys(
     context: ApiKeysContext = Depends(get_api_keys_context),
@@ -209,12 +224,30 @@ async def update_api_key(
         usage_sections_set="usage_sections" in fields,
         expires_at=payload.expires_at,
         expires_at_set="expires_at" in fields,
+        auto_extend_expiry=payload.auto_extend_expiry,
+        auto_extend_expiry_set="auto_extend_expiry" in fields,
+        auto_extend_expiry_type=payload.auto_extend_expiry_type,
+        auto_extend_expiry_type_set="auto_extend_expiry_type" in fields,
+        auto_extend_expiry_threshold=payload.auto_extend_expiry_threshold,
+        auto_extend_expiry_threshold_set="auto_extend_expiry_threshold" in fields,
+        quota_shop_enabled=payload.quota_shop_enabled,
+        quota_shop_enabled_set="quota_shop_enabled" in fields,
+        quota_shop_max_windows=1,
+        quota_shop_max_windows_set=("quota_shop_max_windows" in fields or payload.quota_shop_enabled is True),
+        quota_shop_options=(
+            [option.model_dump() for option in payload.quota_shop_options]
+            if payload.quota_shop_options is not None
+            else None
+        ),
+        quota_shop_options_set="quota_shop_options" in fields,
         is_active=payload.is_active,
         is_active_set="is_active" in fields,
         assigned_account_ids=payload.assigned_account_ids,
         assigned_account_ids_set="assigned_account_ids" in fields,
         assigned_source_ids=payload.assigned_source_ids,
         assigned_source_ids_set="assigned_source_ids" in fields,
+        routing_mode=payload.routing_mode,
+        routing_mode_set="routing_mode" in fields,
         limits=limit_inputs,
         limits_set=limits_set,
         reset_usage=bool(payload.reset_usage),

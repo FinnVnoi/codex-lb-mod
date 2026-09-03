@@ -33,6 +33,18 @@ const AdditionalQuotaRoutingPolicySchema = z.enum([
   "burn_first",
   "preserve",
 ]);
+const UnstartedQuotaPreferenceWindowSchema = z.enum(["primary", "secondary", "both", "any"]);
+const GlobalApiRoutingOverrideSchema = z.enum(["normal", "provider_first", "account_first"]);
+const ProviderFailurePolicySchema = z.enum([
+  "account_after_first_failure",
+  "providers_before_accounts",
+  "provider_only",
+]);
+const AccountFailurePolicySchema = z.enum([
+  "accounts_before_providers",
+  "provider_after_first_failure",
+  "account_only",
+]);
 const AdditionalQuotaPolicySchema = z.object({
   quotaKey: z.string(),
   displayLabel: z.string(),
@@ -54,6 +66,8 @@ const WeeklyPaceSmoothingMinutesSchema = z.union([
 export const DashboardSettingsSchema = z
   .object({
     stickyThreadsEnabled: z.boolean(),
+    modelSourceStickyEnabled: z.boolean().optional().default(true),
+    modelSourceStickyTtlSeconds: z.number().int().min(60).max(86400).optional().default(1800),
     upstreamStreamTransport:
       UpstreamStreamTransportSchema.optional().default("default"),
     prohibitFastMode: z.boolean().optional().default(false),
@@ -62,6 +76,9 @@ export const DashboardSettingsSchema = z
     upstreamProxyRoutingEnabled: z.boolean().optional().default(false),
     upstreamProxyDefaultPoolId: z.string().nullable().optional().default(null),
     preferEarlierResetAccounts: z.boolean(),
+    preferUnstartedQuotaAccounts: z.boolean().optional().default(false),
+    preferUnstartedQuotaWindow: UnstartedQuotaPreferenceWindowSchema.optional().default("both"),
+    preferEarlierRenewalAccounts: z.boolean().optional().default(false),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional().default("secondary"),
     showResetCreditBadges: z.boolean().optional().default(true),
     autoRedeemResetCreditsBeforeExpiry: z.boolean().optional().default(false),
@@ -76,10 +93,11 @@ export const DashboardSettingsSchema = z
       .optional()
       .default(5),
     singleAccountId: z.string().nullable().optional().default(null),
-    proxyAccountResponseCreateLimit: z.number().int().min(0).optional().default(4),
-    proxyAccountStreamLimit: z.number().int().min(0).optional().default(8),
-    proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional().default(1),
-    proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional().default(0),
+    proxyAccountResponseCreateLimit: z.number().int().min(0).optional(),
+    proxyAccountStreamLimit: z.number().int().min(0).optional(),
+    proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional(),
+    overloadCooldownSeconds: z.number().int().min(0).max(86400).optional().default(600),
+    proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional(),
     openaiCacheAffinityMaxAgeSeconds: z
       .number()
       .int()
@@ -99,6 +117,13 @@ export const DashboardSettingsSchema = z
       .record(z.string(), AdditionalQuotaRoutingPolicySchema)
       .optional(),
     additionalQuotaPolicies: z.array(AdditionalQuotaPolicySchema).optional().default([]),
+    globalApiRoutingOverride: GlobalApiRoutingOverrideSchema.optional().default("normal"),
+    providerFailurePolicy: ProviderFailurePolicySchema.optional().default("account_after_first_failure"),
+    accountFailurePolicy: AccountFailurePolicySchema.optional().default("accounts_before_providers"),
+    providerMaxAttempts: z.number().int().min(1).max(10).optional().default(3),
+    accountMaxAttempts: z.number().int().min(1).max(10).optional().default(3),
+    modelSourceAutoPauseEnabled: z.boolean().optional().default(true),
+    modelSourceAutoPauseThreshold: z.number().int().min(1).max(10).optional().default(3),
     warmupModel: z.string().trim().min(1).optional().default("gpt-5.4-mini"),
     importWithoutOverwrite: z.boolean(),
     totpRequiredOnLogin: z.boolean(),
@@ -143,6 +168,11 @@ export const DashboardSettingsSchema = z
     const legacyProvided = settings.stickyReallocationBudgetThresholdPct !== undefined;
     const primaryProvided = settings.stickyReallocationPrimaryBudgetThresholdPct !== undefined;
     const secondaryProvided = settings.stickyReallocationSecondaryBudgetThresholdPct !== undefined;
+    const proxyAccountResponseCreateLimitProvided = settings.proxyAccountResponseCreateLimit !== undefined;
+    const proxyAccountStreamLimitProvided = settings.proxyAccountStreamLimit !== undefined;
+    const proxyAccountStreamRecoveryReserveProvided = settings.proxyAccountStreamRecoveryReserve !== undefined;
+    const proxyApiKeyFairShareCongestionThresholdPctProvided =
+      settings.proxyApiKeyFairShareCongestionThresholdPct !== undefined;
     const primaryThreshold =
       settings.stickyReallocationPrimaryBudgetThresholdPct ??
       settings.stickyReallocationBudgetThresholdPct ??
@@ -156,9 +186,19 @@ export const DashboardSettingsSchema = z
         settings.stickyReallocationSecondaryBudgetThresholdPct ??
         settings.stickyReallocationBudgetThresholdPct ??
         100,
+      proxyAccountResponseCreateLimit: settings.proxyAccountResponseCreateLimit ?? 4,
+      proxyAccountStreamLimit: settings.proxyAccountStreamLimit ?? 8,
+      proxyAccountStreamRecoveryReserve: settings.proxyAccountStreamRecoveryReserve ?? 1,
+      proxyApiKeyFairShareCongestionThresholdPct:
+        settings.proxyApiKeyFairShareCongestionThresholdPct ?? 0,
       __stickyReallocationBudgetThresholdPctProvided: legacyProvided,
       __stickyReallocationPrimaryBudgetThresholdPctProvided: primaryProvided,
       __stickyReallocationSecondaryBudgetThresholdPctProvided: secondaryProvided,
+      __proxyAccountResponseCreateLimitProvided: proxyAccountResponseCreateLimitProvided,
+      __proxyAccountStreamLimitProvided: proxyAccountStreamLimitProvided,
+      __proxyAccountStreamRecoveryReserveProvided: proxyAccountStreamRecoveryReserveProvided,
+      __proxyApiKeyFairShareCongestionThresholdPctProvided:
+        proxyApiKeyFairShareCongestionThresholdPctProvided,
     };
   });
 
@@ -166,12 +206,17 @@ export const SettingsUpdateRequestSchema = z
   .object({
     expectedVersion: z.number().int().min(1).optional(),
     stickyThreadsEnabled: z.boolean().optional(),
+    modelSourceStickyEnabled: z.boolean().optional(),
+    modelSourceStickyTtlSeconds: z.number().int().min(60).max(86400).optional(),
     upstreamStreamTransport: UpstreamStreamTransportSchema.optional(),
     prohibitFastMode: z.boolean().optional(),
     httpDownstreamTransportPolicy: HttpDownstreamTransportPolicySchema.optional(),
     upstreamProxyRoutingEnabled: z.boolean().optional(),
     upstreamProxyDefaultPoolId: z.string().nullable().optional(),
     preferEarlierResetAccounts: z.boolean().optional(),
+    preferUnstartedQuotaAccounts: z.boolean().optional(),
+    preferUnstartedQuotaWindow: UnstartedQuotaPreferenceWindowSchema.optional(),
+    preferEarlierRenewalAccounts: z.boolean().optional(),
     preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional(),
     showResetCreditBadges: z.boolean().optional(),
     autoRedeemResetCreditsBeforeExpiry: z.boolean().optional(),
@@ -183,6 +228,7 @@ export const SettingsUpdateRequestSchema = z
     proxyAccountResponseCreateLimit: z.number().int().min(0).optional(),
     proxyAccountStreamLimit: z.number().int().min(0).optional(),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional(),
+    overloadCooldownSeconds: z.number().int().min(0).max(86400).optional(),
     proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional(),
     openaiCacheAffinityMaxAgeSeconds: z.number().int().positive().optional(),
     dashboardSessionTtlSeconds: z.number().int().min(3600).optional(),
@@ -192,6 +238,13 @@ export const SettingsUpdateRequestSchema = z
     additionalQuotaRoutingPolicies: z
       .record(z.string(), AdditionalQuotaRoutingPolicySchema)
       .optional(),
+    globalApiRoutingOverride: GlobalApiRoutingOverrideSchema.optional(),
+    providerFailurePolicy: ProviderFailurePolicySchema.optional(),
+    accountFailurePolicy: AccountFailurePolicySchema.optional(),
+    providerMaxAttempts: z.number().int().min(1).max(10).optional(),
+    accountMaxAttempts: z.number().int().min(1).max(10).optional(),
+    modelSourceAutoPauseEnabled: z.boolean().optional(),
+    modelSourceAutoPauseThreshold: z.number().int().min(1).max(10).optional(),
     warmupModel: z.string().trim().min(1).optional(),
     importWithoutOverwrite: z.boolean().optional(),
     totpRequiredOnLogin: z.boolean().optional(),
@@ -259,6 +312,10 @@ type StickyThresholdPresenceFlags = Pick<
   | "__stickyReallocationBudgetThresholdPctProvided"
   | "__stickyReallocationPrimaryBudgetThresholdPctProvided"
   | "__stickyReallocationSecondaryBudgetThresholdPctProvided"
+  | "__proxyAccountResponseCreateLimitProvided"
+  | "__proxyAccountStreamLimitProvided"
+  | "__proxyAccountStreamRecoveryReserveProvided"
+  | "__proxyApiKeyFairShareCongestionThresholdPctProvided"
 >;
 type StickyThresholdValues = Pick<
   ParsedDashboardSettings,

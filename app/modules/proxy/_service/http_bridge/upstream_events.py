@@ -1387,6 +1387,21 @@ class _HTTPBridgeUpstreamEventsMixin:
                                 force_retire = not receive_cancelled and not receive_task.cancelled()
                                 if not force_retire:
                                     receive_task = None
+                            if not force_retire:
+                                # The cancelled reader can no longer deliver the event
+                                # that would make this lineage safe. Quarantine before
+                                # recovery/retirement while the fenced owner is valid.
+                                session.quarantine_durable_on_close = True
+                                try:
+                                    await self._quarantine_durable_http_bridge_session(session)
+                                except Exception:
+                                    logger.warning(
+                                        "Failed to quarantine durable HTTP bridge lineage at "
+                                        "missing response.created timeout; close will retry",
+                                        exc_info=True,
+                                    )
+                                else:
+                                    session.quarantine_durable_on_close = False
                             async with session.pending_lock:
                                 for request_state in session.pending_requests:
                                     if request_state.failure_phase_override is None:
@@ -2347,6 +2362,93 @@ class _HTTPBridgeUpstreamEventsMixin:
                         payload,
                         event_type,
                     ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
+        elif (
+            owner_pinned_quota_error
+            in {
+                "rate_limit_exceeded",
+                "usage_limit_reached",
+                "insufficient_quota",
+                "usage_not_included",
+                "quota_exceeded",
+            }
+            and not is_previous_response_not_found_event
+            and status_request_state is not None
+        ):
+            # A continuation remains pinned to its established owner until the
+            # owner supplies explicit quota evidence.  Only then may a fully
+            # verified fresh replay abandon that owner; otherwise retire the
+            # bridge rather than risking a cross-account continuation.
+            await self._handle_stream_error(
+                session.account,
+                {"message": retry_error_message or "Upstream quota unavailable"},
+                owner_pinned_quota_error,
+            )
+            status_request_state.account_health_error_handled = True
+            can_replay = (
+                status_request_state.previous_response_id is not None
+                and status_request_state.preferred_account_id is not None
+                and not status_request_state.file_required_preferred_account
+            )
+            safe_request_text = (
+                _prepare_websocket_request_state_for_account_switch(status_request_state) if can_replay else None
+            )
+            if safe_request_text is not None:
+                previous_upstream_turn_state = session.upstream_turn_state
+                previous_downstream_turn_state = session.downstream_turn_state
+                previous_headers = session.headers
+                session.upstream_turn_state = None
+                session.downstream_turn_state = None
+                session.headers = {
+                    key: value for key, value in session.headers.items() if key.lower() != "x-codex-turn-state"
+                }
+                await self._release_request_state_account_response_create_lease(status_request_state)
+                status_request_state.excluded_account_ids.add(session.account.id)
+                status_request_state.affinity_policy = replace(
+                    status_request_state.affinity_policy,
+                    key=None,
+                    kind=None,
+                    reallocate_sticky=True,
+                    codex_session_source=None,
+                )
+                status_request_state.request_text = safe_request_text
+                async with session.pending_lock:
+                    if status_request_state not in session.pending_requests:
+                        session.pending_requests.appendleft(status_request_state)
+                        session.queued_request_count += 1
+                    status_request_state.awaiting_response_created = True
+                    status_request_state.response_id = None
+                retried = await self._retry_http_bridge_precreated_request(session)
+                if retried:
+                    return
+                session.upstream_turn_state = previous_upstream_turn_state
+                session.downstream_turn_state = previous_downstream_turn_state
+                session.headers = previous_headers
+                async with session.pending_lock:
+                    if status_request_state in session.pending_requests:
+                        session.pending_requests.remove(status_request_state)
+                        if _http_bridge_request_counts_against_queue(status_request_state):
+                            session.queued_request_count = max(0, session.queued_request_count - 1)
+                status_request_state.error_http_status_override = 502
+                (
+                    _downstream_text,
+                    event_block,
+                    event,
+                    payload,
+                    event_type,
+                ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
+            else:
+                status_request_state.error_http_status_override = 502
+                session.upstream_control.reconnect_requested = True
+                session.upstream_control.retire_after_drain = True
+                (
+                    event,
+                    payload,
+                    event_type,
+                    rewritten_text,
+                ) = _rewrite_websocket_previous_response_owner_unavailable_event(
+                    request_state=status_request_state,
+                )
+                event_block = f"data: {rewritten_text}\n\n"
         elif wait_for_model_capacity_retry and status_request_state is not None and retry_error_code is not None:
             # Reserve the terminal request again before any await so a younger
             # submit cannot claim its queue slot while account health is being
@@ -2427,65 +2529,6 @@ class _HTTPBridgeUpstreamEventsMixin:
                         session.pending_requests.remove(status_request_state)
                         if _http_bridge_request_counts_against_queue(status_request_state):
                             session.queued_request_count = max(0, session.queued_request_count - 1)
-        elif owner_pinned_quota_error is not None and not is_previous_response_not_found_event:
-            await self._handle_stream_error(
-                session.account,
-                {"message": retry_error_message or "Upstream error"},
-                owner_pinned_quota_error,
-            )
-            if status_request_state is not None:
-                setattr(status_request_state, "account_health_error_handled", True)
-            if (
-                status_request_state is not None
-                and status_request_state.previous_response_id is not None
-                and status_request_state.preferred_account_id is not None
-            ):
-                safe_request_text = _prepare_websocket_request_state_for_account_switch(status_request_state)
-                if safe_request_text is not None:
-                    previous_upstream_turn_state = session.upstream_turn_state
-                    previous_downstream_turn_state = session.downstream_turn_state
-                    session.upstream_turn_state = None
-                    session.downstream_turn_state = None
-                    await self._release_request_state_account_response_create_lease(status_request_state)
-                    status_request_state.excluded_account_ids.add(session.account.id)
-                    status_request_state.affinity_policy = replace(
-                        status_request_state.affinity_policy,
-                        reallocate_sticky=True,
-                    )
-                    status_request_state.request_text = safe_request_text
-                    async with session.pending_lock:
-                        if status_request_state not in session.pending_requests:
-                            session.pending_requests.appendleft(status_request_state)
-                            session.queued_request_count += 1
-                        status_request_state.awaiting_response_created = True
-                        status_request_state.response_id = None
-                    retried = await self._retry_http_bridge_precreated_request(session)
-                    if retried:
-                        return
-                    session.upstream_turn_state = previous_upstream_turn_state
-                    session.downstream_turn_state = previous_downstream_turn_state
-                    async with session.pending_lock:
-                        if status_request_state in session.pending_requests:
-                            session.pending_requests.remove(status_request_state)
-                            session.queued_request_count = max(0, session.queued_request_count - 1)
-                    status_request_state.error_http_status_override = 502
-                    (
-                        _downstream_text,
-                        event_block,
-                        event,
-                        payload,
-                        event_type,
-                    ) = _build_stream_incomplete_terminal_event_for_request(status_request_state)
-                else:
-                    status_request_state.error_http_status_override = 502
-                    session.upstream_control.reconnect_requested = True
-                    session.upstream_control.retire_after_drain = True
-                    event, payload, event_type, rewritten_text = (
-                        _rewrite_websocket_previous_response_owner_unavailable_event(
-                            request_state=status_request_state,
-                        )
-                    )
-                    event_block = f"data: {rewritten_text}\n\n"
         elif (
             retry_error_code == _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event

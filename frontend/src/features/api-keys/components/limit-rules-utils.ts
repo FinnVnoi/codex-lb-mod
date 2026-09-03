@@ -5,6 +5,7 @@ type NormalizedLimitRule = {
   limitWindow: LimitRuleCreate["limitWindow"];
   maxValue: number;
   modelFilter: string | null;
+  quotaShopEnabled?: true;
 };
 
 function normalizeLimitRule(rule: LimitRuleCreate): NormalizedLimitRule {
@@ -56,6 +57,7 @@ export function hasLimitRuleChanges(
       || rule.limitWindow !== candidate.limitWindow
       || rule.maxValue !== candidate.maxValue
       || rule.modelFilter !== candidate.modelFilter
+      || rule.quotaShopEnabled !== candidate.quotaShopEnabled
     );
   });
 }

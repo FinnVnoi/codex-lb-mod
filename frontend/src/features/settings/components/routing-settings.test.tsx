@@ -36,6 +36,7 @@ const BASE_SETTINGS: DashboardSettings = {
   ...LIMIT_WARMUP_DEFAULTS,
   stickyThreadsEnabled: false,
   preferEarlierResetAccounts: true,
+  preferEarlierRenewalAccounts: false,
   totpConfigured: false,
 };
 const BASE_UPDATE_PAYLOAD = buildSettingsUpdateRequest(BASE_SETTINGS, {});
@@ -408,6 +409,18 @@ describe("RoutingSettings", () => {
     });
   });
 
+  it("renders routing preferences in countdown, renewal, reset priority order", () => {
+    render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={vi.fn().mockResolvedValue(undefined)} />);
+
+    const labels = [
+      screen.getByText("Prefer unstarted quota countdowns"),
+      screen.getByText("Prefer earlier renewal"),
+      screen.getByText("Prefer earlier reset"),
+    ];
+    expect(labels[0].compareDocumentPosition(labels[1]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(labels[1].compareDocumentPosition(labels[2]) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("names limit warm-up controls for assistive technology", () => {
     render(
       <RoutingSettings
@@ -555,6 +568,19 @@ describe("RoutingSettings", () => {
     });
   });
 
+  it("saves the earlier-renewal preference", async () => {
+    const user = userEvent.setup();
+    const onSave = vi.fn().mockResolvedValue(undefined);
+    render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={onSave} />);
+
+    await user.click(screen.getByRole("switch", { name: "Prefer accounts with earlier renewal" }));
+
+    expect(onSave).toHaveBeenCalledWith({
+      ...BASE_UPDATE_PAYLOAD,
+      preferEarlierRenewalAccounts: true,
+    });
+  });
+
   it("saves the reset preference window", async () => {
     const user = userEvent.setup();
     const onSave = vi.fn().mockResolvedValue(undefined);
@@ -688,5 +714,39 @@ describe("RoutingSettings", () => {
         { limitWarmupEnabled: true, limitWarmupStaggeredIdleEnabled: true },
       ),
     );
+  });
+});
+
+it("saves the unstarted-quota preference and scope", async () => {
+  const user = userEvent.setup();
+  const onSave = vi.fn().mockResolvedValue(undefined);
+  const { unmount } = render(<RoutingSettings settings={BASE_SETTINGS} busy={false} onSave={onSave} />);
+
+  await user.click(screen.getByRole("switch", { name: "Prefer accounts with unstarted quota countdowns" }));
+  expect(onSave).toHaveBeenCalledWith({
+    ...BASE_UPDATE_PAYLOAD,
+    preferUnstartedQuotaAccounts: true,
+  });
+  unmount();
+
+  const enabledSettings = {
+    ...BASE_SETTINGS,
+    preferUnstartedQuotaAccounts: true,
+  };
+  const enabledPayload = buildSettingsUpdateRequest(enabledSettings, {});
+  const scopeSave = vi.fn().mockResolvedValue(undefined);
+  render(<RoutingSettings settings={enabledSettings} busy={false} onSave={scopeSave} />);
+  await user.click(screen.getByRole("combobox", { name: "Quota countdown scope" }));
+  await user.click(await screen.findByText("5h quota"));
+  expect(scopeSave).toHaveBeenCalledWith({
+    ...enabledPayload,
+    preferUnstartedQuotaWindow: "primary",
+  });
+
+  await user.click(screen.getByRole("combobox", { name: "Quota countdown scope" }));
+  await user.click(await screen.findByText("Either quota (OR)"));
+  expect(scopeSave).toHaveBeenCalledWith({
+    ...enabledPayload,
+    preferUnstartedQuotaWindow: "any",
   });
 });

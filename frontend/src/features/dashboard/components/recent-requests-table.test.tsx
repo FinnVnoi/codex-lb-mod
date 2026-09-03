@@ -1531,6 +1531,30 @@ describe("RecentRequestsTable", () => {
     expect(convButton.className).toMatch(/max-w-\[200px\]/);
   });
 
+  it("shows the model source name instead of Unassigned for provider-routed requests", () => {
+    render(
+      <RecentRequestsTable
+        {...PAGINATION_PROPS}
+        accounts={[]}
+        requests={[
+          {
+            ...LAYOUT_REQUEST,
+            accountId: null,
+            planType: null,
+            source: "model_source",
+            modelSourceId: "src-xpiki",
+            modelSourceName: "xpiki100m",
+            modelSourceKind: "openai_compatible",
+            model: "claude-opus-5",
+          },
+        ]}
+      />,
+    );
+
+    expect(screen.getByText("Model Source: xpiki100m")).toBeInTheDocument();
+    expect(screen.queryByText("Unassigned")).not.toBeInTheDocument();
+  });
+
   it("truncates long no-handler conversation IDs with title attribute", () => {
     const longId = "conv_this_is_a_very_very_long_id_with_no_handler_that_would_overflow";
     render(

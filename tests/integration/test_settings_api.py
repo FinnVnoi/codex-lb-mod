@@ -50,6 +50,11 @@ async def test_settings_api_get_and_update(async_client):
     payload = response.json()
     assert payload["stickyThreadsEnabled"] is True
     assert payload["upstreamStreamTransport"] == "default"
+    assert payload["globalApiRoutingOverride"] == "normal"
+    assert payload["providerFailurePolicy"] == "account_after_first_failure"
+    assert payload["accountFailurePolicy"] == "accounts_before_providers"
+    assert payload["providerMaxAttempts"] == 3
+    assert payload["accountMaxAttempts"] == 3
     assert payload["prohibitFastMode"] is False
     assert payload["proxyAccountResponseCreateLimit"] == 4
     assert payload["proxyAccountStreamLimit"] == 8
@@ -95,6 +100,11 @@ async def test_settings_api_get_and_update(async_client):
         "/api/settings",
         json={
             "stickyThreadsEnabled": False,
+            "globalApiRoutingOverride": "provider_first",
+            "providerFailurePolicy": "providers_before_accounts",
+            "accountFailurePolicy": "provider_after_first_failure",
+            "providerMaxAttempts": 5,
+            "accountMaxAttempts": 4,
             "upstreamStreamTransport": "websocket",
             "prohibitFastMode": True,
             "proxyAccountResponseCreateLimit": 12,
@@ -140,6 +150,11 @@ async def test_settings_api_get_and_update(async_client):
     assert response.status_code == 200
     updated = response.json()
     assert updated["stickyThreadsEnabled"] is False
+    assert updated["globalApiRoutingOverride"] == "provider_first"
+    assert updated["providerFailurePolicy"] == "providers_before_accounts"
+    assert updated["accountFailurePolicy"] == "provider_after_first_failure"
+    assert updated["providerMaxAttempts"] == 5
+    assert updated["accountMaxAttempts"] == 4
     assert updated["upstreamStreamTransport"] == "websocket"
     assert updated["prohibitFastMode"] is True
     assert updated["proxyAccountResponseCreateLimit"] == 12
@@ -186,6 +201,11 @@ async def test_settings_api_get_and_update(async_client):
     assert response.status_code == 200
     payload = response.json()
     assert payload["stickyThreadsEnabled"] is False
+    assert payload["globalApiRoutingOverride"] == "provider_first"
+    assert payload["providerFailurePolicy"] == "providers_before_accounts"
+    assert payload["accountFailurePolicy"] == "provider_after_first_failure"
+    assert payload["providerMaxAttempts"] == 5
+    assert payload["accountMaxAttempts"] == 4
     assert payload["upstreamStreamTransport"] == "websocket"
     assert payload["prohibitFastMode"] is True
     assert payload["proxyAccountResponseCreateLimit"] == 12

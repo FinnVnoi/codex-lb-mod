@@ -134,11 +134,14 @@ class RequestLogsService:
                 aggregated_cost_usd=result.aggregated_cost_usd,
             )
         api_key_ids = [log.api_key_id for log in logs if log.api_key_id]
+        source_ids = [log.model_source_id for log in logs if log.model_source_id]
         api_key_name_by_id = await self._repo.get_api_key_names_by_ids(api_key_ids)
+        model_source_name_by_id = await self._repo.get_model_source_names_by_ids(source_ids)
         requests = [
             to_request_log_entry(
                 log,
                 api_key_name=api_key_name_by_id.get(log.api_key_id or ""),
+                model_source_name=model_source_name_by_id.get(log.model_source_id or ""),
                 include_sensitive_metadata=include_sensitive_metadata,
             )
             for log in logs

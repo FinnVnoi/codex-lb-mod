@@ -196,6 +196,17 @@ def source_model_supports_reasoning(source: ModelSource, model: str) -> bool:
     return _raw_metadata(entry).get("supports_reasoning") is True
 
 
+def source_model_upstream_slug(source: ModelSource, model: str) -> str:
+    """Return the provider-facing model slug for a public source model alias."""
+    entry = next(
+        (candidate for candidate in source.models if candidate.model == model and candidate.is_enabled),
+        None,
+    )
+    if entry is None or not entry.upstream_model:
+        return model
+    return entry.upstream_model
+
+
 def source_model_request_overrides(source: ModelSource, model: str) -> dict[str, JsonValue]:
     """Operator-configured request overrides for a source model.
 

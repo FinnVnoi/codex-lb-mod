@@ -13,6 +13,7 @@ from app.core.balancer import (
     RoutingStrategy,
     SelectionResult,
     TrafficClass,
+    UnstartedQuotaPreferenceWindow,
 )
 from app.db.models import Account, AccountStatus
 from app.modules.proxy._load_balancer.sticky_selection import (
@@ -58,6 +59,9 @@ class UnboundSelectionOwner(StickySelectionOwner, Protocol):
 class UnboundSelectionRequest(Generic[SelectionInputsT]):
     prefer_earlier_reset_accounts: bool
     prefer_earlier_reset_window: ResetPreferenceWindow
+    prefer_unstarted_quota_accounts: bool
+    prefer_unstarted_quota_window: UnstartedQuotaPreferenceWindow
+    prefer_earlier_renewal_accounts: bool
     routing_strategy: RoutingStrategy
     relative_availability_power: float
     relative_availability_top_k: int
@@ -98,6 +102,9 @@ async def run_unbound_selection_path(
     selection_inputs = request.selection_inputs
     prefer_earlier_reset_accounts = request.prefer_earlier_reset_accounts
     prefer_earlier_reset_window = request.prefer_earlier_reset_window
+    prefer_unstarted_quota_accounts = request.prefer_unstarted_quota_accounts
+    prefer_unstarted_quota_window = request.prefer_unstarted_quota_window
+    prefer_earlier_renewal_accounts = request.prefer_earlier_renewal_accounts
     routing_strategy = request.routing_strategy
     relative_availability_power = request.relative_availability_power
     relative_availability_top_k = request.relative_availability_top_k
@@ -150,6 +157,7 @@ async def run_unbound_selection_path(
                 selection_inputs,
                 required_account_id=required_account_id,
                 redact_sensitive_details=redact_sensitive_details,
+                include_renewal=prefer_earlier_renewal_accounts,
             )
             effective_routing_costs = (
                 routing_costs_by_account_id
@@ -205,6 +213,9 @@ async def run_unbound_selection_path(
                     selection_states,
                     prefer_earlier_reset=prefer_earlier_reset_accounts,
                     prefer_earlier_reset_window=prefer_earlier_reset_window,
+                    prefer_unstarted_quota=prefer_unstarted_quota_accounts,
+                    prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                    prefer_earlier_renewal=prefer_earlier_renewal_accounts,
                     routing_strategy=routing_strategy,
                     relative_availability_power=relative_availability_power,
                     relative_availability_top_k=relative_availability_top_k,
@@ -247,6 +258,9 @@ async def run_unbound_selection_path(
                         selection_states,
                         prefer_earlier_reset=prefer_earlier_reset_accounts,
                         prefer_earlier_reset_window=prefer_earlier_reset_window,
+                        prefer_unstarted_quota_accounts=prefer_unstarted_quota_accounts,
+                        prefer_unstarted_quota_window=prefer_unstarted_quota_window,
+                        prefer_earlier_renewal_accounts=prefer_earlier_renewal_accounts,
                         routing_strategy=routing_strategy,
                         relative_availability_power=relative_availability_power,
                         relative_availability_top_k=relative_availability_top_k,

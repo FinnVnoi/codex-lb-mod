@@ -67,6 +67,10 @@ async def validate_proxy_api_key(
     """A required-capability header authenticates even when global proxy API-key auth is disabled."""
 
     authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    if authorization is None:
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            authorization = f"Bearer {x_api_key}"
     if request.headers.getlist(CODEX_LB_REQUIRED_CAPABILITY_HEADER):
         return await validate_required_proxy_api_key_authorization(authorization)
     return await validate_proxy_api_key_authorization(authorization, request=request)
@@ -130,6 +134,10 @@ async def validate_required_proxy_api_key(
     """Require a valid proxy API key regardless of the global auth setting."""
 
     authorization = None if credentials is None else f"Bearer {credentials.credentials}"
+    if authorization is None:
+        x_api_key = request.headers.get("x-api-key")
+        if x_api_key:
+            authorization = f"Bearer {x_api_key}"
     return await validate_required_proxy_api_key_authorization(authorization)
 
 

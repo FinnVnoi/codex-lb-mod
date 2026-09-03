@@ -14,12 +14,14 @@ import { ApiKeyCreatedDialog } from "@/features/api-keys/components/api-key-crea
 import { ApiKeysOverview } from "@/features/api-keys/components/api-keys-overview";
 import { ApiDetail } from "@/features/apis/components/api-detail";
 import { ApiList } from "@/features/apis/components/api-list";
+import { ApiRoutingMasterCard } from "@/features/apis/components/api-routing-master-card";
 import { ApisSkeleton } from "@/features/apis/components/apis-skeleton";
 import {
 	useApiKeys,
 	useApiKeyTrends,
 	useApiKeyUsage7Day,
 } from "@/features/apis/hooks/use-apis";
+import { useSettings } from "@/features/settings/hooks/use-settings";
 import { useDialogState } from "@/hooks/use-dialog-state";
 import { getErrorMessageOrNull } from "@/utils/errors";
 
@@ -44,6 +46,7 @@ export function ApisPage() {
 		deleteMutation,
 		regenerateMutation,
 	} = useApiKeys();
+	const { settingsQuery, updateSettingsMutation } = useSettings();
 
 	const createDialog = useDialogState();
 	const editDialog = useDialogState<ApiKey>();
@@ -84,7 +87,8 @@ export function ApisPage() {
 		createMutation.isPending ||
 		updateMutation.isPending ||
 		deleteMutation.isPending ||
-		regenerateMutation.isPending;
+		regenerateMutation.isPending ||
+		updateSettingsMutation.isPending;
 
 	const mutationError =
 		getErrorMessageOrNull(createMutation.error) ||
@@ -93,7 +97,8 @@ export function ApisPage() {
 		getErrorMessageOrNull(regenerateMutation.error);
 	const listError = getErrorMessageOrNull(apiKeysQuery.error);
 	const usage7DayError = getErrorMessageOrNull(usage7DayQuery.error);
-	const pageError = mutationError || (apiKeysQuery.data ? listError : null);
+	const settingsError = getErrorMessageOrNull(settingsQuery.error);
+	const pageError = mutationError || (apiKeysQuery.data ? listError : null) || settingsError;
 
 	const handleCreate = async (payload: ApiKeyCreateRequest) => {
 		const created = await createMutation.mutateAsync(payload);
@@ -139,6 +144,16 @@ export function ApisPage() {
 				</div>
 			) : (
 				<div className="space-y-6">
+					{settingsQuery.data ? (
+						<ApiRoutingMasterCard
+							settings={settingsQuery.data}
+							busy={mutationBusy || settingsQuery.isFetching}
+							onSave={async (payload) => {
+								await updateSettingsMutation.mutateAsync(payload);
+							}}
+						/>
+					) : null}
+
 					<ApiKeysOverview apiKeys={apiKeys} />
 
 					<div className="grid gap-4 lg:grid-cols-[22rem_minmax(0,1fr)]">
@@ -153,6 +168,7 @@ export function ApisPage() {
 
 						<ApiDetail
 							apiKey={selectedApiKey}
+							settings={settingsQuery.data}
 							trends={trendsQuery.data}
 							usage7Day={usage7DayQuery.data}
 							usage7DayLoading={usage7DayQuery.isPending}

@@ -115,7 +115,9 @@ class _ApiKeyUsageMixin:
                         request_usage_budget=request_usage_budget,
                     )
                 except ApiKeyRateLimitExceededError as exc:
-                    message = f"{exc}. Usage resets at {exc.reset_at.isoformat()}Z."
+                    message = str(exc)
+                    if not exc.is_lifetime and exc.reset_at is not None:
+                        message = f"{message} Thời gian reset: {exc.reset_at.isoformat()}Z."
                     raise ProxyRateLimitError(message) from exc
                 except ApiKeyInvalidError as exc:
                     raise ProxyAuthError(str(exc)) from exc

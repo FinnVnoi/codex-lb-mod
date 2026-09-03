@@ -117,6 +117,9 @@ const SettingsPayloadSchema = z.looseObject({
   upstreamProxyRoutingEnabled: z.boolean().optional(),
   upstreamProxyDefaultPoolId: z.string().nullable().optional(),
   preferEarlierResetAccounts: z.boolean().optional(),
+  preferUnstartedQuotaAccounts: z.boolean().optional(),
+  preferUnstartedQuotaWindow: z.enum(["primary", "secondary", "both"]).optional(),
+  preferEarlierRenewalAccounts: z.boolean().optional(),
   preferEarlierResetWindow: z.enum(["primary", "secondary"]).optional(),
   showResetCreditBadges: z.boolean().optional(),
   autoRedeemResetCreditsBeforeExpiry: z.boolean().optional(),
@@ -167,6 +170,7 @@ const ModelSourceCreatePayloadSchema = z.looseObject({
     .array(
       z.looseObject({
         model: z.string(),
+        upstreamModel: z.string().nullable().optional(),
         displayName: z.string().nullable().optional(),
         contextWindow: z.number().nullable().optional(),
         maxOutputTokens: z.number().nullable().optional(),
@@ -2129,6 +2133,7 @@ export const handlers = [
           id: index + 1,
           sourceId,
           model: model.model,
+          upstreamModel: model.upstreamModel ?? null,
           displayName: model.displayName ?? model.model,
           contextWindow: model.contextWindow ?? null,
           maxOutputTokens: model.maxOutputTokens ?? null,

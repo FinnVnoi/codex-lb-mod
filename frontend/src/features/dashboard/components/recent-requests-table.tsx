@@ -410,7 +410,11 @@ export function RecentRequestsTable({
           <TableBody>
             {requests.map((request) => {
               const time = formatDateTimeLines(request.requestedAt, dateDisplayFormat);
-              const accountLabel = request.accountId ? (accountLabelMap.get(request.accountId) ?? request.accountId) : t("dashboard.requests.unassigned");
+              const accountLabel = request.accountId
+                ? (accountLabelMap.get(request.accountId) ?? request.accountId)
+                : (request.modelSourceName
+                    ? `Model Source: ${request.modelSourceName}`
+                    : t("dashboard.requests.unassigned"));
               const isEmailLabel = !!(request.accountId && emailLabelIds.has(request.accountId));
               const errorPreview = request.errorMessage || request.errorCode || "-";
               const hasError = !!(request.errorCode || request.errorMessage);

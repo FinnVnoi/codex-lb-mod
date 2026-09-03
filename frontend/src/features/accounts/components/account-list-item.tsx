@@ -8,6 +8,7 @@ import { usePrivacyStore } from "@/hooks/use-privacy";
 import { useAccountQuotaDisplayStore } from "@/hooks/use-account-quota-display";
 import { useDateDisplayFormatStore } from "@/hooks/use-date-format";
 import { StatusBadge } from "@/components/status-badge";
+import { SubscriptionRenewal } from "@/features/accounts/components/subscription-renewal";
 import { MiniQuotaBar } from "@/components/mini-quota-bar";
 import type {
   AccountRoutingPolicy,
@@ -137,6 +138,7 @@ export function AccountListItem({
             label={t("common.quota.monthly")}
             percent={monthly}
             resetAt={account.resetAtMonthly}
+            renewalAt={account.subscriptionActiveUntil}
           />
         ) : null}
         {showPrimaryRow ? (
@@ -144,6 +146,7 @@ export function AccountListItem({
             label="5h"
             percent={primary}
             resetAt={account.resetAtPrimary}
+            renewalAt={!showSecondaryRow ? account.subscriptionActiveUntil : null}
           />
         ) : null}
         {showSecondaryRow ? (
@@ -151,6 +154,7 @@ export function AccountListItem({
             label={t("common.quota.weekly")}
             percent={secondary}
             resetAt={account.resetAtSecondary}
+            renewalAt={account.subscriptionActiveUntil}
           />
         ) : null}
       </div>
@@ -204,10 +208,12 @@ function MiniQuotaRow({
   label,
   percent,
   resetAt,
+  renewalAt,
 }: {
   label: string;
   percent: number | null;
   resetAt: string | null | undefined;
+  renewalAt?: string | null;
 }) {
   const { t } = useTranslation();
   return (
@@ -223,8 +229,15 @@ function MiniQuotaRow({
         percent={percent}
         testId={`mini-quota-track-${label.toLowerCase()}`}
       />
-      <div className="text-[10px] text-muted-foreground">
-        {formatMiniQuotaResetLabel(resetAt ?? null, t)}
+      <div className="flex min-w-0 items-center justify-between gap-2 text-[10px] text-muted-foreground">
+        <span className="shrink-0">{formatMiniQuotaResetLabel(resetAt ?? null, t)}</span>
+        {renewalAt ? (
+          <SubscriptionRenewal
+            activeUntil={renewalAt}
+            showIcon
+            className="justify-end"
+          />
+        ) : null}
       </div>
     </div>
   );

@@ -3492,8 +3492,8 @@ class _HTTPBridgeRequestSubmitMixin:
         retry_text = _prepare_websocket_request_state_for_account_switch(request_state)
         if retry_text is None:
             return False
-
         owner_account_id = session.account.id
+
         previous_replay_count = request_state.replay_count
         previous_response_id = request_state.response_id
         previous_response_event_count = request_state.response_event_count

@@ -25,7 +25,7 @@ from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, ApiKey, ApiKeyLimit, LimitType, LimitWindow, ModelSource, UsageHistory
 from app.db.session import sqlite_writer_section
 from app.modules.api_keys.last_used_coalescer import ApiKeyLastUsedCoalescer, get_api_key_last_used_coalescer
-from app.modules.api_keys.limit_windows import advance_limit_reset, limit_window_delta, next_limit_reset
+from app.modules.api_keys.limit_windows import limit_window_delta, next_limit_reset
 from app.modules.api_keys.repository import (
     _UNSET,
     ApiKeyTrendBucket,
@@ -47,9 +47,15 @@ API_KEY_USAGE_RESERVATION_DEFAULT_INPUT_TOKENS = API_KEY_USAGE_RESERVATION_MAX_T
 API_KEY_USAGE_RESERVATION_DEFAULT_OUTPUT_TOKENS = 2_048
 _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_MICRODOLLARS = 2_000_000
 _API_KEY_USAGE_RESERVATION_UNKNOWN_MODEL_BASE_TOKENS = API_KEY_USAGE_RESERVATION_MAX_TOKEN_BUDGET * 2
+_STANDARD_KEY_PREFIX = "sk-clb"
+_EXPIRING_KEY_PREFIX = "sk-amin"
 TRAFFIC_CLASS_FOREGROUND = "foreground"
 TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 _SUPPORTED_TRAFFIC_CLASSES = frozenset({TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC})
+ROUTING_MODE_BALANCED = "balanced"
+ROUTING_MODE_ACCOUNT_FIRST = "account_first"
+ROUTING_MODE_PROVIDER_FIRST = "provider_first"
+_SUPPORTED_ROUTING_MODES = frozenset({ROUTING_MODE_BALANCED, ROUTING_MODE_ACCOUNT_FIRST, ROUTING_MODE_PROVIDER_FIRST})
 _SUPPORTED_TRANSPORT_POLICY_OVERRIDES = frozenset({"smart", "always_http", "always_websocket"})
 _REASONING_POLICY_EXCLUSIVE_CONSTRAINT = "ck_api_keys_reasoning_policy_exclusive"
 
@@ -91,11 +97,15 @@ class ApiKeysRepositoryProtocol(Protocol):
         allowed_reasoning_efforts: str | None | _Unset = ...,
         enforced_service_tier: str | None | _Unset = ...,
         traffic_class: str | _Unset = ...,
+        routing_mode: str | _Unset = ...,
         transport_policy_override: str | None | _Unset = ...,
         usage_sections: str | _Unset = ...,
         account_assignment_scope_enabled: bool | _Unset = ...,
         source_assignment_scope_enabled: bool | _Unset = ...,
         expires_at: datetime | None | _Unset = ...,
+        quota_shop_enabled: bool | _Unset = ...,
+        quota_shop_max_windows: int | _Unset = ...,
+        quota_shop_options: str | _Unset = ...,
         is_active: bool | _Unset = ...,
         key_hash: str | _Unset = ...,
         key_prefix: str | _Unset = ...,
@@ -130,14 +140,21 @@ class ApiKeysRepositoryProtocol(Protocol):
         cost_microdollars: int,
     ) -> None: ...
 
-    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool: ...
+    async def reset_limit(
+        self,
+        limit_id: int,
+        *,
+        expected_reset_at: datetime,
+        new_reset_at: datetime | None,
+    ) -> bool: ...
 
     async def try_reserve_usage(
         self,
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
+        first_reset_at: datetime,
     ) -> ReservationResult: ...
 
     async def adjust_reserved_usage(
@@ -145,7 +162,7 @@ class ApiKeysRepositoryProtocol(Protocol):
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
     ) -> bool: ...
 
     async def create_usage_reservation(
@@ -226,9 +243,10 @@ class ApiKeyValidationError(ValueError):
 
 
 class ApiKeyRateLimitExceededError(ValueError):
-    def __init__(self, *, message: str, reset_at: datetime) -> None:
+    def __init__(self, *, message: str, reset_at: datetime | None, is_lifetime: bool = False) -> None:
         super().__init__(message)
         self.reset_at = reset_at
+        self.is_lifetime = is_lifetime
 
 
 def _ensure_optional_int_token_budget(field_name: str, value: int | None) -> None:
@@ -256,7 +274,7 @@ class LimitRuleData:
     max_value: int
     current_value: int
     model_filter: str | None
-    reset_at: datetime
+    reset_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -265,6 +283,7 @@ class LimitRuleInput:
     limit_window: str
     max_value: int
     model_filter: str | None = None
+    quota_shop_enabled: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -280,8 +299,15 @@ class ApiKeyCreateData:
     transport_policy_override: str | None = None
     usage_sections: str = "upstream_limits,account_pool_usage"
     expires_at: datetime | None = None
+    auto_extend_expiry: bool = False
+    auto_extend_expiry_type: str | None = None
+    auto_extend_expiry_threshold: int | None = None
+    quota_shop_enabled: bool = False
+    quota_shop_max_windows: int = 1
+    quota_shop_options: list[dict[str, str]] = field(default_factory=list)
     assigned_account_ids: list[str] | None = None
     assigned_source_ids: list[str] | None = None
+    routing_mode: str = ROUTING_MODE_BALANCED
     limits: list[LimitRuleInput] = field(default_factory=list)
 
 
@@ -309,12 +335,26 @@ class ApiKeyUpdateData:
     usage_sections_set: bool = False
     expires_at: datetime | None = None
     expires_at_set: bool = False
+    auto_extend_expiry: bool | None = None
+    auto_extend_expiry_set: bool = False
+    auto_extend_expiry_type: str | None = None
+    auto_extend_expiry_type_set: bool = False
+    auto_extend_expiry_threshold: int | None = None
+    auto_extend_expiry_threshold_set: bool = False
+    quota_shop_enabled: bool | None = None
+    quota_shop_enabled_set: bool = False
+    quota_shop_max_windows: int | None = None
+    quota_shop_max_windows_set: bool = False
+    quota_shop_options: list[dict[str, str]] | None = None
+    quota_shop_options_set: bool = False
     is_active: bool | None = None
     is_active_set: bool = False
     assigned_account_ids: list[str] | None = None
     assigned_account_ids_set: bool = False
     assigned_source_ids: list[str] | None = None
     assigned_source_ids_set: bool = False
+    routing_mode: str | None = None
+    routing_mode_set: bool = False
     limits: list[LimitRuleInput] | None = None
     limits_set: bool = False
     reset_usage: bool = False
@@ -330,6 +370,9 @@ class ApiKeyData:
     enforced_reasoning_effort: str | None
     enforced_service_tier: str | None
     expires_at: datetime | None
+    quota_shop_enabled: bool
+    quota_shop_max_windows: int
+    quota_shop_options: list[dict[str, str]]
     is_active: bool
     created_at: datetime
     last_used_at: datetime | None
@@ -344,7 +387,11 @@ class ApiKeyData:
     source_assignment_scope_enabled: bool = False
     assigned_account_ids: list[str] = field(default_factory=list)
     assigned_source_ids: list[str] = field(default_factory=list)
+    routing_mode: str = ROUTING_MODE_BALANCED
     pooled_credits: "PooledCreditData | None" = None
+    auto_extend_expiry: bool = False
+    auto_extend_expiry_type: str | None = None
+    auto_extend_expiry_threshold: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -467,10 +514,14 @@ class ApiKeysService:
         self._last_used_coalescer = last_used_coalescer or get_api_key_last_used_coalescer()
 
     async def create_key(self, payload: ApiKeyCreateData) -> ApiKeyCreatedData:
+        if payload.quota_shop_max_windows < 1:
+            raise ApiKeyValidationError("quota_shop_max_windows must be at least 1")
+        if payload.quota_shop_enabled and payload.limits:
+            raise ApiKeyValidationError("Quota Shop Mode and fixed limits cannot both be enabled")
         _validate_unique_limit_rule_identities(payload.limits)
         now = utcnow()
         expires_at = _normalize_expires_at(payload.expires_at)
-        plain_key = _generate_plain_key()
+        plain_key = _generate_plain_key(expires_at=expires_at)
         normalized_allowed_models = _normalize_allowed_models(payload.allowed_models)
         assigned_account_ids = await self._resolve_assigned_account_ids(payload.assigned_account_ids)
         assigned_source_ids = await self._resolve_assigned_source_ids(payload.assigned_source_ids)
@@ -481,6 +532,7 @@ class ApiKeysService:
         traffic_class = _normalize_traffic_class(payload.traffic_class)
         transport_policy_override = _normalize_transport_policy_override(payload.transport_policy_override)
         usage_sections = _normalize_usage_sections(payload.usage_sections)
+        routing_mode = _normalize_routing_mode(payload.routing_mode)
         _validate_model_enforcement(enforced_model=enforced_model, allowed_models=normalized_allowed_models)
         _validate_reasoning_effort_policy(
             enforced_reasoning_effort=enforced_reasoning_effort,
@@ -499,10 +551,21 @@ class ApiKeysService:
             enforced_service_tier=enforced_service_tier,
             account_assignment_scope_enabled=bool(assigned_account_ids),
             source_assignment_scope_enabled=bool(assigned_source_ids),
+            routing_mode=routing_mode,
             traffic_class=traffic_class,
             transport_policy_override=transport_policy_override,
             usage_sections=usage_sections,
             expires_at=expires_at,
+            auto_extend_expiry=bool(payload.auto_extend_expiry and expires_at is not None),
+            auto_extend_expiry_type=payload.auto_extend_expiry_type
+            if payload.auto_extend_expiry and expires_at is not None
+            else None,
+            auto_extend_expiry_threshold=payload.auto_extend_expiry_threshold
+            if payload.auto_extend_expiry and expires_at is not None
+            else None,
+            quota_shop_enabled=payload.quota_shop_enabled,
+            quota_shop_max_windows=1,
+            quota_shop_options=json.dumps(payload.quota_shop_options),
             is_active=True,
             created_at=now,
             last_used_at=None,
@@ -586,8 +649,19 @@ class ApiKeysService:
     async def update_key(self, key_id: str, payload: ApiKeyUpdateData) -> ApiKeyData:
         expires_at = _normalize_expires_at(payload.expires_at) if payload.expires_at_set else None
         existing = await self._repository.get_by_id(key_id)
+        if payload.quota_shop_max_windows_set and (
+            payload.quota_shop_max_windows is None or payload.quota_shop_max_windows < 1
+        ):
+            raise ApiKeyValidationError("quota_shop_max_windows must be at least 1")
         if existing is None:
             raise ApiKeyNotFoundError(f"API key not found: {key_id}")
+
+        effective_quota_shop_enabled = (
+            bool(payload.quota_shop_enabled) if payload.quota_shop_enabled_set else bool(existing.quota_shop_enabled)
+        )
+        effective_has_limits = bool(payload.limits) if payload.limits_set else bool(existing.limits)
+        if effective_quota_shop_enabled and effective_has_limits:
+            raise ApiKeyValidationError("Quota Shop Mode and fixed limits cannot both be enabled")
 
         if payload.allowed_models_set:
             allowed_models = _normalize_allowed_models(payload.allowed_models)
@@ -644,6 +718,9 @@ class ApiKeysService:
         usage_sections: str | _Unset = _UNSET
         if payload.usage_sections_set:
             usage_sections = _normalize_usage_sections(payload.usage_sections)
+        routing_mode: str | _Unset = _UNSET
+        if payload.routing_mode_set:
+            routing_mode = _normalize_routing_mode(payload.routing_mode)
 
         if payload.allowed_models_set or payload.enforced_model_set:
             effective_allowed_models = (
@@ -710,9 +787,36 @@ class ApiKeysService:
                 traffic_class=traffic_class_update,
                 transport_policy_override=transport_policy_override_update,
                 usage_sections=usage_sections,
+                routing_mode=routing_mode,
                 account_assignment_scope_enabled=account_assignment_scope_enabled,
                 source_assignment_scope_enabled=source_assignment_scope_enabled,
                 expires_at=expires_at if payload.expires_at_set else _UNSET,
+                auto_extend_expiry=(bool(payload.auto_extend_expiry) and expires_at is not None)
+                if payload.auto_extend_expiry_set
+                else _UNSET,
+                auto_extend_expiry_type=(
+                    payload.auto_extend_expiry_type
+                    if payload.auto_extend_expiry_set and payload.auto_extend_expiry
+                    else None
+                )
+                if payload.auto_extend_expiry_type_set or payload.auto_extend_expiry_set
+                else _UNSET,
+                auto_extend_expiry_threshold=(
+                    payload.auto_extend_expiry_threshold
+                    if payload.auto_extend_expiry_set and payload.auto_extend_expiry
+                    else None
+                )
+                if payload.auto_extend_expiry_threshold_set or payload.auto_extend_expiry_set
+                else _UNSET,
+                quota_shop_enabled=(payload.quota_shop_enabled if payload.quota_shop_enabled_set else _UNSET),
+                quota_shop_max_windows=(
+                    1 if payload.quota_shop_enabled is True or payload.quota_shop_max_windows_set else _UNSET
+                ),
+                quota_shop_options=(
+                    json.dumps(payload.quota_shop_options)
+                    if payload.quota_shop_options_set and payload.quota_shop_options is not None
+                    else (_UNSET if not payload.quota_shop_options_set else "[]")
+                ),
                 is_active=(payload.is_active if payload.is_active_set and payload.is_active is not None else _UNSET),
                 commit=False,
             )
@@ -752,6 +856,7 @@ class ApiKeysService:
             or payload.traffic_class_set
             or payload.transport_policy_override_set
             or payload.usage_sections_set
+            or payload.routing_mode_set
             or payload.expires_at_set
             or payload.is_active_set
         ):
@@ -806,7 +911,7 @@ class ApiKeysService:
         if row is None:
             raise ApiKeyNotFoundError(f"API key not found: {key_id}")
         old_key_hash = row.key_hash
-        plain_key = _generate_plain_key()
+        plain_key = _generate_plain_key(expires_at=row.expires_at)
         updated = await self._repository.update(
             key_id,
             key_hash=_hash_key(plain_key),
@@ -887,6 +992,12 @@ class ApiKeysService:
             )
             if refreshed.expires_at is not None and refreshed.expires_at < now:
                 raise ApiKeyInvalidError("API key has expired")
+            if refreshed.quota_shop_enabled:
+                raise ApiKeyRateLimitExceededError(
+                    message="API key đang ở Quota Shop Mode. Vui lòng mua quota trước khi sử dụng.",
+                    reset_at=now,
+                    is_lifetime=True,
+                )
 
             reservation_items: list[UsageReservationItemData] = []
             reservation_id: str | None = None
@@ -896,6 +1007,8 @@ class ApiKeysService:
                     if not _limit_applies_for_request(limit, request_model=request_model):
                         continue
                     if limit.current_value >= limit.max_value:
+                        if limit.reset_at is None and limit.limit_window != LimitWindow.LIFETIME:
+                            limit.reset_at = next_limit_reset(now, limit.limit_window)
                         raise _rate_limit_exceeded_error(limit)
                     reserve_delta = _reserve_delta_for_limit(
                         limit,
@@ -908,15 +1021,19 @@ class ApiKeysService:
                             limit.id,
                             delta=reserve_delta,
                             expected_reset_at=limit.reset_at,
+                            first_reset_at=next_limit_reset(now, limit.limit_window),
                         )
                         if not result.success:
                             raise _rate_limit_exceeded_error(limit)
+                        expected_reset_at = result.reset_at
+                    else:
+                        expected_reset_at = limit.reset_at
                     reservation_items.append(
                         UsageReservationItemData(
                             limit_id=limit.id,
                             limit_type=limit.limit_type,
                             reserved_delta=reserve_delta,
-                            expected_reset_at=limit.reset_at,
+                            expected_reset_at=expected_reset_at,
                         )
                     )
 
@@ -1243,6 +1360,7 @@ class ApiKeysService:
         usage = await self._repository.get_usage_summary_by_key_id(key_id)
         limits = [
             ApiKeySelfLimitData(
+                id=limit.id,
                 limit_type=limit.limit_type.value,
                 limit_window=limit.limit_window.value,
                 max_value=limit.max_value,
@@ -1320,13 +1438,14 @@ class ApiKeyUsage7DayData:
 
 @dataclass(frozen=True, slots=True)
 class ApiKeySelfLimitData:
+    id: int
     limit_type: str
     limit_window: str
     max_value: int
     current_value: int
     remaining_value: int
     model_filter: str | None
-    reset_at: datetime
+    reset_at: datetime | None
     source: str = "api_key_limit"
 
 
@@ -1369,8 +1488,9 @@ def _get_usage_sections_with_default(row: ApiKey) -> str:
     return value
 
 
-def _generate_plain_key() -> str:
-    return f"sk-clb-{secrets.token_urlsafe(32)}"
+def _generate_plain_key(*, expires_at: datetime | None = None) -> str:
+    prefix = _EXPIRING_KEY_PREFIX if expires_at is not None else _STANDARD_KEY_PREFIX
+    return f"{prefix}-{secrets.token_urlsafe(32)}"
 
 
 def _hash_key(plain_key: str) -> str:
@@ -1539,6 +1659,19 @@ def _normalize_service_tier_lenient(value: str | None) -> str | None:
     return None
 
 
+def _normalize_routing_mode(value: str | None) -> str:
+    normalized = (value or ROUTING_MODE_BALANCED).strip().lower()
+    if normalized not in _SUPPORTED_ROUTING_MODES:
+        options = ", ".join(sorted(_SUPPORTED_ROUTING_MODES))
+        raise ApiKeyValidationError(f"Unsupported routing mode '{normalized}'. Expected one of: {options}")
+    return normalized
+
+
+def _normalize_routing_mode_lenient(value: str | None) -> str:
+    normalized = (value or ROUTING_MODE_BALANCED).strip().lower()
+    return normalized if normalized in _SUPPORTED_ROUTING_MODES else ROUTING_MODE_BALANCED
+
+
 def _normalize_traffic_class(value: str | None) -> str:
     normalized = (value or TRAFFIC_CLASS_FOREGROUND).strip().lower()
     if normalized not in _SUPPORTED_TRAFFIC_CLASSES:
@@ -1593,6 +1726,20 @@ def _validate_reasoning_effort_policy(
         )
 
 
+def _decode_quota_shop_options(value: str | None) -> list[dict[str, str]]:
+    import json
+
+    defaults = [
+        {"limit_type": "total_tokens", "limit_window": "lifetime"},
+        {"limit_type": "cost_usd", "limit_window": "lifetime"},
+    ]
+    try:
+        options = json.loads(value or "")
+        return options if isinstance(options, list) else defaults
+    except (TypeError, ValueError):
+        return defaults
+
+
 def _to_limit_rule_data(limit: ApiKeyLimit) -> LimitRuleData:
     return LimitRuleData(
         id=limit.id,
@@ -1619,13 +1766,16 @@ async def _lazy_reset_expired_limits(
 ) -> bool:
     reset_performed = False
     for limit in limits:
+        if limit.limit_window == LimitWindow.LIFETIME:
+            continue
+        if limit.reset_at is None:
+            continue
         if limit.reset_at >= now:
             continue
-        new_reset_at = advance_limit_reset(limit.reset_at, now, limit.limit_window)
         await repository.reset_limit(
             limit.id,
             expected_reset_at=limit.reset_at,
-            new_reset_at=new_reset_at,
+            new_reset_at=None,
         )
         reset_performed = True
     return reset_performed
@@ -1633,9 +1783,13 @@ async def _lazy_reset_expired_limits(
 
 def _rate_limit_exceeded_error(limit: ApiKeyLimit) -> ApiKeyRateLimitExceededError:
     return ApiKeyRateLimitExceededError(
-        message=f"API key {limit.limit_type.value} {limit.limit_window.value} limit exceeded"
-        + (f" for model {limit.model_filter}" if limit.model_filter else ""),
-        reset_at=limit.reset_at,
+        message=(
+            "Đã đạt đến giới hạn. Vui lòng nạp thêm quota."
+            if limit.limit_window == LimitWindow.LIFETIME
+            else "Đã đạt đến giới hạn. Vui lòng nạp thêm quota hoặc chờ hạn mức tự reset."
+        ),
+        reset_at=(limit.reset_at if limit.reset_at is not None else next_limit_reset(utcnow(), limit.limit_window)),
+        is_lifetime=limit.limit_window == LimitWindow.LIFETIME,
     )
 
 
@@ -1790,6 +1944,9 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         transport_policy_override=data.transport_policy_override,
         usage_sections=data.usage_sections,
         expires_at=data.expires_at,
+        quota_shop_enabled=data.quota_shop_enabled,
+        quota_shop_max_windows=data.quota_shop_max_windows,
+        quota_shop_options=data.quota_shop_options,
         is_active=data.is_active,
         created_at=data.created_at,
         last_used_at=data.last_used_at,
@@ -1799,6 +1956,7 @@ def _to_created_data(data: ApiKeyData, key: str) -> ApiKeyCreatedData:
         source_assignment_scope_enabled=data.source_assignment_scope_enabled,
         assigned_account_ids=data.assigned_account_ids,
         assigned_source_ids=data.assigned_source_ids,
+        routing_mode=data.routing_mode,
         key=key,
     )
 
@@ -1830,6 +1988,12 @@ def _to_api_key_data(
         ),
         usage_sections=_get_usage_sections_with_default(row),
         expires_at=row.expires_at,
+        auto_extend_expiry=bool(getattr(row, "auto_extend_expiry", False)),
+        auto_extend_expiry_type=getattr(row, "auto_extend_expiry_type", None),
+        auto_extend_expiry_threshold=getattr(row, "auto_extend_expiry_threshold", None),
+        quota_shop_enabled=bool(getattr(row, "quota_shop_enabled", False)),
+        quota_shop_max_windows=int(getattr(row, "quota_shop_max_windows", None) or 1),
+        quota_shop_options=_decode_quota_shop_options(getattr(row, "quota_shop_options", "")),
         is_active=row.is_active,
         created_at=row.created_at,
         last_used_at=row.last_used_at,
@@ -1839,6 +2003,7 @@ def _to_api_key_data(
         source_assignment_scope_enabled=getattr(row, "source_assignment_scope_enabled", False),
         assigned_account_ids=[assignment.account_id for assignment in account_assignments],
         assigned_source_ids=[assignment.source_id for assignment in source_assignments],
+        routing_mode=_normalize_routing_mode_lenient(getattr(row, "routing_mode", None)),
         pooled_credits=pooled_credits,
     )
 
@@ -1872,7 +2037,11 @@ def _limit_input_to_row(
         max_value=li.max_value,
         current_value=current_value,
         model_filter=li.model_filter,
-        reset_at=reset_at if reset_at is not None else next_limit_reset(now, window),
+        reset_at=(
+            reset_at
+            if reset_at is not None
+            else (next_limit_reset(now, window) if window == LimitWindow.LIFETIME or current_value > 0 else None)
+        ),
     )
 
 
@@ -1888,10 +2057,37 @@ async def _build_limit_rows_for_update(
     existing_by_key = {_limit_identity_from_row(limit): limit for limit in existing_limits}
     _validate_unique_limit_rule_identities(submitted_limits)
 
+    matched_by_index: dict[int, ApiKeyLimit] = {}
+    matched_existing_ids: set[int] = set()
+    for index, submitted in enumerate(submitted_limits):
+        matched = existing_by_key.get(_limit_identity_from_input(submitted))
+        if matched is not None:
+            matched_by_index[index] = matched
+            matched_existing_ids.add(matched.id)
+
+    unmatched_existing_by_policy: dict[tuple[str, str | None], list[ApiKeyLimit]] = {}
+    for existing in existing_limits:
+        if existing.id in matched_existing_ids:
+            continue
+        unmatched_existing_by_policy.setdefault(_limit_policy_identity_from_row(existing), []).append(existing)
+
+    unmatched_submitted_by_policy: dict[tuple[str, str | None], list[int]] = {}
+    for index, submitted in enumerate(submitted_limits):
+        if index in matched_by_index:
+            continue
+        unmatched_submitted_by_policy.setdefault(_limit_policy_identity_from_input(submitted), []).append(index)
+
+    # Changing only the window should keep the accumulated usage. Match it only
+    # when the old/new policy pair is unambiguous; adding a second window for the
+    # same type/model still starts a fresh counter.
+    for policy_identity, submitted_indexes in unmatched_submitted_by_policy.items():
+        existing_candidates = unmatched_existing_by_policy.get(policy_identity, [])
+        if len(submitted_indexes) == 1 and len(existing_candidates) == 1:
+            matched_by_index[submitted_indexes[0]] = existing_candidates[0]
+
     rows: list[ApiKeyLimit] = []
-    for submitted in submitted_limits:
-        identity = _limit_identity_from_input(submitted)
-        matched = existing_by_key.get(identity)
+    for index, submitted in enumerate(submitted_limits):
+        matched = matched_by_index.get(index)
         if reset_usage:
             rows.append(_limit_input_to_row(submitted, key_id, now))
             continue
@@ -1900,13 +2096,14 @@ async def _build_limit_rows_for_update(
                 raise TypeError("repository is required to backfill new API key limit usage")
             rows.append(await _new_limit_input_to_backfilled_row(submitted, key_id, now, repository))
             continue
+        window_changed = matched.limit_window.value != submitted.limit_window
         rows.append(
             _limit_input_to_row(
                 submitted,
                 key_id,
                 now,
                 current_value=matched.current_value,
-                reset_at=matched.reset_at,
+                reset_at=None if window_changed else matched.reset_at,
             )
         )
     return rows
@@ -1920,8 +2117,11 @@ async def _new_limit_input_to_backfilled_row(
 ) -> ApiKeyLimit:
     limit_type = LimitType(submitted.limit_type)
     window = LimitWindow(submitted.limit_window)
-    reset_at = next_limit_reset(now, window)
-    since = now - limit_window_delta(window)
+    reset_at = next_limit_reset(now, window) if window == LimitWindow.LIFETIME else None
+    # A lifetime rule covers every successful request ever recorded for the key.
+    # Unlike rolling windows it has no reset interval, so backfill from the
+    # earliest representable timestamp instead of asking limit_window_delta().
+    since = datetime.min if window == LimitWindow.LIFETIME else now - limit_window_delta(window)
     current_value = await repository.get_limit_usage_value(
         key_id,
         limit_type=limit_type,
@@ -1954,7 +2154,11 @@ def _build_reset_limit_rows(
                 max_value=existing.max_value,
                 current_value=0,
                 model_filter=existing.model_filter,
-                reset_at=next_limit_reset(now, existing.limit_window),
+                reset_at=(
+                    next_limit_reset(now, existing.limit_window)
+                    if existing.limit_window == LimitWindow.LIFETIME
+                    else None
+                ),
             )
         )
     return rows
@@ -1975,6 +2179,14 @@ def _validate_unique_limit_rule_identities(limits: list[LimitRuleInput]) -> None
 
 def _limit_identity_from_row(limit: ApiKeyLimit) -> tuple[str, str, str | None]:
     return (limit.limit_type.value, limit.limit_window.value, limit.model_filter)
+
+
+def _limit_policy_identity_from_input(limit: LimitRuleInput) -> tuple[str, str | None]:
+    return (limit.limit_type, limit.model_filter)
+
+
+def _limit_policy_identity_from_row(limit: ApiKeyLimit) -> tuple[str, str | None]:
+    return (limit.limit_type.value, limit.model_filter)
 
 
 def _calculate_cost_microdollars(

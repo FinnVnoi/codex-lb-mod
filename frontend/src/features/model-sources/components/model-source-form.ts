@@ -1,17 +1,36 @@
-import { z } from "zod";
 import type { TFunction } from "i18next";
+import { z } from "zod";
 
-import type {
-  ModelSource,
-  ModelSourceModelInput,
-} from "@/features/model-sources/schemas";
+import type { ModelSource, ModelSourceModel, ModelSourceModelInput } from "@/features/model-sources/schemas";
+
+const modelFormSchema = z.object({
+  model: z.string().min(1, "Public model ID is required"),
+  upstreamModel: z.string(),
+  contextWindow: z.string(),
+  maxOutputTokens: z.string(),
+  inputPer1M: z.string(),
+  cachedInputPer1M: z.string(),
+  outputPer1M: z.string(),
+  audioPerMinute: z.string(),
+  supportsStreaming: z.boolean(),
+  supportsTools: z.boolean(),
+  supportsVision: z.boolean(),
+  supportsReasoning: z.boolean(),
+  isEnabled: z.boolean(),
+});
 
 export function createModelSourceFormSchema(t: TFunction) {
   return z.object({
     name: z.string().min(1, t("modelSources.validation.nameRequired")),
     baseUrl: z.string().min(1, t("modelSources.validation.baseUrlRequired")),
     apiKey: z.string(),
-    models: z.string().min(1, t("modelSources.validation.modelsRequired")),
+    supportsChatCompletions: z.boolean(),
+    supportsResponses: z.boolean(),
+    supportsAudioTranscriptions: z.boolean(),
+    supportsEmbeddings: z.boolean(),
+    estimateMissingStreamUsage: z.boolean(),
+    routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]),
+    models: z.array(modelFormSchema).min(1, t("modelSources.validation.modelsRequired")),
   });
 }
 
@@ -19,79 +38,52 @@ export const modelSourceFormSchema = z.object({
   name: z.string().min(1, "Name is required"),
   baseUrl: z.string().min(1, "Base URL is required"),
   apiKey: z.string(),
-  models: z.string().min(1, "At least one model is required"),
+  supportsChatCompletions: z.boolean(),
+  supportsResponses: z.boolean(),
+  supportsAudioTranscriptions: z.boolean(),
+  supportsEmbeddings: z.boolean(),
+  estimateMissingStreamUsage: z.boolean(),
+  routingPolicy: z.enum(["normal", "burn_first", "preserve", "fallback_only"]),
+  models: z.array(modelFormSchema).min(1, "At least one model is required"),
 });
 
 export type ModelSourceFormValues = z.infer<typeof modelSourceFormSchema>;
+export type ModelSourceModelFormValue = ModelSourceFormValues["models"][number];
 
-// Per-model settings the dialogs apply uniformly across every model ID entered
-// for the source. Pricing is USD per 1M tokens; blank means "unknown" (cost
-// settles at $0 for that model).
-export type ModelSourceDraft = {
-  supportsChatCompletions: boolean;
-  supportsResponses: boolean;
-  supportsAudioTranscriptions: boolean;
-  supportsEmbeddings: boolean;
-  supportsStreaming: boolean;
-  supportsTools: boolean;
-  supportsVision: boolean;
-  supportsReasoning: boolean;
-  reasoningEffortsInput: string;
-  reasoningEfforts: string[];
-  defaultReasoningEffort: string;
-  contextWindow: string;
-  maxOutputTokens: string;
-  inputPer1M: string;
-  cachedInputPer1M: string;
-  outputPer1M: string;
-  audioPerMinute: string;
-};
-
-export const initialModelSourceDraft: ModelSourceDraft = {
-  supportsChatCompletions: true,
-  supportsResponses: false,
-  supportsAudioTranscriptions: false,
-  supportsEmbeddings: false,
-  supportsStreaming: true,
-  supportsTools: false,
-  supportsVision: false,
-  supportsReasoning: false,
-  reasoningEffortsInput: "",
-  reasoningEfforts: [],
-  defaultReasoningEffort: "",
+export const emptyModelFormValue: ModelSourceModelFormValue = {
+  model: "",
+  upstreamModel: "",
   contextWindow: "",
   maxOutputTokens: "",
   inputPer1M: "",
   cachedInputPer1M: "",
   outputPer1M: "",
   audioPerMinute: "",
+  supportsStreaming: true,
+  supportsTools: false,
+  supportsVision: false,
+  supportsReasoning: false,
+  isEnabled: true,
 };
 
-export function modelSourceDraftReducer(
-  state: ModelSourceDraft,
-  patch: Partial<ModelSourceDraft>,
-): ModelSourceDraft {
-  return { ...state, ...patch };
-}
-
-function parsePositiveInt(value: string): number | undefined {
+function parsePositiveInt(value: string): number | null {
   const trimmed = value.trim();
-  if (!trimmed) return undefined;
+  if (!trimmed) return null;
   const parsed = Number.parseInt(trimmed, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
-function parseNonNegativeFloat(value: string): number | undefined {
+function parseNonNegativeFloat(value: string): number | null {
   const trimmed = value.trim();
-  if (!trimmed) return undefined;
+  if (!trimmed) return null;
   const parsed = Number.parseFloat(trimmed);
-  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
 }
 
-// The backend has no first-class reasoning column; the flag lives in the
-// model's raw metadata JSON, which the proxy reads to pass reasoning fields
-// through and to advertise supports_reasoning in /v1/models. Merge it into
-// any raw metadata the model already carries so other keys survive edits.
+function numberToInput(value: number | null | undefined): string {
+  return value === null || value === undefined ? "" : String(value);
+}
+
 const DEFAULT_REASONING_EFFORTS = ["low", "medium", "high"];
 
 function normalizeReasoningEffort(value: string): string {
@@ -125,6 +117,44 @@ function normalizeDefaultReasoningEffort(
   return reasoningEfforts[0] ?? "";
 }
 
+function parseReasoningMetadata(rawMetadataJson: string | null | undefined): {
+  supportsReasoning: boolean;
+  reasoningEfforts: string[];
+  defaultReasoningEffort: string;
+} {
+  const fallback = { supportsReasoning: false, reasoningEfforts: [], defaultReasoningEffort: "" };
+  if (!rawMetadataJson) return fallback;
+  try {
+    const parsed: unknown = JSON.parse(rawMetadataJson);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return fallback;
+    const metadata = parsed as Record<string, unknown>;
+    const supportsReasoning = metadata.supports_reasoning === true;
+    const declaredLevels = Array.isArray(metadata.supported_reasoning_levels)
+      ? dedupeReasoningEfforts(
+          metadata.supported_reasoning_levels.flatMap((value): string[] => {
+            if (typeof value === "string") return [value];
+            if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
+            const effort = (value as Record<string, unknown>).effort;
+            return typeof effort === "string" ? [effort] : [];
+          }),
+        )
+      : [];
+    const reasoningEfforts = supportsReasoning && declaredLevels.length === 0
+      ? DEFAULT_REASONING_EFFORTS
+      : declaredLevels;
+    return {
+      supportsReasoning,
+      reasoningEfforts,
+      defaultReasoningEffort: normalizeDefaultReasoningEffort(
+        reasoningEfforts,
+        typeof metadata.default_reasoning_level === "string" ? metadata.default_reasoning_level : "",
+      ),
+    };
+  } catch {
+    return fallback;
+  }
+}
+
 export function mergeReasoningMetadata(
   existing: string | null | undefined,
   supportsReasoning: boolean,
@@ -144,15 +174,13 @@ export function mergeReasoningMetadata(
   }
   if (supportsReasoning) {
     metadata.supports_reasoning = true;
-    if (reasoningEfforts.length > 0) {
-      metadata.supported_reasoning_levels = reasoningEfforts;
+    const normalizedEfforts = dedupeReasoningEfforts(reasoningEfforts);
+    if (normalizedEfforts.length > 0) {
+      metadata.supported_reasoning_levels = normalizedEfforts;
       metadata.default_reasoning_level = normalizeDefaultReasoningEffort(
-        reasoningEfforts,
+        normalizedEfforts,
         defaultReasoningEffort,
       );
-    } else {
-      delete metadata.supported_reasoning_levels;
-      delete metadata.default_reasoning_level;
     }
   } else {
     delete metadata.supports_reasoning;
@@ -162,132 +190,68 @@ export function mergeReasoningMetadata(
   return Object.keys(metadata).length > 0 ? JSON.stringify(metadata) : null;
 }
 
-export function modelInputsFromForm(
-  values: ModelSourceFormValues,
-  draft: ModelSourceDraft,
-  existingRawMetadata: Record<string, string | null> = {},
-  existingEnabledByModel: Record<string, boolean> = {},
-): ModelSourceModelInput[] {
-  const contextWindow = parsePositiveInt(draft.contextWindow);
-  const maxOutputTokens = parsePositiveInt(draft.maxOutputTokens);
-  const inputPer1M = parseNonNegativeFloat(draft.inputPer1M);
-  const cachedInputPer1M = parseNonNegativeFloat(draft.cachedInputPer1M);
-  const outputPer1M = parseNonNegativeFloat(draft.outputPer1M);
-  const audioPerMinute = parseNonNegativeFloat(draft.audioPerMinute);
-  return values.models
-    .split(/[\n,]/)
-    .map((model) => model.trim())
-    .filter(Boolean)
-    .map((model) => ({
-      model,
-      displayName: model,
-      contextWindow,
-      maxOutputTokens,
-      supportsStreaming: draft.supportsStreaming,
-      supportsTools: draft.supportsTools,
-      supportsVision: draft.supportsVision,
-      inputPer1M: inputPer1M ?? null,
-      cachedInputPer1M: cachedInputPer1M ?? null,
-      outputPer1M: outputPer1M ?? null,
-      audioPerMinute: audioPerMinute ?? null,
-      rawMetadataJson: mergeReasoningMetadata(
-        existingRawMetadata[model],
-        draft.supportsReasoning,
-        draft.reasoningEfforts,
-        draft.defaultReasoningEffort,
-      ),
-      isEnabled: existingEnabledByModel[model] ?? true,
-    }));
-}
-
-function numberToInput(value: number | null | undefined): string {
-  return value === null || value === undefined ? "" : String(value);
-}
-
-// Derive the shared draft from an existing source. The create UI applies one
-// set of per-model settings to every model, so editing mirrors that by reading
-// the first model's values as the representative settings.
-function parseReasoningMetadata(rawMetadataJson: string | null | undefined): {
-  supportsReasoning: boolean;
-  reasoningEffortsInput: string;
-  reasoningEfforts: string[];
-  defaultReasoningEffort: string;
-} {
-  const fallback = {
-    supportsReasoning: false,
-    reasoningEffortsInput: "",
-    reasoningEfforts: [],
-    defaultReasoningEffort: "",
-  };
-  if (!rawMetadataJson) return fallback;
-  try {
-    const parsed: unknown = JSON.parse(rawMetadataJson);
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      return fallback;
-    }
-    const metadata = parsed as Record<string, unknown>;
-    const supportsReasoning = metadata.supports_reasoning === true;
-    const declaredLevels = Array.isArray(metadata.supported_reasoning_levels)
-      ? dedupeReasoningEfforts(
-          metadata.supported_reasoning_levels.flatMap((value): string[] => {
-            if (typeof value === "string") return [value];
-            if (typeof value !== "object" || value === null || Array.isArray(value)) return [];
-            const effort = (value as Record<string, unknown>).effort;
-            return typeof effort === "string" ? [effort] : [];
-          }),
-        )
-      : [];
-    const reasoningEfforts =
-      supportsReasoning && declaredLevels.length === 0 ? DEFAULT_REASONING_EFFORTS : declaredLevels;
-
-    return {
-      supportsReasoning,
-      reasoningEffortsInput: reasoningEfforts.join(", "),
-      reasoningEfforts,
-      defaultReasoningEffort: normalizeDefaultReasoningEffort(
-        reasoningEfforts,
-        typeof metadata.default_reasoning_level === "string"
-          ? metadata.default_reasoning_level
-          : "",
-      ),
-    };
-  } catch {
-    return fallback;
-  }
-}
-
-export function draftFromSource(source: ModelSource): ModelSourceDraft {
-  const firstModel = source.models[0];
-  const reasoningMetadata = parseReasoningMetadata(firstModel?.rawMetadataJson);
+export function modelFormValueFromSource(model: ModelSourceModel): ModelSourceModelFormValue {
   return {
+    model: model.model,
+    upstreamModel: model.upstreamModel ?? model.model,
+    contextWindow: numberToInput(model.contextWindow),
+    maxOutputTokens: numberToInput(model.maxOutputTokens),
+    inputPer1M: numberToInput(model.inputPer1M),
+    cachedInputPer1M: numberToInput(model.cachedInputPer1M),
+    outputPer1M: numberToInput(model.outputPer1M),
+    audioPerMinute: numberToInput(model.audioPerMinute),
+    supportsStreaming: model.supportsStreaming,
+    supportsTools: model.supportsTools,
+    supportsVision: model.supportsVision,
+    supportsReasoning: parseReasoningMetadata(model.rawMetadataJson).supportsReasoning,
+    isEnabled: model.isEnabled,
+  };
+}
+
+export function formValuesFromSource(source: ModelSource): ModelSourceFormValues {
+  return {
+    name: source.name,
+    baseUrl: source.baseUrl,
+    apiKey: "",
     supportsChatCompletions: source.supportsChatCompletions,
     supportsResponses: source.supportsResponses,
     supportsAudioTranscriptions: source.supportsAudioTranscriptions,
     supportsEmbeddings: source.supportsEmbeddings,
-    supportsStreaming: firstModel?.supportsStreaming ?? true,
-    supportsTools: firstModel?.supportsTools ?? false,
-    supportsVision: firstModel?.supportsVision ?? false,
-    supportsReasoning: reasoningMetadata.supportsReasoning,
-    reasoningEffortsInput: reasoningMetadata.reasoningEffortsInput,
-    reasoningEfforts: reasoningMetadata.reasoningEfforts,
-    defaultReasoningEffort: reasoningMetadata.defaultReasoningEffort,
-    contextWindow: numberToInput(firstModel?.contextWindow),
-    maxOutputTokens: numberToInput(firstModel?.maxOutputTokens),
-    inputPer1M: numberToInput(firstModel?.inputPer1M),
-    cachedInputPer1M: numberToInput(firstModel?.cachedInputPer1M),
-    outputPer1M: numberToInput(firstModel?.outputPer1M),
-    audioPerMinute: numberToInput(firstModel?.audioPerMinute),
+    estimateMissingStreamUsage: source.estimateMissingStreamUsage ?? true,
+    routingPolicy: source.routingPolicy,
+    models: source.models.map(modelFormValueFromSource),
   };
 }
 
-export function modelIdsToInput(source: ModelSource): string {
-  return source.models.map((model) => model.model).join(", ");
-}
-
-export function rawMetadataByModel(source: ModelSource): Record<string, string | null> {
-  return Object.fromEntries(source.models.map((model) => [model.model, model.rawMetadataJson]));
-}
-
-export function enabledByModel(source: ModelSource): Record<string, boolean> {
-  return Object.fromEntries(source.models.map((model) => [model.model, model.isEnabled]));
+export function modelInputsFromForm(
+  values: ModelSourceFormValues,
+  existingModels: ModelSourceModel[] = [],
+): ModelSourceModelInput[] {
+  const existingByPublicId = new Map(existingModels.map((model) => [model.model, model]));
+  return values.models.map((model) => {
+    const publicId = model.model.trim();
+    const upstreamId = model.upstreamModel.trim();
+    const existing = existingByPublicId.get(publicId);
+    return {
+      model: publicId,
+      upstreamModel: upstreamId && upstreamId !== publicId ? upstreamId : null,
+      displayName: existing?.displayName ?? publicId,
+      contextWindow: parsePositiveInt(model.contextWindow),
+      maxOutputTokens: parsePositiveInt(model.maxOutputTokens),
+      supportsStreaming: model.supportsStreaming,
+      supportsTools: model.supportsTools,
+      supportsVision: model.supportsVision,
+      inputPer1M: parseNonNegativeFloat(model.inputPer1M),
+      cachedInputPer1M: parseNonNegativeFloat(model.cachedInputPer1M),
+      outputPer1M: parseNonNegativeFloat(model.outputPer1M),
+      audioPerMinute: parseNonNegativeFloat(model.audioPerMinute),
+      rawMetadataJson: mergeReasoningMetadata(
+        existing?.rawMetadataJson,
+        model.supportsReasoning,
+        parseReasoningMetadata(existing?.rawMetadataJson).reasoningEfforts,
+        parseReasoningMetadata(existing?.rawMetadataJson).defaultReasoningEffort,
+      ),
+      isEnabled: model.isEnabled,
+    };
+  });
 }

@@ -143,6 +143,110 @@ async def test_durable_bridge_lookup_prefers_turn_state_then_previous_response_t
 
 
 @pytest.mark.asyncio
+async def test_quarantine_live_session_clears_owner_lineage_and_aliases(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-poisoned",
+        api_key_id="key-poisoned",
+        instance_id="instance-a",
+        lease_ttl_seconds=120.0,
+        account_id="acc-poisoned",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_session_header(
+        session_id=claimed.session_id,
+        api_key_id="key-poisoned",
+        session_header="sid-poisoned",
+    )
+    await coordinator.register_turn_state(
+        session_id=claimed.session_id,
+        api_key_id="key-poisoned",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        turn_state="http_turn_poisoned",
+        lease_ttl_seconds=120.0,
+    )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-poisoned",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_poisoned",
+        lease_ttl_seconds=120.0,
+        input_item_count=12,
+        input_full_fingerprint="f" * 64,
+    )
+
+    quarantined = await coordinator.quarantine_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+    )
+
+    assert quarantined is not None
+    assert quarantined.state == HttpBridgeSessionState.CLOSED
+    assert quarantined.account_id is None
+    assert quarantined.owner_instance_id is None
+    assert quarantined.latest_turn_state is None
+    assert quarantined.latest_response_id is None
+    assert quarantined.latest_input_item_count is None
+    assert quarantined.latest_input_full_fingerprint is None
+    lookup = await coordinator.lookup_request_targets(
+        session_key_kind="request",
+        session_key_value="new-request",
+        api_key_id="key-poisoned",
+        turn_state="http_turn_poisoned",
+        session_header="sid-poisoned",
+        previous_response_id="resp_poisoned",
+    )
+    assert lookup is None
+    canonical_lookup = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-poisoned",
+        api_key_id="key-poisoned",
+        turn_state=None,
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert canonical_lookup is None
+
+
+@pytest.mark.asyncio
+async def test_quarantine_live_session_is_fenced_by_owner_epoch(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value="sid-current-owner",
+        api_key_id=None,
+        instance_id="instance-a",
+        lease_ttl_seconds=120.0,
+        account_id="acc-current",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=None,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    stale_result = await coordinator.quarantine_live_session(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch + 1,
+    )
+
+    assert stale_result is not None
+    assert stale_result.state == HttpBridgeSessionState.ACTIVE
+    assert stale_result.account_id == "acc-current"
+    assert stale_result.owner_instance_id == "instance-a"
+
+
+@pytest.mark.asyncio
 async def test_reversible_recovery_turn_state_registration_restores_previous_owner(
     coordinator: DurableBridgeSessionCoordinator,
 ) -> None:

@@ -249,19 +249,21 @@ class UsageRefreshScheduler:
                             before_monthly=before_monthly,
                             after_monthly=after_monthly,
                         )
+                        # Recover a post-reset selected account before warm-up filtering.
+                        # Running this afterwards can lose the reset transition and leave
+                        # the account excluded from the only warm-up pass that can observe it.
+                        await reconcile_recoverable_account_statuses(
+                            accounts_repo=accounts_repo,
+                            usage_repo=usage_repo,
+                            accounts=refreshed_selected_accounts,
+                            monthly_reset_evidence=monthly_reset_evidence,
+                        )
                         detach_session_objects(session)
                     warmup_before_monthly = dict(before_monthly)
                     warmup_after_monthly = dict(after_monthly)
                     for account_id, reset_evidence in monthly_reset_evidence.items():
                         warmup_before_monthly[account_id] = reset_evidence.before
                         warmup_after_monthly[account_id] = reset_evidence.after
-                    async with get_background_session() as session:
-                        await reconcile_recoverable_account_statuses(
-                            accounts_repo=AccountsRepository(session),
-                            usage_repo=UsageRepository(session),
-                            accounts=refreshed_selected_accounts,
-                            monthly_reset_evidence=monthly_reset_evidence,
-                        )
                     warmup_service = LimitWarmupService(
                         cast(Any, _BackgroundLimitWarmupRepository()),
                         cast(Any, _BackgroundRequestLogsRepository()),

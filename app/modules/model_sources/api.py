@@ -12,6 +12,8 @@ from app.core.exceptions import DashboardBadRequestError, DashboardNotFoundError
 from app.dependencies import ModelSourcesContext, get_model_sources_context
 from app.modules.model_sources.schemas import (
     ModelSourceCreateRequest,
+    ModelSourceProbeRequest,
+    ModelSourceProbeResponse,
     ModelSourceResponse,
     ModelSourcesResponse,
     ModelSourceUpdateRequest,
@@ -25,6 +27,7 @@ router = APIRouter(
 )
 
 
+@router.get("", response_model=ModelSourcesResponse, include_in_schema=False)
 @router.get("/", response_model=ModelSourcesResponse)
 async def list_model_sources(
     context: ModelSourcesContext = Depends(get_model_sources_context),
@@ -32,6 +35,21 @@ async def list_model_sources(
     return ModelSourcesResponse(sources=await context.service.list_sources())
 
 
+@router.post("/probe", response_model=ModelSourceProbeResponse)
+async def probe_model_source(
+    payload: ModelSourceProbeRequest = Body(...),
+    _write_access=Depends(require_dashboard_write_access),
+    context: ModelSourcesContext = Depends(get_model_sources_context),
+) -> ModelSourceProbeResponse:
+    try:
+        return await context.service.probe_source(payload)
+    except ModelSourceNotFoundError as exc:
+        raise DashboardNotFoundError(str(exc)) from exc
+    except ModelSourceValidationError as exc:
+        raise DashboardBadRequestError(str(exc), code="invalid_model_source_probe") from exc
+
+
+@router.post("", response_model=ModelSourceResponse, include_in_schema=False)
 @router.post("/", response_model=ModelSourceResponse)
 async def create_model_source(
     request: Request,

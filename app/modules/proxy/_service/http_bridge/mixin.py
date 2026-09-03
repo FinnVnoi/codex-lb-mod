@@ -69,6 +69,7 @@ from app.modules.proxy._service.http_bridge.activity import _HTTPBridgeActivityM
 from app.modules.proxy._service.http_bridge.helpers import (
     _HTTP_BRIDGE_BACKGROUND_CLOSE_TIMEOUT_SECONDS,
     _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR,
+    _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
     _active_http_bridge_instance_ring,
     _alias_fallback_key,
     _durable_bridge_lookup_active_owner,
@@ -1666,7 +1667,46 @@ class _HTTPBridgeMixin(
                 sessions_to_close.append(session)
         return sessions_to_close
 
-    _close_http_bridge_session = _helpers_close_http_bridge_session
+    async def _close_http_bridge_session(
+        self,
+        session: "_HTTPBridgeSession",
+        *,
+        turn_state_lock_held: bool = False,
+        release_durable_session: bool = True,
+    ) -> None:
+        if session.quarantine_durable_on_close:
+            try:
+                await self._quarantine_durable_http_bridge_session(session)
+            except Exception:
+                logger.warning("Failed to quarantine durable HTTP bridge session during close", exc_info=True)
+            else:
+                session.quarantine_durable_on_close = False
+                release_durable_session = False
+        await _helpers_close_http_bridge_session(
+            self,
+            session,
+            turn_state_lock_held=turn_state_lock_held,
+            release_durable_session=release_durable_session,
+        )
+
+    async def _quarantine_durable_http_bridge_session(self, session: "_HTTPBridgeSession") -> None:
+        if session.durable_session_id is None or session.durable_owner_epoch is None:
+            return
+        await self._durable_bridge.quarantine_live_session(
+            session_id=session.durable_session_id,
+            instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
+            owner_epoch=session.durable_owner_epoch,
+        )
+        _log_http_bridge_event(
+            "durable_lineage_quarantined",
+            session.key,
+            account_id=session.account.id,
+            model=session.request_model,
+            detail=_HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+            cache_key_family=session.key.affinity_kind,
+            model_class=_extract_model_class(session.request_model) if session.request_model else None,
+            owner_check_applied=True,
+        )
 
     async def _create_http_bridge_session(
         self,
@@ -2151,6 +2191,9 @@ class _HTTPBridgeMixin(
                     api_key=session.api_key,
                     affinity_policy=selection_affinity or session.affinity,
                     prefer_earlier_reset_accounts=settings.prefer_earlier_reset_accounts,
+                    prefer_unstarted_quota_accounts=bool(getattr(settings, "prefer_unstarted_quota_accounts", False)),
+                    prefer_unstarted_quota_window=getattr(settings, "prefer_unstarted_quota_window", "both"),
+                    prefer_earlier_renewal_accounts=bool(getattr(settings, "prefer_earlier_renewal_accounts", False)),
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                     routing_strategy=_routing_strategy(settings),
                     model=session.request_model,

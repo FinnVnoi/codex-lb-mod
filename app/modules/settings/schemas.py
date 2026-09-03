@@ -7,6 +7,9 @@ from app.modules.shared.schemas import DashboardModel
 _DEFAULT_WEEKLY_PACE_WORKING_DAYS = "0,1,2,3,4,5,6"
 _WEEKLY_PACE_SMOOTHING_MINUTES = (15, 30, 60, 120, 240)
 _HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN = r"^(smart|always_http|always_websocket|pinned)$"
+_GLOBAL_API_ROUTING_OVERRIDE_PATTERN = r"^(normal|provider_first|account_first)$"
+_PROVIDER_FAILURE_POLICY_PATTERN = r"^(account_after_first_failure|providers_before_accounts|provider_only)$"
+_ACCOUNT_FAILURE_POLICY_PATTERN = r"^(accounts_before_providers|provider_after_first_failure|account_only)$"
 
 
 def _normalize_weekly_pace_working_days(value: str | None) -> str | None:
@@ -33,6 +36,18 @@ class AdditionalQuotaPolicy(DashboardModel):
 
 class DashboardSettingsResponse(DashboardModel):
     sticky_threads_enabled: bool
+    model_source_sticky_enabled: bool = True
+    model_source_sticky_ttl_seconds: int = Field(default=1800, ge=60, le=86400)
+    global_api_routing_override: str = Field(default="normal", pattern=_GLOBAL_API_ROUTING_OVERRIDE_PATTERN)
+    provider_failure_policy: str = Field(
+        default="account_after_first_failure",
+        pattern=_PROVIDER_FAILURE_POLICY_PATTERN,
+    )
+    account_failure_policy: str = Field(default="accounts_before_providers", pattern=_ACCOUNT_FAILURE_POLICY_PATTERN)
+    provider_max_attempts: int = Field(default=3, ge=1, le=10)
+    account_max_attempts: int = Field(default=3, ge=1, le=10)
+    model_source_auto_pause_enabled: bool = True
+    model_source_auto_pause_threshold: int = Field(default=3, ge=1, le=10)
     upstream_stream_transport: str = Field(pattern=r"^(default|auto|http|websocket)$")
     prohibit_fast_mode: bool
     http_downstream_transport_policy: str = Field(pattern=_HTTP_DOWNSTREAM_TRANSPORT_POLICY_PATTERN)
@@ -40,9 +55,13 @@ class DashboardSettingsResponse(DashboardModel):
     proxy_account_stream_limit: int = Field(ge=0)
     proxy_account_stream_recovery_reserve: int = Field(ge=0)
     proxy_api_key_fair_share_congestion_threshold_pct: int = Field(ge=0, le=100)
+    overload_cooldown_seconds: int = Field(default=600, ge=0, le=86400)
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool
+    prefer_unstarted_quota_accounts: bool
+    prefer_unstarted_quota_window: str = Field(pattern=r"^(primary|secondary|both|any)$")
+    prefer_earlier_renewal_accounts: bool
     prefer_earlier_reset_window: str = Field(pattern=r"^(primary|secondary)$")
     show_reset_credit_badges: bool
     auto_redeem_reset_credits_before_expiry: bool
@@ -67,7 +86,7 @@ class DashboardSettingsResponse(DashboardModel):
     api_key_auth_enabled: bool
     hide_upstream_quota_from_api_keys: bool
     limit_warmup_enabled: bool
-    limit_warmup_windows: str = Field(pattern=r"^(primary|secondary|both)$")
+    limit_warmup_windows: str = Field(pattern=r"^(primary|secondary|both|any)$")
     limit_warmup_model: str = Field(min_length=1, max_length=128)
     limit_warmup_prompt: str = Field(min_length=1, max_length=512)
     limit_warmup_cooldown_seconds: int = Field(ge=60)
@@ -91,6 +110,15 @@ class DashboardSettingsResponse(DashboardModel):
 class DashboardSettingsUpdateRequest(DashboardModel):
     expected_version: int | None = Field(default=None, ge=1)
     sticky_threads_enabled: bool | None = None
+    model_source_sticky_enabled: bool | None = None
+    model_source_sticky_ttl_seconds: int | None = Field(default=None, ge=60, le=86400)
+    global_api_routing_override: str | None = Field(default=None, pattern=_GLOBAL_API_ROUTING_OVERRIDE_PATTERN)
+    provider_failure_policy: str | None = Field(default=None, pattern=_PROVIDER_FAILURE_POLICY_PATTERN)
+    account_failure_policy: str | None = Field(default=None, pattern=_ACCOUNT_FAILURE_POLICY_PATTERN)
+    provider_max_attempts: int | None = Field(default=None, ge=1, le=10)
+    account_max_attempts: int | None = Field(default=None, ge=1, le=10)
+    model_source_auto_pause_enabled: bool | None = None
+    model_source_auto_pause_threshold: int | None = Field(default=None, ge=1, le=10)
     upstream_stream_transport: str | None = Field(
         default=None,
         pattern=r"^(default|auto|http|websocket)$",
@@ -104,9 +132,13 @@ class DashboardSettingsUpdateRequest(DashboardModel):
     proxy_account_stream_limit: int | None = Field(default=None, ge=0)
     proxy_account_stream_recovery_reserve: int | None = Field(default=None, ge=0)
     proxy_api_key_fair_share_congestion_threshold_pct: int | None = Field(default=None, ge=0, le=100)
+    overload_cooldown_seconds: int | None = Field(default=None, ge=0, le=86400)
     upstream_proxy_routing_enabled: bool | None = None
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool | None = None
+    prefer_unstarted_quota_accounts: bool | None = None
+    prefer_unstarted_quota_window: str | None = Field(default=None, pattern=r"^(primary|secondary|both|any)$")
+    prefer_earlier_renewal_accounts: bool | None = None
     prefer_earlier_reset_window: str | None = Field(default=None, pattern=r"^(primary|secondary)$")
     show_reset_credit_badges: bool | None = None
     auto_redeem_reset_credits_before_expiry: bool | None = None
@@ -132,7 +164,7 @@ class DashboardSettingsUpdateRequest(DashboardModel):
     api_key_auth_enabled: bool | None = None
     hide_upstream_quota_from_api_keys: bool | None = None
     limit_warmup_enabled: bool | None = None
-    limit_warmup_windows: str | None = Field(default=None, pattern=r"^(primary|secondary|both)$")
+    limit_warmup_windows: str | None = Field(default=None, pattern=r"^(primary|secondary|both|any)$")
     limit_warmup_model: str | None = Field(default=None, min_length=1, max_length=128)
     limit_warmup_prompt: str | None = Field(default=None, min_length=1, max_length=512)
     limit_warmup_cooldown_seconds: int | None = Field(default=None, ge=60)

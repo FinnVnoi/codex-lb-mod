@@ -19,6 +19,7 @@ import { cn } from "@/lib/utils";
 import { formatCompactAccountId } from "@/utils/account-identifiers";
 import { normalizeStatus, quotaBarColor, quotaBarTrack } from "@/utils/account-status";
 import {
+  formatDateOnly,
   formatDateTimeInline,
   formatPercentNullable,
   formatQuotaResetLabel,
@@ -28,7 +29,7 @@ import {
 
 const ACCOUNT_LIST_VISIBLE_ROWS = 8;
 const ACCOUNT_LIST_ROW_HEIGHT_REM = 4.5;
-const ACCOUNT_LIST_COLUMNS = "minmax(13rem,1.3fr) 7.75rem 5rem minmax(14rem,1.2fr) 7.5rem 7.5rem minmax(8rem,0.8fr) 6.5rem";
+const ACCOUNT_LIST_COLUMNS = "minmax(13rem,1.3fr) 7.75rem 5rem minmax(14rem,1.2fr) 7.5rem 7.5rem minmax(8rem,0.8fr) minmax(8rem,0.8fr) 6.5rem";
 
 type AccountListProps = {
   accounts: AccountSummary[];
@@ -38,7 +39,7 @@ type AccountListProps = {
   onAction?: (account: AccountSummary, action: AccountAction) => void;
 };
 
-export type AccountListSortKey = "account" | "status" | "plan" | "quota" | "subscriptionCredits" | "purchasedCredits" | "warmup";
+export type AccountListSortKey = "account" | "status" | "plan" | "quota" | "subscriptionCredits" | "purchasedCredits" | "warmup" | "renewal";
 export type SortDirection = "asc" | "desc";
 export type AccountListSort = {
   key: AccountListSortKey;
@@ -53,6 +54,7 @@ const SORTABLE_HEADERS: Array<{ key: AccountListSortKey; label: string }> = [
   { key: "subscriptionCredits", label: "Subscription" },
   { key: "purchasedCredits", label: "Purchased" },
   { key: "warmup", label: "Warm-up" },
+  { key: "renewal", label: "Renewal" },
 ];
 
 const SORTABLE_HEADER_KEY: Record<AccountListSortKey, string> = {
@@ -63,6 +65,7 @@ const SORTABLE_HEADER_KEY: Record<AccountListSortKey, string> = {
   subscriptionCredits: "dashboard.accountList.headers.subscriptionCredits",
   purchasedCredits: "dashboard.accountList.headers.purchasedCredits",
   warmup: "dashboard.accountList.headers.warmup",
+  renewal: "accounts.subscription.renewal",
 };
 
 function formatWarmupWindow(window: string): string {
@@ -150,6 +153,11 @@ function compareNullableNumber(a: number | null, b: number | null, direction: So
   return direction === "asc" ? result : -result;
 }
 
+function accountRenewalSortValue(account: AccountSummary): number | null {
+  const time = account.subscriptionActiveUntil ? new Date(account.subscriptionActiveUntil).getTime() : Number.NaN;
+  return Number.isFinite(time) ? time : null;
+}
+
 function accountWarmupSortValue(account: AccountSummary): string {
   const enabledPrefix = account.limitWarmupEnabled ? "0" : "1";
   const attemptedAt = account.limitWarmup?.completedAt ?? account.limitWarmup?.attemptedAt ?? "";
@@ -184,13 +192,16 @@ function compareAccountsBySort(a: AccountSummary, b: AccountSummary, sort: Accou
     case "warmup":
       result = compareText(accountWarmupSortValue(a), accountWarmupSortValue(b));
       break;
+    case "renewal":
+      result = compareNullableNumber(accountRenewalSortValue(a), accountRenewalSortValue(b), sort.direction);
+      break;
   }
 
   if (result === 0) {
     result = compareText(accountTitle(a), accountTitle(b));
     return sort.direction === "asc" ? result : -result;
   }
-  if (sort.key === "quota" || sort.key === "subscriptionCredits" || sort.key === "purchasedCredits") {
+  if (sort.key === "quota" || sort.key === "subscriptionCredits" || sort.key === "purchasedCredits" || sort.key === "renewal") {
     return result;
   }
   return sort.direction === "asc" ? result : -result;
@@ -401,6 +412,15 @@ export function AccountList({
 	                  {account.limitWarmupEnabled ? t("common.states.on") : t("common.states.off")}
 	                </p>
                 <p className="truncate text-[11px] text-muted-foreground">{warmupDetail}</p>
+              </div>
+              <div className="min-w-0 text-xs">
+                {account.subscriptionActiveUntil ? (
+                  <p className="truncate font-medium tabular-nums">
+                    {formatDateOnly(account.subscriptionActiveUntil)} · {formatSingleUnitRemaining(account.subscriptionActiveUntil).label}
+                  </p>
+                ) : (
+                  <p className="text-muted-foreground">--</p>
+                )}
               </div>
               <div className="flex justify-end gap-1">
                 <Button

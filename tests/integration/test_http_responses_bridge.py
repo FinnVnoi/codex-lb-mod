@@ -501,10 +501,11 @@ class _PrecreatedOverloadUpstreamWebSocket(_FakeBridgeUpstreamWebSocket):
                     {
                         "type": "response.failed",
                         "response": {
+                            "id": "resp_terminal_overload",
                             "error": {
                                 "code": "server_is_overloaded",
                                 "message": "Our servers are currently overloaded. Please try again later.",
-                            }
+                            },
                         },
                     },
                     separators=(",", ":"),
@@ -9506,7 +9507,13 @@ async def test_backend_responses_http_bridge_retries_precreated_server_overload(
         "acc_http_bridge_server_overload",
         "http-bridge-server-overload@example.com",
     )
+    replacement_account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_server_overload_replacement",
+        "http-bridge-server-overload-replacement@example.com",
+    )
     account = await _get_account(account_id)
+    replacement_account = await _get_account(replacement_account_id)
     upstreams = [_PrecreatedOverloadUpstreamWebSocket(), _FakeBridgeUpstreamWebSocket()]
     connect_count = 0
 
@@ -9543,11 +9550,11 @@ async def test_backend_responses_http_bridge_retries_precreated_server_overload(
             prefer_earlier_reset_accounts,
             routing_strategy,
             model,
-            exclude_account_ids,
             additional_limit_name,
             api_key,
         )
-        return AccountSelection(account=account, error_message=None, error_code=None)
+        selected_account = replacement_account if account.id in (exclude_account_ids or set()) else account
+        return AccountSelection(account=selected_account, error_message=None, error_code=None)
 
     async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
         del self, force, timeout_seconds
@@ -9590,6 +9597,7 @@ async def test_backend_responses_http_bridge_retries_precreated_server_overload(
     _assert_created_text_delta_completed(events)
     assert events[-1]["response"]["id"] == "resp_bridge_1"
     assert connect_count == 2
+    assert replacement_account.id != account.id
 
 
 @pytest.mark.asyncio

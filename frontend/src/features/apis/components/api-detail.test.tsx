@@ -7,6 +7,7 @@ import {
 	createApiKey,
 	createApiKeyTrends,
 	createApiKeyUsage7Day,
+	createDashboardSettings,
 } from "@/test/mocks/factories";
 import { renderWithProviders } from "@/test/utils";
 
@@ -73,6 +74,15 @@ describe("ApiDetail", () => {
 		expect(screen.getByTestId("api-trend-legend")).toBeInTheDocument();
 		expect(screen.getByRole("switch")).toBeInTheDocument();
 		expect(screen.getByText("Key Details")).toBeInTheDocument();
+	});
+
+	it("shows effective routing when settings are available", () => {
+		renderApiDetail({
+			apiKey: createApiKey({ routingMode: "provider_first" }),
+			settings: createDashboardSettings({ globalApiRoutingOverride: "normal" }),
+		});
+
+		expect(screen.getByText("Effective routing: API key: Provider first")).toBeInTheDocument();
 	});
 
 	it("prefers the 7 day usage payload over list summary usage", () => {

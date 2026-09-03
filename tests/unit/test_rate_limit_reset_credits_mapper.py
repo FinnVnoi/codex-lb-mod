@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 from datetime import datetime
 from typing import cast
 
@@ -14,6 +16,12 @@ from app.modules.rate_limit_reset_credits.store import RateLimitResetCreditsStor
 pytestmark = pytest.mark.unit
 
 _DEFAULT_CHATGPT_ACCOUNT_ID = object()
+
+
+def _encode_jwt(payload: dict) -> str:
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    body = base64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+    return f"header.{body}.sig"
 
 
 def _account(
@@ -48,6 +56,35 @@ def _summaries(accounts: list[Account], store: RateLimitResetCreditsStore):
         include_auth=False,
         reset_credits_store=store,
     )
+
+
+def test_account_summary_exposes_subscription_window_from_id_token() -> None:
+    encryptor = TokenEncryptor()
+    account = _account("acc_subscription")
+    account.id_token_encrypted = encryptor.encrypt(
+        _encode_jwt(
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_subscription_active_start": "2026-07-07T09:00:00Z",
+                    "chatgpt_subscription_active_until": "2026-08-07T09:00:00Z",
+                },
+            },
+        ),
+    )
+
+    [summary] = build_account_summaries(
+        accounts=[account],
+        primary_usage={},
+        secondary_usage={},
+        encryptor=encryptor,
+        include_auth=False,
+        reset_credits_store=RateLimitResetCreditsStore(),
+    )
+
+    assert summary.subscription_active_start is not None
+    assert summary.subscription_active_start.isoformat() == "2026-07-07T09:00:00+00:00"
+    assert summary.subscription_active_until is not None
+    assert summary.subscription_active_until.isoformat() == "2026-08-07T09:00:00+00:00"
 
 
 def test_account_summary_exposes_cached_reset_credits_fields() -> None:

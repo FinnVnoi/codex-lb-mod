@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from sqlalchemy import BigInteger, Integer, cast, delete, func, insert, literal, or_, select, true, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +19,7 @@ from app.db.models import (
     ApiKeyAccountAssignment,
     ApiKeyLimit,
     ApiKeyModelSourceAssignment,
+    ApiKeyQuotaPurchase,
     ApiKeyUsageReservation,
     ApiKeyUsageReservationItem,
     ApiKeyUsageRollup,
@@ -31,7 +33,7 @@ from app.db.session import sqlite_writer_section
 from app.modules.accounts.usage_rollup import api_key_usage_aggregate_stmt, read_api_key_rollup_state
 from app.modules.accounts.usage_time_rollup import HOURLY_BUCKET_SECONDS, WARMUP_REQUEST_KINDS, to_dimension
 from app.modules.accounts.usage_time_rollup_read import RawWindow, raw_windows_clause, read_hourly_window
-from app.modules.api_keys.limit_windows import advance_limit_reset
+from app.modules.api_keys.limit_windows import next_limit_reset
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +50,7 @@ class UsageReservationItemData:
     limit_id: int
     limit_type: LimitType
     reserved_delta: int
-    expected_reset_at: datetime
+    expected_reset_at: datetime | None
     actual_delta: int | None = None
 
 
@@ -171,8 +173,8 @@ class ApiKeysRepository:
     async def get_for_limit_enforcement(self, key_id: str) -> ApiKey | None:
         """Admission-path load for ``enforce_limits_for_request``.
 
-        The enforcement transaction reads only ``is_active``/``expires_at``
-        plus the ``limits`` collection, so this skips the
+        The enforcement transaction reads ``is_active``/``expires_at`` /
+        ``quota_shop_enabled`` plus the ``limits`` collection, so this skips the
         ``account_assignments``/``source_assignments`` selectin round trips
         that ``get_by_id`` pays on every proxied request. ``raiseload`` keeps
         the narrowing fail-loud: any future enforcement code that touches an
@@ -199,7 +201,12 @@ class ApiKeysRepository:
             select(ApiKey)
             .execution_options(populate_existing=True)
             .options(
-                load_only(ApiKey.is_active, ApiKey.expires_at, raiseload=True),
+                load_only(
+                    ApiKey.is_active,
+                    ApiKey.expires_at,
+                    ApiKey.quota_shop_enabled,
+                    raiseload=True,
+                ),
                 selectinload(ApiKey.limits),
                 raiseload(ApiKey.account_assignments),
                 raiseload(ApiKey.source_assignments),
@@ -357,11 +364,18 @@ class ApiKeysRepository:
         allowed_reasoning_efforts: str | None | _Unset = _UNSET,
         enforced_service_tier: str | None | _Unset = _UNSET,
         traffic_class: str | _Unset = _UNSET,
+        routing_mode: str | _Unset = _UNSET,
         transport_policy_override: str | None | _Unset = _UNSET,
         usage_sections: str | _Unset = _UNSET,
         account_assignment_scope_enabled: bool | _Unset = _UNSET,
         source_assignment_scope_enabled: bool | _Unset = _UNSET,
         expires_at: datetime | None | _Unset = _UNSET,
+        auto_extend_expiry: bool | _Unset = _UNSET,
+        auto_extend_expiry_type: str | None | _Unset = _UNSET,
+        auto_extend_expiry_threshold: int | None | _Unset = _UNSET,
+        quota_shop_enabled: bool | _Unset = _UNSET,
+        quota_shop_max_windows: int | _Unset = _UNSET,
+        quota_shop_options: str | _Unset = _UNSET,
         is_active: bool | _Unset = _UNSET,
         key_hash: str | _Unset = _UNSET,
         key_prefix: str | _Unset = _UNSET,
@@ -394,6 +408,9 @@ class ApiKeysRepository:
         if traffic_class is not _UNSET:
             assert isinstance(traffic_class, str)
             row.traffic_class = traffic_class
+        if routing_mode is not _UNSET:
+            assert isinstance(routing_mode, str)
+            row.routing_mode = routing_mode
         if transport_policy_override is not _UNSET:
             assert transport_policy_override is None or isinstance(transport_policy_override, str)
             row.transport_policy_override = transport_policy_override
@@ -409,6 +426,24 @@ class ApiKeysRepository:
         if expires_at is not _UNSET:
             assert expires_at is None or isinstance(expires_at, datetime)
             row.expires_at = expires_at
+        if auto_extend_expiry is not _UNSET:
+            assert isinstance(auto_extend_expiry, bool)
+            row.auto_extend_expiry = auto_extend_expiry
+        if auto_extend_expiry_type is not _UNSET:
+            assert auto_extend_expiry_type is None or isinstance(auto_extend_expiry_type, str)
+            row.auto_extend_expiry_type = auto_extend_expiry_type
+        if auto_extend_expiry_threshold is not _UNSET:
+            assert auto_extend_expiry_threshold is None or isinstance(auto_extend_expiry_threshold, int)
+            row.auto_extend_expiry_threshold = auto_extend_expiry_threshold
+        if quota_shop_enabled is not _UNSET:
+            assert isinstance(quota_shop_enabled, bool)
+            row.quota_shop_enabled = quota_shop_enabled
+        if quota_shop_max_windows is not _UNSET:
+            assert isinstance(quota_shop_max_windows, int) and quota_shop_max_windows >= 1
+            row.quota_shop_max_windows = quota_shop_max_windows
+        if quota_shop_options is not _UNSET:
+            assert isinstance(quota_shop_options, str)
+            row.quota_shop_options = quota_shop_options
         if is_active is not _UNSET:
             assert isinstance(is_active, bool)
             row.is_active = is_active
@@ -545,6 +580,7 @@ class ApiKeysRepository:
         cost_microdollars: int,
     ) -> None:
         limits = await self.get_limits_by_key(key_id)
+        now = utcnow()
         for limit in limits:
             if limit.model_filter is not None and limit.model_filter != model:
                 continue
@@ -553,20 +589,91 @@ class ApiKeysRepository:
                 await self._session.execute(
                     update(ApiKeyLimit)
                     .where(ApiKeyLimit.id == limit.id)
-                    .values(current_value=ApiKeyLimit.current_value + increment)
+                    .values(
+                        current_value=ApiKeyLimit.current_value + increment,
+                        reset_at=func.coalesce(
+                            ApiKeyLimit.reset_at,
+                            next_limit_reset(now, limit.limit_window),
+                        ),
+                    )
                 )
         await self._session.commit()
 
-    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
+    async def reset_limit(
+        self,
+        limit_id: int,
+        *,
+        expected_reset_at: datetime,
+        new_reset_at: datetime | None,
+    ) -> bool:
+        purchased_delta = (
+            select(func.coalesce(func.sum(ApiKeyQuotaPurchase.purchased_value), 0))
+            .where(ApiKeyQuotaPurchase.limit_id == limit_id)
+            .where(ApiKeyQuotaPurchase.target_reset_at == expected_reset_at)
+            .scalar_subquery()
+        )
         result = await self._session.execute(
             update(ApiKeyLimit)
             .where(ApiKeyLimit.id == limit_id)
             .where(ApiKeyLimit.reset_at == expected_reset_at)
-            .values(current_value=0, reset_at=new_reset_at)
+            .values(
+                current_value=0,
+                max_value=ApiKeyLimit.max_value - purchased_delta,
+                reset_at=new_reset_at,
+            )
             .returning(ApiKeyLimit.id)
         )
         await self._session.commit()
         return result.scalar_one_or_none() is not None
+
+
+    async def process_auto_extend_expiry(self, *, now: datetime) -> int:
+        """Process the last completed local calendar day, exactly once."""
+        # Keep this import local to avoid api_keys.service -> repository ->
+        # automations.service -> proxy.request_policy -> api_keys.service.
+        from app.modules.automations.service import _resolve_server_timezone_name
+
+        tz = ZoneInfo(_resolve_server_timezone_name())
+        aware_now = now.replace(tzinfo=timezone.utc)
+        local_today = aware_now.astimezone(tz).date()
+        day = local_today - timedelta(days=1)
+        start_local = datetime.combine(day, datetime.min.time(), tzinfo=tz)
+        end_local = start_local + timedelta(days=1)
+        start = start_local.astimezone(timezone.utc).replace(tzinfo=None)
+        end = end_local.astimezone(timezone.utc).replace(tzinfo=None)
+        rows = (
+            await self._session.execute(
+                select(ApiKey).where(
+                    ApiKey.expires_at.is_not(None),
+                    ApiKey.auto_extend_expiry.is_(True),
+                )
+            )
+        ).scalars().all()
+        count = 0
+        for row in rows:
+            if row.auto_extend_expiry_last_processed_date == day:
+                continue
+            if row.auto_extend_expiry_type not in {"total_tokens", "cost_usd"}:
+                row.auto_extend_expiry_last_processed_date = day
+                continue
+            value = await self.get_limit_usage_value(
+                row.id,
+                limit_type=LimitType(row.auto_extend_expiry_type),
+                since=start,
+                until=end,
+                model_filter=None,
+            )
+            if (
+                row.auto_extend_expiry_threshold is not None
+                and row.expires_at is not None
+                and row.expires_at >= now
+                and value >= row.auto_extend_expiry_threshold
+            ):
+                row.expires_at = row.expires_at + timedelta(days=1)
+                count += 1
+            row.auto_extend_expiry_last_processed_date = day
+        await self._session.commit()
+        return count
 
     async def reset_expired_limits(self, *, now: datetime) -> int:
         reset_count = 0
@@ -578,6 +685,7 @@ class ApiKeysRepository:
                     ApiKeyLimit.limit_window,
                 )
                 .where(ApiKeyLimit.reset_at < now)
+                .where(ApiKeyLimit.limit_window != LimitWindow.LIFETIME)
                 .order_by(ApiKeyLimit.reset_at.asc(), ApiKeyLimit.id.asc())
                 .limit(_EXPIRED_LIMIT_RESET_BATCH_SIZE)
             )
@@ -586,13 +694,20 @@ class ApiKeysRepository:
                 return reset_count
 
             for limit in expired_limits:
+                purchased_delta = (
+                    select(func.coalesce(func.sum(ApiKeyQuotaPurchase.purchased_value), 0))
+                    .where(ApiKeyQuotaPurchase.limit_id == limit.id)
+                    .where(ApiKeyQuotaPurchase.target_reset_at == limit.reset_at)
+                    .scalar_subquery()
+                )
                 update_result = await self._session.execute(
                     update(ApiKeyLimit)
                     .where(ApiKeyLimit.id == limit.id)
                     .where(ApiKeyLimit.reset_at == limit.reset_at)
                     .values(
                         current_value=0,
-                        reset_at=advance_limit_reset(limit.reset_at, now, limit.limit_window),
+                        max_value=ApiKeyLimit.max_value - purchased_delta,
+                        reset_at=None,
                     )
                     .returning(ApiKeyLimit.id)
                 )
@@ -605,7 +720,8 @@ class ApiKeysRepository:
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
+        first_reset_at: datetime,
     ) -> ReservationResult:
         if delta <= 0:
             snapshot = await self._session.get(ApiKeyLimit, limit_id)
@@ -617,12 +733,19 @@ class ApiKeysRepository:
                 reset_at=snapshot.reset_at if snapshot is not None else None,
             )
 
+        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id)
+        stmt = (
+            stmt.where(ApiKeyLimit.reset_at.is_(None))
+            if expected_reset_at is None
+            else stmt.where(ApiKeyLimit.reset_at == expected_reset_at)
+        )
         result = await self._session.execute(
-            update(ApiKeyLimit)
-            .where(ApiKeyLimit.id == limit_id)
-            .where(ApiKeyLimit.reset_at == expected_reset_at)
+            stmt
             .where(ApiKeyLimit.current_value + delta <= ApiKeyLimit.max_value)
-            .values(current_value=ApiKeyLimit.current_value + delta)
+            .values(
+                current_value=ApiKeyLimit.current_value + delta,
+                reset_at=func.coalesce(ApiKeyLimit.reset_at, first_reset_at),
+            )
             .returning(
                 ApiKeyLimit.id,
                 ApiKeyLimit.current_value,
@@ -661,9 +784,14 @@ class ApiKeysRepository:
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
     ) -> bool:
-        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id).where(ApiKeyLimit.reset_at == expected_reset_at)
+        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id)
+        stmt = (
+            stmt.where(ApiKeyLimit.reset_at.is_(None))
+            if expected_reset_at is None
+            else stmt.where(ApiKeyLimit.reset_at == expected_reset_at)
+        )
         if delta < 0:
             stmt = stmt.where(ApiKeyLimit.current_value >= -delta)
         result = await self._session.execute(
