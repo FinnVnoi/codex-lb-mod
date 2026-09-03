@@ -20,6 +20,7 @@ from app.db.models import (
     ModelSource,
     UsageHistory,
 )
+from app.modules.api_keys.limit_windows import next_limit_reset
 from app.modules.api_keys.repository import (
     _UNSET,
     ApiKeyTrendBucket,
@@ -297,11 +298,19 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
             increment = _compute_increment(limit, input_tokens, output_tokens, cost_microdollars)
             if increment > 0:
                 limit.current_value += increment
+                if limit.reset_at is None:
+                    limit.reset_at = next_limit_reset(utcnow(), limit.limit_window)
         row = self.rows.get(key_id)
         if row is not None:
             row.last_used_at = utcnow()
 
-    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
+    async def reset_limit(
+        self,
+        limit_id: int,
+        *,
+        expected_reset_at: datetime,
+        new_reset_at: datetime | None,
+    ) -> bool:
         for limits in self._limits.values():
             for limit in limits:
                 if limit.id == limit_id and limit.reset_at == expected_reset_at:
@@ -315,7 +324,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
+        first_reset_at: datetime,
     ) -> ReservationResult:
         limit = _find_limit_by_id(self._limits, limit_id)
         if limit is None:
@@ -325,6 +335,8 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         if limit.current_value + delta > limit.max_value:
             return ReservationResult(False, limit_id, limit.current_value, limit.max_value, limit.reset_at)
         limit.current_value += delta
+        if limit.reset_at is None:
+            limit.reset_at = first_reset_at
         return ReservationResult(True, limit_id, limit.current_value, limit.max_value, limit.reset_at)
 
     async def adjust_reserved_usage(
@@ -332,7 +344,7 @@ class _FakeApiKeysRepository(ApiKeysRepositoryProtocol):
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
     ) -> bool:
         limit = _find_limit_by_id(self._limits, limit_id)
         if limit is None or limit.reset_at != expected_reset_at:
@@ -1261,8 +1273,69 @@ async def test_create_key_with_limits() -> None:
     assert token_limit.max_value == 1_000_000
     assert token_limit.limit_window == "weekly"
     assert token_limit.current_value == 0
+    assert token_limit.reset_at is None
     assert cost_limit.max_value == 5_000_000
     assert cost_limit.limit_window == "daily"
+    assert cost_limit.reset_at is None
+
+
+@pytest.mark.asyncio
+async def test_admin_edit_preserves_usage_and_countdown() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="preserve-countdown",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=100)],
+        )
+    )
+    limits = await repo.get_limits_by_key(created.id)
+    original_reset_at = utcnow() + timedelta(days=3)
+    limits[0].current_value = 12
+    limits[0].reset_at = original_reset_at
+
+    await service.update_key(
+        created.id,
+        ApiKeyUpdateData(
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=200)],
+            limits_set=True,
+        ),
+    )
+
+    updated = (await repo.get_limits_by_key(created.id))[0]
+    assert updated.max_value == 200
+    assert updated.current_value == 12
+    assert updated.reset_at == original_reset_at
+
+
+@pytest.mark.asyncio
+async def test_explicit_reset_clears_countdown_until_first_usage() -> None:
+    repo = _FakeApiKeysRepository()
+    service = ApiKeysService(repo)
+    created = await service.create_key(
+        ApiKeyCreateData(
+            name="reset-countdown",
+            allowed_models=None,
+            expires_at=None,
+            limits=[LimitRuleInput(limit_type="total_tokens", limit_window="weekly", max_value=100)],
+        )
+    )
+    limits = await repo.get_limits_by_key(created.id)
+    limits[0].current_value = 12
+    limits[0].reset_at = utcnow() + timedelta(days=3)
+
+    await service.update_key(created.id, ApiKeyUpdateData(reset_usage=True))
+    reset = (await repo.get_limits_by_key(created.id))[0]
+    assert reset.current_value == 0
+    assert reset.reset_at is None
+
+    await service.record_usage(created.id, model="gpt-5.1", input_tokens=1, output_tokens=1)
+    used = (await repo.get_limits_by_key(created.id))[0]
+    assert used.current_value == 2
+    assert used.reset_at is not None
+    assert used.reset_at > utcnow() + timedelta(days=6)
 
 
 @pytest.mark.asyncio
@@ -1351,7 +1424,7 @@ async def test_validate_key_lazy_resets_expired_limit() -> None:
     # Verify lazy reset occurred
     updated_limits = await repo.get_limits_by_key(created.id)
     assert updated_limits[0].current_value == 0
-    assert updated_limits[0].reset_at > utcnow()
+    assert updated_limits[0].reset_at is None
 
 
 @pytest.mark.asyncio
@@ -1409,7 +1482,7 @@ async def test_validate_key_advances_reset_strictly_into_future(monkeypatch: pyt
 
     updated_limits = await repo.get_limits_by_key(created.id)
     assert updated_limits[0].current_value == 0
-    assert updated_limits[0].reset_at == fixed_now + timedelta(days=7)
+    assert updated_limits[0].reset_at is None
 
 
 @pytest.mark.asyncio

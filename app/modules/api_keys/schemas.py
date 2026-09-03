@@ -21,7 +21,7 @@ class LimitRuleResponse(DashboardModel):
     max_value: int
     current_value: int
     model_filter: str | None
-    reset_at: datetime
+    reset_at: datetime | None
 
 
 class QuotaShopOption(DashboardModel):

@@ -195,7 +195,13 @@ async def quota_shop_catalog(
             max_value=existing.max_value if existing else 0,
             current_value=current,
             remaining_value=max(0, (existing.max_value - current) if existing else 0),
-            reset_at=_reset_iso(existing.reset_at) if existing else _reset_iso(next_limit_reset(utcnow(), limit_window)),
+            # A dormant window has no enforcement countdown yet. The shop still
+            # needs a concrete order snapshot, so quote a window starting now.
+            reset_at=_reset_iso(
+                existing.reset_at
+                if existing is not None and existing.reset_at is not None
+                else next_limit_reset(utcnow(), limit_window)
+            ),
             unit_size=unit_size,
             unit_label=unit_label,
         ))
@@ -325,17 +331,28 @@ async def fulfill_quota_purchase(
         if not allowed:
             raise HTTPException(status_code=409, detail="This quota option is not available in the shop")
 
-        if _utc_naive(limit.reset_at) != expected_reset_at:
+        dormant_window = limit.reset_at is None
+        if not dormant_window and _utc_naive(limit.reset_at) != expected_reset_at:
             raise HTTPException(status_code=409, detail="The selected limit window has reset; create a new order")
         if limit.limit_window != LimitWindow.LIFETIME and expected_reset_at <= now:
             raise HTTPException(status_code=409, detail="The selected limit window has reset; create a new order")
-        result = await session.execute(
+        limit_update = (
             update(ApiKeyLimit)
             .where(ApiKeyLimit.id == limit.id)
             .where(ApiKeyLimit.api_key_id == api_key.id)
-            .where(ApiKeyLimit.reset_at == expected_reset_at)
+        )
+        limit_update = (
+            limit_update.where(ApiKeyLimit.reset_at.is_(None))
+            if dormant_window
+            else limit_update.where(ApiKeyLimit.reset_at == expected_reset_at)
+        )
+        result = await session.execute(
+            limit_update
             .where(ApiKeyLimit.max_value <= MAX_PURCHASE_VALUE[limit_type] - purchased_value)
-            .values(max_value=ApiKeyLimit.max_value + purchased_value)
+            .values(
+                max_value=ApiKeyLimit.max_value + purchased_value,
+                reset_at=func.coalesce(ApiKeyLimit.reset_at, expected_reset_at),
+            )
             .returning(ApiKeyLimit.max_value, ApiKeyLimit.current_value, ApiKeyLimit.reset_at)
         )
         updated = result.first()

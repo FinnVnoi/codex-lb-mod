@@ -3507,7 +3507,7 @@ async def test_update_key_reset_usage_requires_explicit_action(async_client):
         limits = await repo.get_limits_by_key(key_id)
         assert len(limits) == 1
         assert limits[0].current_value == 0
-        assert limits[0].reset_at > original_reset_at
+        assert limits[0].reset_at is None
 
 
 @pytest.mark.asyncio
@@ -3583,7 +3583,7 @@ async def test_hourly_and_lifetime_limit_windows_have_expected_reset_semantics(a
         by_window = {limit.limit_window: limit for limit in limits}
         hourly_limit = by_window[LimitWindow.ONE_HOUR]
         lifetime_limit = by_window[LimitWindow.LIFETIME]
-        assert timedelta(minutes=59) < hourly_limit.reset_at - utcnow() <= timedelta(hours=1)
+        assert hourly_limit.reset_at is None
         assert lifetime_limit.reset_at == datetime.max
 
         lifetime_limit.current_value = 123
@@ -3641,9 +3641,9 @@ async def test_reset_expired_limits_background_fallback_advances_windows(async_c
         daily_limit = next(limit for limit in limits if limit.limit_window == LimitWindow.DAILY)
         weekly_limit = next(limit for limit in limits if limit.limit_window == LimitWindow.WEEKLY)
         assert daily_limit.current_value == 0
-        assert daily_limit.reset_at == now + timedelta(days=1)
+        assert daily_limit.reset_at is None
         assert weekly_limit.current_value == 0
-        assert weekly_limit.reset_at == now + timedelta(days=7)
+        assert weekly_limit.reset_at is None
 
 
 @pytest.mark.asyncio
@@ -3690,11 +3690,11 @@ async def test_reset_expired_limits_background_fallback_processes_batches(async_
         limits = await repo.get_limits_by_key(key_id)
         by_window = {limit.limit_window: limit for limit in limits}
         assert by_window[LimitWindow.DAILY].current_value == 0
-        assert by_window[LimitWindow.DAILY].reset_at == now + timedelta(days=1)
+        assert by_window[LimitWindow.DAILY].reset_at is None
         assert by_window[LimitWindow.WEEKLY].current_value == 0
-        assert by_window[LimitWindow.WEEKLY].reset_at == now + timedelta(days=7)
+        assert by_window[LimitWindow.WEEKLY].reset_at is None
         assert by_window[LimitWindow.MONTHLY].current_value == 0
-        assert by_window[LimitWindow.MONTHLY].reset_at == now + timedelta(days=30)
+        assert by_window[LimitWindow.MONTHLY].reset_at is None
 
 
 @pytest.mark.asyncio

@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, Response
 from starlette._utils import get_route_path
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from app.core.errors import dashboard_error, openai_error
+from app.core.errors import dashboard_error, openai_error, response_failed_event
 from app.core.exceptions import (
     AppError,
     DashboardAuthError,
@@ -43,6 +43,7 @@ from app.core.middleware.request_body_limit import (
 )
 from app.core.multipart import MultipartPayloadTooLarge
 from app.core.runtime_logging import log_error_response
+from app.core.utils.sse import format_sse_event
 from app.modules.proxy.images_observability import (
     IMAGE_ROUTE_MODEL_STATE,
     IMAGE_ROUTE_STARTED_AT_STATE,
@@ -95,6 +96,42 @@ _IMAGE_ROUTE_PATHS: dict[str, ImageRoute] = {
     "/backend-api/codex/images/edits": "edits",
 }
 _CODEX_JSON_IMAGE_EDIT_PATH = "/backend-api/codex/images/edits"
+_RESPONSES_STREAM_PATHS: frozenset[str] = frozenset(
+    {
+        "/backend-api/codex/responses",
+        "/backend-api/codex/responses/",
+        "/v1/responses",
+        "/v1/responses/",
+    }
+)
+
+
+def _codex_rate_limit_sse_response(request: Request, exc: AppError) -> Response | None:
+    """Expose quota text to Codex clients instead of its generic HTTP retry error.
+
+    Native Codex clients replace an HTTP 429 response body with their own
+    ``exceeded retry limit`` message after retrying. A terminal Responses SSE
+    event is not retried and preserves the proxy's localized error message.
+    Keep this compatibility behavior narrowly scoped to Responses requests
+    whose User-Agent contains ``codex``; every other client retains HTTP 429.
+    """
+    if not isinstance(exc, ProxyRateLimitError):
+        return None
+    if request.url.path not in _RESPONSES_STREAM_PATHS:
+        return None
+    if "codex" not in request.headers.get("user-agent", "").lower():
+        return None
+    event = response_failed_event(
+        exc.code,
+        exc.message,
+        error_type=exc.error_type,
+    )
+    return Response(
+        content=format_sse_event(event),
+        status_code=200,
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache"},
+    )
 
 
 def _image_route_from_path(path: str) -> ImageRoute | None:
@@ -234,6 +271,9 @@ def add_exception_handlers(app: FastAPI) -> None:
                     status=exc.status_code,
                     outcome="auth_error",
                 )
+            codex_sse_response = _codex_rate_limit_sse_response(request, exc)
+            if codex_sse_response is not None:
+                return codex_sse_response
             return JSONResponse(
                 status_code=exc.status_code,
                 content=openai_error(exc.code, exc.message, error_type=error_type),

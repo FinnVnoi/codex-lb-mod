@@ -259,7 +259,7 @@ class V1UsageLimitResponse(BaseModel):
     current_value: int
     remaining_value: int
     model_filter: str | None = None
-    reset_at: str
+    reset_at: str | None
     source: str = "api_key_limit"
 
 
@@ -305,6 +305,16 @@ class V1UsageActivityRow(BaseModel):
     cost_usd: float
 
 
+class V1UsageActivityModelAggregate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    model: str
+    success_count: int
+    failed_count: int
+    total_tokens: int
+    total_cost_usd: float
+
+
 class V1UsageActivityResponse(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -316,6 +326,7 @@ class V1UsageActivityResponse(BaseModel):
     latest_id: int | None = None
     removed_ids: list[int] = []
     totals: V1UsageActivityTotals
+    model_aggregates: list[V1UsageActivityModelAggregate] = []
     requests: list[V1UsageActivityRow]
 
 

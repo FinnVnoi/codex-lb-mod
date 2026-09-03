@@ -13,7 +13,7 @@ const LimitRuleSchema = z.object({
   maxValue: z.number(),
   currentValue: z.number(),
   modelFilter: z.string().nullable(),
-  resetAt: z.iso.datetime({ offset: true }),
+  resetAt: z.iso.datetime({ offset: true }).nullable(),
 });
 
 export const LimitRuleCreateSchema = z.object({

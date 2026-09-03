@@ -879,6 +879,33 @@ async def test_v1_usage_activity_collapses_fallback_attempts(async_client):
     assert payload["requests"][1]["error_code"] is None
     assert payload["requests"][1]["model"] == "gpt-b"
     assert payload["requests"][1]["total_tokens"] == 34
+    assert payload["model_aggregates"] == [
+        {"model": "gpt-b", "success_count": 1, "failed_count": 0, "total_tokens": 34, "total_cost_usd": pytest.approx(.03)},
+        {"model": "gpt-c", "success_count": 0, "failed_count": 1, "total_tokens": 5, "total_cost_usd": pytest.approx(.005)},
+    ]
+
+@pytest.mark.asyncio
+async def test_v1_usage_activity_model_aggregates_are_lifetime_and_all_non_success(async_client):
+    key_id, raw_key = await _create_api_key(name="activity-model-aggregates")
+    now = utcnow()
+    async with SessionLocal() as session:
+        session.add_all([
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="recent-success", requested_at=now, model="gpt-z", status="success", error_code=None, input_tokens=10, output_tokens=2, cached_input_tokens=1, total_cost_usd=.02),
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="recent-cancelled", requested_at=now, model="gpt-z", status="cancelled", error_code="cancelled", input_tokens=1, output_tokens=0, cached_input_tokens=0, total_cost_usd=.001),
+            ApiKeyLogicalRequest(api_key_id=key_id, logical_id="old-error", requested_at=now - timedelta(days=40), model="gpt-old", status="error", error_code="failed", input_tokens=3, output_tokens=0, cached_input_tokens=0, total_cost_usd=.003),
+        ])
+        await session.commit()
+
+    response = await async_client.get("/v1/usage/activity?window=1d&include_logs=false", headers={"Authorization": f"Bearer {raw_key}"})
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"]["request_count"] == 2
+    assert payload["requests"] == []
+    assert payload["model_aggregates"] == [
+        {"model": "gpt-z", "success_count": 1, "failed_count": 1, "total_tokens": 13, "total_cost_usd": pytest.approx(.021)},
+        {"model": "gpt-old", "success_count": 0, "failed_count": 1, "total_tokens": 3, "total_cost_usd": pytest.approx(.003)},
+    ]
+
 
 @pytest.mark.asyncio
 async def test_request_log_writer_upserts_one_logical_request():
@@ -912,6 +939,10 @@ async def test_v1_usage_activity_after_id_returns_only_new_logs(async_client):
     assert payload["max_rows"] == 2
     assert payload["latest_id"] > cursor
     assert payload["totals"]["request_count"] == 2
+    assert payload["model_aggregates"] == [
+        {"model": "new", "success_count": 1, "failed_count": 0, "total_tokens": 3, "total_cost_usd": pytest.approx(.02)},
+        {"model": "old", "success_count": 1, "failed_count": 0, "total_tokens": 2, "total_cost_usd": pytest.approx(.01)},
+    ]
 
 @pytest.mark.asyncio
 async def test_v1_usage_activity_hides_superseded_client_retry(async_client):
@@ -927,4 +958,7 @@ async def test_v1_usage_activity_hides_superseded_client_retry(async_client):
     payload = response.json()
     assert payload["totals"]["request_count"] == 1
     assert [row["status"] for row in payload["requests"]] == ["success"]
+    assert payload["model_aggregates"] == [
+        {"model": "gpt-x", "success_count": 1, "failed_count": 0, "total_tokens": 12, "total_cost_usd": pytest.approx(.02)},
+    ]
     assert failed_id in payload["removed_ids"]

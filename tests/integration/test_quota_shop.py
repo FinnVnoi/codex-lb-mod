@@ -304,7 +304,7 @@ async def test_periodic_order_snapshot_cannot_cross_reset_boundary(async_client,
         )
         limit = result.scalar_one()
         original_max = limit.max_value
-        order_reset = limit.reset_at
+        order_reset = utcnow() + timedelta(hours=5)
         limit.reset_at = order_reset + timedelta(hours=5)
         await session.commit()
 

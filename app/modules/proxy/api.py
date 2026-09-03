@@ -245,6 +245,7 @@ from app.modules.proxy.schemas import (
     V1ResetCreditEntry,
     V1ResetCreditRedeemRequest,
     V1ResetCreditRedeemResponse,
+    V1UsageActivityModelAggregate,
     V1UsageActivityResponse,
     V1UsageActivityRow,
     V1UsageActivityTotals,
@@ -1414,7 +1415,7 @@ async def v1_usage_activity(
 ) -> V1UsageActivityResponse:
     page = max(1, page)
     async with get_background_session() as session:
-        totals, rows, total_pages, log_count, latest_id, removed_ids = await get_logical_usage(
+        totals, rows, model_aggregates, total_pages, log_count, latest_id, removed_ids = await get_logical_usage(
             session,
             api_key_id=api_key.id,
             window=window,
@@ -1431,6 +1432,7 @@ async def v1_usage_activity(
         latest_id=latest_id,
         removed_ids=removed_ids,
         totals=V1UsageActivityTotals(**asdict(totals)),
+        model_aggregates=[V1UsageActivityModelAggregate(**asdict(row)) for row in model_aggregates],
         requests=[V1UsageActivityRow(**asdict(row)) for row in rows],
     )
 
@@ -2023,7 +2025,7 @@ def _to_v1_usage_limit_response(limit: ApiKeySelfLimitData) -> V1UsageLimitRespo
         current_value=current_value,
         remaining_value=max(0, limit.max_value - current_value),
         model_filter=limit.model_filter,
-        reset_at=limit.reset_at.isoformat() + "Z",
+        reset_at=limit.reset_at.isoformat() + "Z" if limit.reset_at is not None else None,
         source=limit.source,
     )
 
@@ -2105,7 +2107,7 @@ def _select_codex_usage_limit(
 
 
 def _codex_usage_window_snapshot(limit: V1UsageLimitResponse | None) -> RateLimitWindowSnapshotData | None:
-    if limit is None or limit.max_value <= 0:
+    if limit is None or limit.max_value <= 0 or limit.reset_at is None:
         return None
     reset_at = datetime.fromisoformat(limit.reset_at.replace("Z", "+00:00"))
     reset_epoch = int(reset_at.timestamp())
@@ -8048,7 +8050,7 @@ async def _enforce_request_limits(
             )
         except ApiKeyRateLimitExceededError as exc:
             message = str(exc)
-            if not exc.is_lifetime:
+            if not exc.is_lifetime and exc.reset_at is not None:
                 message = f"{message} Thời gian reset: {exc.reset_at.isoformat()}Z."
             raise ProxyRateLimitError(message) from exc
         except ApiKeyInvalidError as exc:

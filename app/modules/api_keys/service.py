@@ -24,7 +24,7 @@ from app.core.usage.types import UsageWindowRow
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import Account, AccountStatus, ApiKey, ApiKeyLimit, LimitType, LimitWindow, ModelSource, UsageHistory
 from app.db.session import sqlite_writer_section
-from app.modules.api_keys.limit_windows import advance_limit_reset, limit_window_delta, next_limit_reset
+from app.modules.api_keys.limit_windows import limit_window_delta, next_limit_reset
 from app.modules.api_keys.repository import (
     _UNSET,
     ApiKeyTrendBucket,
@@ -139,14 +139,21 @@ class ApiKeysRepositoryProtocol(Protocol):
         cost_microdollars: int,
     ) -> None: ...
 
-    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool: ...
+    async def reset_limit(
+        self,
+        limit_id: int,
+        *,
+        expected_reset_at: datetime,
+        new_reset_at: datetime | None,
+    ) -> bool: ...
 
     async def try_reserve_usage(
         self,
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
+        first_reset_at: datetime,
     ) -> ReservationResult: ...
 
     async def adjust_reserved_usage(
@@ -154,7 +161,7 @@ class ApiKeysRepositoryProtocol(Protocol):
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
     ) -> bool: ...
 
     async def create_usage_reservation(
@@ -235,7 +242,7 @@ class ApiKeyValidationError(ValueError):
 
 
 class ApiKeyRateLimitExceededError(ValueError):
-    def __init__(self, *, message: str, reset_at: datetime, is_lifetime: bool = False) -> None:
+    def __init__(self, *, message: str, reset_at: datetime | None, is_lifetime: bool = False) -> None:
         super().__init__(message)
         self.reset_at = reset_at
         self.is_lifetime = is_lifetime
@@ -266,7 +273,7 @@ class LimitRuleData:
     max_value: int
     current_value: int
     model_filter: str | None
-    reset_at: datetime
+    reset_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -922,6 +929,8 @@ class ApiKeysService:
                     if not _limit_applies_for_request(limit, request_model=request_model):
                         continue
                     if limit.current_value >= limit.max_value:
+                        if limit.reset_at is None and limit.limit_window != LimitWindow.LIFETIME:
+                            limit.reset_at = next_limit_reset(now, limit.limit_window)
                         raise _rate_limit_exceeded_error(limit)
                     reserve_delta = _reserve_delta_for_limit(
                         limit,
@@ -934,15 +943,19 @@ class ApiKeysService:
                             limit.id,
                             delta=reserve_delta,
                             expected_reset_at=limit.reset_at,
+                            first_reset_at=next_limit_reset(now, limit.limit_window),
                         )
                         if not result.success:
                             raise _rate_limit_exceeded_error(limit)
+                        expected_reset_at = result.reset_at
+                    else:
+                        expected_reset_at = limit.reset_at
                     reservation_items.append(
                         UsageReservationItemData(
                             limit_id=limit.id,
                             limit_type=limit.limit_type,
                             reserved_delta=reserve_delta,
-                            expected_reset_at=limit.reset_at,
+                            expected_reset_at=expected_reset_at,
                         )
                     )
 
@@ -1311,7 +1324,7 @@ class ApiKeySelfLimitData:
     current_value: int
     remaining_value: int
     model_filter: str | None
-    reset_at: datetime
+    reset_at: datetime | None
     source: str = "api_key_limit"
 
 
@@ -1576,13 +1589,14 @@ async def _lazy_reset_expired_limits(
     for limit in limits:
         if limit.limit_window == LimitWindow.LIFETIME:
             continue
+        if limit.reset_at is None:
+            continue
         if limit.reset_at >= now:
             continue
-        new_reset_at = advance_limit_reset(limit.reset_at, now, limit.limit_window)
         await repository.reset_limit(
             limit.id,
             expected_reset_at=limit.reset_at,
-            new_reset_at=new_reset_at,
+            new_reset_at=None,
         )
         reset_performed = True
     return reset_performed
@@ -1595,7 +1609,11 @@ def _rate_limit_exceeded_error(limit: ApiKeyLimit) -> ApiKeyRateLimitExceededErr
             if limit.limit_window == LimitWindow.LIFETIME
             else "Đã đạt đến giới hạn. Vui lòng nạp thêm quota hoặc chờ hạn mức tự reset."
         ),
-        reset_at=limit.reset_at,
+        reset_at=(
+            limit.reset_at
+            if limit.reset_at is not None
+            else next_limit_reset(utcnow(), limit.limit_window)
+        ),
         is_lifetime=limit.limit_window == LimitWindow.LIFETIME,
     )
 
@@ -1840,7 +1858,15 @@ def _limit_input_to_row(
         max_value=li.max_value,
         current_value=current_value,
         model_filter=li.model_filter,
-        reset_at=reset_at if reset_at is not None else next_limit_reset(now, window),
+        reset_at=(
+            reset_at
+            if reset_at is not None
+            else (
+                next_limit_reset(now, window)
+                if window == LimitWindow.LIFETIME or current_value > 0
+                else None
+            )
+        ),
     )
 
 
@@ -1916,7 +1942,7 @@ async def _new_limit_input_to_backfilled_row(
 ) -> ApiKeyLimit:
     limit_type = LimitType(submitted.limit_type)
     window = LimitWindow(submitted.limit_window)
-    reset_at = next_limit_reset(now, window)
+    reset_at = next_limit_reset(now, window) if window == LimitWindow.LIFETIME else None
     # A lifetime rule covers every successful request ever recorded for the key.
     # Unlike rolling windows it has no reset interval, so backfill from the
     # earliest representable timestamp instead of asking limit_window_delta().
@@ -1953,7 +1979,11 @@ def _build_reset_limit_rows(
                 max_value=existing.max_value,
                 current_value=0,
                 model_filter=existing.model_filter,
-                reset_at=next_limit_reset(now, existing.limit_window),
+                reset_at=(
+                    next_limit_reset(now, existing.limit_window)
+                    if existing.limit_window == LimitWindow.LIFETIME
+                    else None
+                ),
             )
         )
     return rows

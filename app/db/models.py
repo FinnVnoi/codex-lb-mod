@@ -1254,7 +1254,9 @@ class ApiKeyLimit(Base):
     max_value: Mapped[int] = mapped_column(BigInteger, nullable=False)
     current_value: Mapped[int] = mapped_column(BigInteger, default=0, server_default=text("0"), nullable=False)
     model_filter: Mapped[str | None] = mapped_column(String, nullable=True)
-    reset_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    # Rolling windows remain dormant until the first usage in a cycle.
+    # Lifetime limits keep datetime.max as their sentinel.
+    reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     api_key: Mapped["ApiKey"] = relationship("ApiKey", back_populates="limits")
 
@@ -1336,7 +1338,7 @@ class ApiKeyUsageReservationItem(Base):
     limit_type: Mapped[str] = mapped_column(String, nullable=False)
     reserved_delta: Mapped[int] = mapped_column(BigInteger, nullable=False)
     actual_delta: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
-    expected_reset_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    expected_reset_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime,

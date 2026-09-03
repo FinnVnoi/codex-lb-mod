@@ -29,7 +29,7 @@ from app.db.models import (
 )
 from app.db.session import sqlite_writer_section
 from app.modules.accounts.usage_rollup import api_key_usage_aggregate_stmt, read_api_key_rollup_state
-from app.modules.api_keys.limit_windows import advance_limit_reset
+from app.modules.api_keys.limit_windows import next_limit_reset
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,7 +46,7 @@ class UsageReservationItemData:
     limit_id: int
     limit_type: LimitType
     reserved_delta: int
-    expected_reset_at: datetime
+    expected_reset_at: datetime | None
     actual_delta: int | None = None
 
 
@@ -492,6 +492,7 @@ class ApiKeysRepository:
         cost_microdollars: int,
     ) -> None:
         limits = await self.get_limits_by_key(key_id)
+        now = utcnow()
         for limit in limits:
             if limit.model_filter is not None and limit.model_filter != model:
                 continue
@@ -500,12 +501,24 @@ class ApiKeysRepository:
                 await self._session.execute(
                     update(ApiKeyLimit)
                     .where(ApiKeyLimit.id == limit.id)
-                    .values(current_value=ApiKeyLimit.current_value + increment)
+                    .values(
+                        current_value=ApiKeyLimit.current_value + increment,
+                        reset_at=func.coalesce(
+                            ApiKeyLimit.reset_at,
+                            next_limit_reset(now, limit.limit_window),
+                        ),
+                    )
                 )
         await self._session.execute(update(ApiKey).where(ApiKey.id == key_id).values(last_used_at=utcnow()))
         await self._session.commit()
 
-    async def reset_limit(self, limit_id: int, *, expected_reset_at: datetime, new_reset_at: datetime) -> bool:
+    async def reset_limit(
+        self,
+        limit_id: int,
+        *,
+        expected_reset_at: datetime,
+        new_reset_at: datetime | None,
+    ) -> bool:
         purchased_delta = (
             select(func.coalesce(func.sum(ApiKeyQuotaPurchase.purchased_value), 0))
             .where(ApiKeyQuotaPurchase.limit_id == limit_id)
@@ -607,7 +620,7 @@ class ApiKeysRepository:
                     .values(
                         current_value=0,
                         max_value=ApiKeyLimit.max_value - purchased_delta,
-                        reset_at=advance_limit_reset(limit.reset_at, now, limit.limit_window),
+                        reset_at=None,
                     )
                     .returning(ApiKeyLimit.id)
                 )
@@ -620,7 +633,8 @@ class ApiKeysRepository:
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
+        first_reset_at: datetime,
     ) -> ReservationResult:
         if delta <= 0:
             snapshot = await self._session.get(ApiKeyLimit, limit_id)
@@ -632,12 +646,19 @@ class ApiKeysRepository:
                 reset_at=snapshot.reset_at if snapshot is not None else None,
             )
 
+        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id)
+        stmt = (
+            stmt.where(ApiKeyLimit.reset_at.is_(None))
+            if expected_reset_at is None
+            else stmt.where(ApiKeyLimit.reset_at == expected_reset_at)
+        )
         result = await self._session.execute(
-            update(ApiKeyLimit)
-            .where(ApiKeyLimit.id == limit_id)
-            .where(ApiKeyLimit.reset_at == expected_reset_at)
+            stmt
             .where(ApiKeyLimit.current_value + delta <= ApiKeyLimit.max_value)
-            .values(current_value=ApiKeyLimit.current_value + delta)
+            .values(
+                current_value=ApiKeyLimit.current_value + delta,
+                reset_at=func.coalesce(ApiKeyLimit.reset_at, first_reset_at),
+            )
             .returning(
                 ApiKeyLimit.id,
                 ApiKeyLimit.current_value,
@@ -676,9 +697,14 @@ class ApiKeysRepository:
         limit_id: int,
         *,
         delta: int,
-        expected_reset_at: datetime,
+        expected_reset_at: datetime | None,
     ) -> bool:
-        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id).where(ApiKeyLimit.reset_at == expected_reset_at)
+        stmt = update(ApiKeyLimit).where(ApiKeyLimit.id == limit_id)
+        stmt = (
+            stmt.where(ApiKeyLimit.reset_at.is_(None))
+            if expected_reset_at is None
+            else stmt.where(ApiKeyLimit.reset_at == expected_reset_at)
+        )
         if delta < 0:
             stmt = stmt.where(ApiKeyLimit.current_value >= -delta)
         result = await self._session.execute(
