@@ -210,7 +210,6 @@ from app.modules.model_sources.repository import ModelSourcesRepository
 from app.modules.model_sources.selection import (
     allowed_source_ids_for_api_key,
     effective_model_for_api_key,
-    select_responses_model_source,
 )
 from app.modules.proxy import affinity as proxy_affinity_module
 from app.modules.proxy import images_service as images_service_module
@@ -1128,6 +1127,7 @@ async def responses(
             api_key,
             raw_model=raw_source_model,
             require_streaming=True,
+            request=request,
         )
         if source_selection is not None:
             source, selected_model = source_selection
@@ -1168,6 +1168,18 @@ async def responses(
         enforce_openai_sdk_contract=openai_sdk_request,
         native_codex_heartbeat=native_codex_heartbeat,
     )
+    if _account_response_allows_provider_fallback(response) and _responses_request_allows_safe_branch_fallback(
+        responses_payload
+    ):
+        provider_response = await _account_responses_provider_fallback_response(
+            request,
+            responses_payload,
+            api_key=api_key,
+            rate_limit_headers=await _rate_limit_headers_for_request(context, api_key),
+            pre_normalization_effort=pre_normalization_effort,
+        )
+        if provider_response is not None:
+            return provider_response
     return _mark_subscription_prompt_cache_fallback(response, responses_payload)
 
 
@@ -1280,6 +1292,7 @@ async def v1_responses(
             api_key,
             raw_model=raw_source_model,
             require_streaming=responses_payload.stream is True,
+            request=request,
         )
     )
     source = source_selection[0] if source_selection is not None else None
@@ -3915,6 +3928,11 @@ def _is_codex_backend_catalog_model(model: UpstreamModel) -> bool:
 
 _CODEX_WIRE_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"})
 
+# Balanced routing alternates the preferred branch for each API key + model.
+# A request-scoped cache below prevents repeated selector calls from advancing
+# the cursor twice for the same inbound request.
+_SOURCE_ROUTE_CURSOR: dict[str, int] = {}
+
 
 def _codex_model_truncation_policy(model: UpstreamModel) -> CodexTruncationPolicy:
     if "truncation_policy" in model.raw:
@@ -4393,21 +4411,82 @@ async def _select_chat_model_source(
         return (source, candidate) if source is not None else None
 
 
+def _api_key_routing_mode(api_key: ApiKeyData | None) -> str:
+    mode = getattr(api_key, "routing_mode", "balanced") if api_key is not None else "account_first"
+    return mode if mode in {"balanced", "account_first", "provider_first"} else "balanced"
+
+
+def _model_can_use_account_branch(model: str) -> bool:
+    return model in get_model_registry().get_models_with_fallback()
+
+
+def _responses_request_allows_safe_branch_fallback(payload: ResponsesRequest) -> bool:
+    # Server-owned continuations are pinned to their original upstream. Fresh
+    # full-history turns can switch branches before any visible output.
+    return payload.previous_response_id is None and payload.conversation is None
+
+
+def _route_to_provider_for_native_model(
+    api_key: ApiKeyData | None,
+    *,
+    model: str,
+    request: Request | None = None,
+) -> bool:
+    mode = _api_key_routing_mode(api_key)
+    if mode == "provider_first":
+        return True
+    if mode == "account_first":
+        return False
+    key_id = api_key.id if api_key is not None else "dashboard"
+    route_key = f"mixed:{key_id}:{model}"
+    if request is not None:
+        decisions = getattr(request.state, "balanced_route_decisions", None)
+        if decisions is None:
+            decisions = {}
+            request.state.balanced_route_decisions = decisions
+        if route_key in decisions:
+            return bool(decisions[route_key])
+    index = _SOURCE_ROUTE_CURSOR.get(route_key, 0)
+    decision = index % 2 == 0
+    _SOURCE_ROUTE_CURSOR[route_key] = index + 1
+    if request is not None:
+        decisions[route_key] = decision
+    return decision
+
+
 async def _select_responses_model_source(
     model: str,
     api_key: ApiKeyData | None,
     *,
     raw_model: str | None = None,
     require_streaming: bool = False,
+    allow_native_provider_fallback: bool = False,
+    request: Request | None = None,
 ) -> tuple[ModelSource, str] | None:
-    # Shared with the WebSocket path so both transports agree on which models
-    # belong to a model source.
-    return await select_responses_model_source(
-        model,
-        api_key,
-        raw_model=raw_model,
-        require_streaming=require_streaming,
-    )
+    assigned_source_ids = _allowed_source_ids_for_api_key(api_key)
+    exact_allowed_models = set(api_key.allowed_models) if api_key and api_key.allowed_models else None
+    candidates = list(dict.fromkeys(candidate for candidate in (raw_model, model) if candidate))
+    registry_models = get_model_registry().get_models_with_fallback()
+    async with get_background_session() as session:
+        repository = ModelSourcesRepository(session)
+        for candidate in candidates:
+            if exact_allowed_models is not None and candidate not in exact_allowed_models:
+                continue
+            if (
+                registry_models.get(candidate) is not None
+                and not allow_native_provider_fallback
+                and not _route_to_provider_for_native_model(api_key, model=candidate, request=request)
+            ):
+                continue
+            source = await repository.find_responses_source_for_model(
+                candidate,
+                allowed_source_ids=assigned_source_ids,
+                require_streaming=require_streaming,
+            )
+            if source is not None:
+                detach_session_objects(session)
+                return source, candidate
+        return None
 
 
 async def _select_embeddings_model_source(model: str, api_key: ApiKeyData | None) -> ModelSource | None:
@@ -4662,6 +4741,85 @@ async def _source_audio_transcription_response(
     if result.content_type is not None:
         headers["content-type"] = result.content_type
     return Response(content=result.body, status_code=200, headers=headers)
+
+
+def _account_error_allows_provider_fallback(
+    *,
+    status_code: int,
+    code: str | None,
+    message: str | None,
+) -> bool:
+    normalized_code = (code or "").strip().lower()
+    normalized_message = (message or "").strip().lower()
+    # Downstream API-key quota never reaches this point; account capacity and
+    # upstream availability errors may safely try a provider. Generic payload
+    # errors (including orphan item ids) must stop instead of retrying blindly.
+    if normalized_code in {
+        "usage_limit_reached",
+        "insufficient_quota",
+        "account_model_unsupported",
+        "model_not_supported",
+        "no_accounts",
+        "no_available_accounts",
+        "quota_exhausted",
+        "previous_response_owner_unavailable",
+        "upstream_error",
+        "upstream_rate_limit",
+    }:
+        return True
+    if status_code in {401, 403, 408, 409, 425, 429} or status_code >= 500:
+        return True
+    model_fragments = ("model not found", "unsupported model", "model is not available")
+    return status_code in {400, 404, 422} and any(fragment in normalized_message for fragment in model_fragments)
+
+
+def _account_response_allows_provider_fallback(response: Response) -> bool:
+    try:
+        payload = json.loads(bytes(response.body).decode("utf-8"))
+    except (AttributeError, JSONDecodeError, UnicodeDecodeError):
+        return False
+    if response.status_code < 400 or not isinstance(payload, Mapping):
+        return False
+    code, message = _error_details_from_content(cast(Mapping[str, JsonValue], payload))
+    return _account_error_allows_provider_fallback(
+        status_code=response.status_code,
+        code=code,
+        message=message,
+    )
+
+
+async def _account_responses_provider_fallback_response(
+    request: Request,
+    payload: ResponsesRequest,
+    *,
+    api_key: ApiKeyData | None,
+    rate_limit_headers: Mapping[str, str],
+    pre_normalization_effort: str | None,
+) -> Response | None:
+    if not _responses_request_allows_safe_branch_fallback(payload):
+        return None
+    selection = await _select_responses_model_source(
+        payload.model,
+        api_key,
+        raw_model=payload.model,
+        require_streaming=payload.stream is True,
+        allow_native_provider_fallback=True,
+        request=request,
+    )
+    if selection is None:
+        return None
+    source, selected_model = selection
+    provider_payload = payload.model_copy(deep=True)
+    provider_payload.model = selected_model
+    request.state.model_source_fallback = True
+    return await _source_responses_response(
+        request,
+        provider_payload,
+        source=source,
+        api_key=api_key,
+        rate_limit_headers=rate_limit_headers,
+        pre_normalization_effort=pre_normalization_effort,
+    )
 
 
 async def _source_responses_response(
