@@ -7299,6 +7299,51 @@ async def test_stream_responses_starts_upstream_timer_after_image_inlining(monke
 
 
 @pytest.mark.asyncio
+async def test_stream_responses_strips_unpersisted_reasoning_lookup_id(monkeypatch):
+    class Settings:
+        upstream_base_url = "https://chatgpt.com/backend-api"
+        upstream_connect_timeout_seconds = 8.0
+        stream_idle_timeout_seconds = 600.0
+        max_sse_event_bytes = 1024
+        image_inline_fetch_enabled = False
+        trace_channels = frozenset()
+        proxy_request_budget_seconds = 600.0
+        http_responses_stream_request_budget_seconds = 7200.0
+        upstream_stream_transport = "http"
+
+    monkeypatch.setattr(proxy_module, "get_settings", lambda: Settings())
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_start", lambda **kwargs: None)
+    monkeypatch.setattr(proxy_module, "_maybe_log_upstream_request_complete", lambda **kwargs: None)
+
+    orphan_id = "rs_f8fa2502-2dd3-4f04-90cc-f950ed4d94fc"
+    payload = ResponsesRequest.model_validate(
+        {
+            "model": "gpt-5.6-sol",
+            "instructions": "continue",
+            "input": [{"type": "reasoning", "id": orphan_id, "summary": []}],
+            "store": False,
+        }
+    )
+    session = _SseSession(_SsePostResponse([b'data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']))
+
+    events = [
+        event
+        async for event in proxy_module.stream_responses(
+            payload,
+            headers={},
+            access_token="token",
+            account_id="acc_1",
+            session=cast(proxy_module.aiohttp.ClientSession, session),
+        )
+    ]
+
+    forwarded = session.calls[0]["json"]
+    assert forwarded["input"] == [{"type": "reasoning", "summary": []}]
+    assert orphan_id not in str(forwarded)
+    assert events == ['data: {"type":"response.completed","response":{"id":"resp_1"}}\n\n']
+
+
+@pytest.mark.asyncio
 async def test_stream_responses_uses_http_responses_stream_budget(monkeypatch):
     class Settings:
         upstream_base_url = "https://chatgpt.com/backend-api"

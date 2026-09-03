@@ -3203,6 +3203,11 @@ async def _stream_responses_with_session(
     retryable_same_contract: bool | None = None
     client_session = session
     payload_dict = dict(payload.to_payload())
+    # Codex always forwards store=false. A resumed client can replay a
+    # reasoning item carrying only its old rs_* id; upstream cannot resolve
+    # that non-persisted item. Strip the lookup id while retaining the item
+    # content, matching the production v1.22 stream path.
+    strip_invalid_native_input_item_ids(payload_dict)
     apply_codex_installation_metadata(payload_dict, codex_installation_id)
     if settings.image_inline_fetch_enabled:
         payload_dict = await _inline_input_image_urls(
